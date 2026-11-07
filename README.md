@@ -1,10 +1,11 @@
-<a href="https://mtsu.dev"><img align="right" src="https://mtsu.dev/press/mtsu-icon-1024.png" width="48" alt="MTSU"></a>
-
 # douane
 
-[![CI](https://github.com/mtsu-dev/douane/actions/workflows/ci.yml/badge.svg)](https://github.com/mtsu-dev/douane/actions/workflows/ci.yml)
+[![CI](https://github.com/klNuno/douane/actions/workflows/ci.yml/badge.svg)](https://github.com/klNuno/douane/actions/workflows/ci.yml)
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
 ![Rust 1.90+](https://img.shields.io/badge/rust-1.90%2B-orange)
+
+> [!WARNING]
+> douane uses your subscriptions outside the providers' official apps. A provider can treat that as a breach of its terms of service and suspend or ban the account. Use it at your own risk: douane comes with no warranty (see the [license](LICENSE)), and you are responsible for the accounts you connect.
 
 One self-hosted endpoint for every AI subscription you pay for.
 
@@ -46,7 +47,7 @@ What a provider exposes depends on the account and plan. A quota douane cannot r
 
 ### Executables
 
-Each [release](https://github.com/mtsu-dev/douane/releases/latest) attaches an archive per platform holding `douane`, `douanectl`, the license and this file: `douane-<version>-windows-x64.zip`, `-macos-arm64.tar.gz`, `-macos-x64.tar.gz`, `-linux-x64.tar.gz` and `-linux-arm64.tar.gz`. They need no runtime: Linux builds are static, the Windows build carries its C runtime. `SHA256SUMS` lists every file's checksum and `manifest.json` describes the raw executables for installers.
+Each [release](https://github.com/klNuno/douane/releases/latest) attaches an archive per platform holding `douane`, `douanectl`, the license and this file: `douane-<version>-windows-x64.zip`, `-macos-arm64.tar.gz`, `-macos-x64.tar.gz`, `-linux-x64.tar.gz` and `-linux-arm64.tar.gz`. They need no runtime: Linux builds are static, the Windows build carries its C runtime. `SHA256SUMS` lists every file's checksum and `manifest.json` describes the raw executables for installers.
 
 ```sh
 tar -xzf douane-<version>-linux-x64.tar.gz
@@ -71,7 +72,7 @@ or without compose:
 
 ```sh
 docker run -d --name douane --restart unless-stopped \
-  -p 127.0.0.1:8787:8787 -v douane:/data ghcr.io/mtsu-dev/douane:latest
+  -p 127.0.0.1:8787:8787 -v douane:/data ghcr.io/klnuno/douane:latest
 ```
 
 Accounts, the database and `douane.toml` live in the `/data` volume; put a configuration file there to change settings. The container runs as uid 65532, so a bind-mounted folder must be writable by that uid. `docker exec douane douanectl status` runs the CLI inside it. The port is published on loopback only: read [Security and data](#security-and-data) before exposing it.

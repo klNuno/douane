@@ -7,7 +7,7 @@ version = "0.3.1"
 edition = "2024"
 rust-version = "1.90"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/mtsu-dev/douane"
+repository = "https://github.com/klNuno/douane"
 
 [workspace.dependencies]
 anyhow = "1"
