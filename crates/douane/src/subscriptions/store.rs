@@ -171,6 +171,10 @@ pub struct AccountSummary {
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dialect: Option<String>,
+    /// Images a Chat request to this endpoint carries at most; absent uses
+    /// the default of 20.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_limit: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
     pub created_at: String,
@@ -237,6 +241,10 @@ pub struct AccountCredential {
     /// `messages`. Absent forwards the client's own format unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) dialect: Option<String>,
+    /// Images a Chat request to this endpoint carries at most: older ones
+    /// become a text placeholder. Absent uses [`crate::chat_images::DEFAULT_LIMIT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) image_limit: Option<u32>,
 }
 
 /// A reserve is a share strictly between 0 and 100.
@@ -257,6 +265,14 @@ pub fn valid_route(route: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
         && SubscriptionProvider::parse(route).is_none()
+}
+
+/// The most images a custom endpoint's `image_limit` can allow.
+pub const MAX_IMAGE_LIMIT: u32 = 1000;
+
+/// An image limit from 0 (no image) to [`MAX_IMAGE_LIMIT`].
+pub fn valid_image_limit(limit: u32) -> bool {
+    limit <= MAX_IMAGE_LIMIT
 }
 
 /// Wire formats a custom endpoint can speak.
@@ -282,6 +298,8 @@ pub struct EndpointPatch {
     pub base_url: Option<String>,
     /// `Some(None)` returns to forwarding the client's own format.
     pub dialect: Option<Option<String>>,
+    /// `Some(None)` returns to the default image limit.
+    pub image_limit: Option<Option<u32>>,
     /// An empty list serves every model the endpoint lists.
     pub models: Option<Vec<String>>,
     pub api_key: Option<String>,
@@ -289,6 +307,7 @@ pub struct EndpointPatch {
 
 const ROUTE_RULE: &str = "route must be 1 to 32 lowercase letters, digits, - or _, and not a provider name such as claude, codex, openai or copilot";
 const DIALECT_RULE: &str = "dialect must be chat, responses or messages";
+const IMAGE_LIMIT_RULE: &str = "image_limit must be a whole number from 0 to 1000";
 const BASE_URL_RULE: &str =
     "base_url must be an http or https address without credentials or query";
 
@@ -311,6 +330,12 @@ pub fn reserve_windows(kinds: &[String]) -> Option<Vec<String>> {
 }
 
 impl AccountCredential {
+    /// Images a Chat request to this account may carry.
+    pub(crate) fn image_limit(&self) -> u32 {
+        self.image_limit
+            .unwrap_or(crate::chat_images::DEFAULT_LIMIT)
+    }
+
     /// The stored reserve, ignored when a hand-edited file holds a value
     /// outside the accepted range.
     pub(crate) fn reserve(&self) -> Option<f64> {
@@ -393,6 +418,7 @@ impl AccountCredential {
                 .then(|| self.base_url.clone())
                 .flatten(),
             dialect: self.dialect.clone(),
+            image_limit: self.image_limit,
             models: if self.provider == SubscriptionProvider::OpenaiCompatible {
                 self.models.clone()
             } else {
@@ -662,6 +688,13 @@ impl AccountStore {
         {
             return Err(SubscriptionError::InvalidEndpoint(DIALECT_RULE));
         }
+        if patch
+            .image_limit
+            .flatten()
+            .is_some_and(|limit| !valid_image_limit(limit))
+        {
+            return Err(SubscriptionError::InvalidEndpoint(IMAGE_LIMIT_RULE));
+        }
         let api_key = patch.api_key.map(|key| key.trim().to_owned());
         if api_key.as_deref().is_some_and(|key| {
             key.is_empty() || key.len() > 8192 || key.chars().any(char::is_control)
@@ -689,7 +722,7 @@ impl AccountStore {
         let current = accounts.get(id).ok_or(SubscriptionError::NotFound)?;
         if current.provider != SubscriptionProvider::OpenaiCompatible {
             return Err(SubscriptionError::InvalidEndpoint(
-                "only openai_compatible endpoints take a route, base_url, dialect, models or api_key",
+                "only openai_compatible endpoints take a route, base_url, dialect, image_limit, models or api_key",
             ));
         }
         let mut account = current.clone();
@@ -701,6 +734,9 @@ impl AccountStore {
         }
         if let Some(dialect) = dialect {
             account.dialect = dialect;
+        }
+        if let Some(limit) = patch.image_limit {
+            account.image_limit = limit;
         }
         if let Some(models) = models {
             account.models = models;
@@ -978,11 +1014,17 @@ fn check_record(account: &AccountCredential) -> Result<(), SubscriptionError> {
     {
         return Err(SubscriptionError::InvalidImport("invalid base URL"));
     }
-    if account.route.is_some() || account.dialect.is_some() {
+    if account.route.is_some() || account.dialect.is_some() || account.image_limit.is_some() {
         if account.provider != SubscriptionProvider::OpenaiCompatible {
             return Err(SubscriptionError::InvalidEndpoint(
-                "route and dialect apply only to openai_compatible endpoints",
+                "route, dialect and image_limit apply only to openai_compatible endpoints",
             ));
+        }
+        if account
+            .image_limit
+            .is_some_and(|limit| !valid_image_limit(limit))
+        {
+            return Err(SubscriptionError::InvalidEndpoint(IMAGE_LIMIT_RULE));
         }
         if account.route.as_deref().is_some_and(|r| !valid_route(r)) {
             return Err(SubscriptionError::InvalidEndpoint(ROUTE_RULE));
@@ -1234,10 +1276,20 @@ fn parse_import(
     }
     let route = text(&value, &["route", "prefix"]).map(|r| r.trim().to_ascii_lowercase());
     let dialect = text(&value, &["dialect", "format"]).map(|d| d.trim().to_ascii_lowercase());
-    if route.is_some() || dialect.is_some() {
+    let image_limit = match value.get("image_limit") {
+        None | Some(Value::Null) => None,
+        Some(limit) => Some(
+            limit
+                .as_u64()
+                .and_then(|limit| u32::try_from(limit).ok())
+                .filter(|limit| valid_image_limit(*limit))
+                .ok_or(SubscriptionError::InvalidEndpoint(IMAGE_LIMIT_RULE))?,
+        ),
+    };
+    if route.is_some() || dialect.is_some() || image_limit.is_some() {
         if provider != SubscriptionProvider::OpenaiCompatible {
             return Err(SubscriptionError::InvalidEndpoint(
-                "route and dialect apply only to openai_compatible endpoints",
+                "route, dialect and image_limit apply only to openai_compatible endpoints",
             ));
         }
         if route.as_deref().is_some_and(|r| !valid_route(r)) {
@@ -1329,6 +1381,7 @@ fn parse_import(
         reserve_windows: vec![],
         route,
         dialect,
+        image_limit,
     };
     apply_identity(&mut account);
     account.name = name
