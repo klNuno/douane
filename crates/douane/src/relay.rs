@@ -641,6 +641,21 @@ pub async fn forward(
                 .and_then(|m| m.thinking.clone());
             crate::openai_reasoning::configure(&mut translated, &value, thinking.as_ref());
         }
+        // Mistral refuses a Chat request past 20 images with a 503 no retry
+        // can fix: the oldest images give way to a placeholder instead.
+        if account.provider == SubscriptionProvider::OpenaiCompatible && to == Dialect::Chat {
+            let limit = account.image_limit();
+            let omitted = crate::chat_images::cap(&mut translated, limit);
+            if omitted > 0 {
+                tracing::info!(
+                    provider = account.pool(),
+                    model = %model,
+                    omitted,
+                    limit,
+                    "older images replaced by a placeholder to fit the endpoint's image limit"
+                );
+            }
+        }
         let mut replay = if account.provider == SubscriptionProvider::Antigravity {
             crate::antigravity_system::normalize_system(&mut translated);
             let mut history = match translate::antigravity_history(&value, from) {
@@ -919,7 +934,14 @@ pub async fn forward(
                     last_reason = Some(UNSERVED.into());
                     continue;
                 }
-                call.fail("upstream request refused");
+                call.fail(&with_excerpt("upstream request refused", &body, &account));
+                tracing::warn!(
+                    provider = account.pool(),
+                    model = %model,
+                    status = last_status.as_u16(),
+                    error = call.call.error.as_deref().unwrap_or_default(),
+                    "upstream refused the request"
+                );
                 if native && refusal.is_some() {
                     let mut answer = (last_status, Body::from(body)).into_response();
                     answer.headers_mut().extend(passed);
@@ -939,14 +961,21 @@ pub async fn forward(
                     &message.unwrap_or_else(|| "upstream request refused".into()),
                 );
             }
-            let (response, refusal) = if to == Dialect::Gemini && !native {
+            // Google keeps only its enum reason (its free text can name the
+            // project); every other refusal is read once, for the ledger and,
+            // on a native request, for the client.
+            let (body, refusal) = if to == Dialect::Gemini && !native {
                 let body = read_bounded(response, 64 * 1024, idle)
                     .await
                     .unwrap_or_default();
                 (None, google_refusal(&body))
             } else {
-                (Some(response), None)
+                (read_bounded(response, 256 * 1024, idle).await.ok(), None)
             };
+            let excerpt = body
+                .as_deref()
+                .filter(|_| to != Dialect::Gemini)
+                .and_then(|body| crate::refusal::excerpt(body, &account.secrets()));
             // An Antigravity plan answers NOT_FOUND for a model it lacks
             // (the newest Claude on a trial or partner plan) while another
             // account of the pool may serve it: the account itself is fine.
@@ -968,13 +997,21 @@ pub async fn forward(
                 }
                 _ => "upstream request refused",
             };
-            match &refusal {
-                Some(refusal) => {
+            match (&refusal, &excerpt) {
+                (Some(refusal), _) => {
                     call.fail(&format!("{summary} ({})", refusal.reason));
                     last_reason = Some(refusal.reason.clone());
                 }
-                None => call.fail(summary),
+                (None, Some(excerpt)) => call.fail(&format!("{summary}: {excerpt}")),
+                (None, None) => call.fail(summary),
             }
+            tracing::warn!(
+                provider = account.pool(),
+                model = %model,
+                status = last_status.as_u16(),
+                error = call.call.error.as_deref().unwrap_or(summary),
+                "upstream refused the request"
+            );
             if last_status == StatusCode::TOO_MANY_REQUESTS || last_status.is_server_error() {
                 let wait = advised
                     .or_else(|| refusal.as_ref().and_then(|r| r.retry_seconds))
@@ -986,11 +1023,16 @@ pub async fn forward(
                 if owner.is_some() && last_status == StatusCode::TOO_MANY_REQUESTS {
                     return replay_rate_limit(wait);
                 }
-                if let (true, Some(response)) = (
+                if refusal.is_none() {
+                    if let Some(excerpt) = &excerpt {
+                        last_reason = Some(excerpt.clone());
+                    }
+                }
+                if let (true, Some(body)) = (
                     native && account.provider != SubscriptionProvider::Meta,
-                    response,
+                    body,
                 ) {
-                    last_native = native_refusal(last_status, passed, response, idle).await;
+                    last_native = native_refusal(last_status, passed, body);
                 }
                 continue;
             }
@@ -1009,8 +1051,8 @@ pub async fn forward(
             if account.provider == SubscriptionProvider::Meta {
                 return error(last_status, summary);
             }
-            if let (true, Some(response)) = (native, response) {
-                if let Some(refusal) = native_refusal(last_status, passed, response, idle).await {
+            if let (true, Some(body)) = (native, body) {
+                if let Some(refusal) = native_refusal(last_status, passed, body) {
                     return refusal;
                 }
             } else {
@@ -1337,14 +1379,8 @@ pub(crate) fn passthrough_headers(upstream: &HeaderMap) -> HeaderMap {
 }
 
 /// The provider's own JSON refusal with its status and limit headers, or
-/// nothing when its body is not a bounded JSON document.
-async fn native_refusal(
-    status: StatusCode,
-    headers: HeaderMap,
-    response: reqwest::Response,
-    idle: Duration,
-) -> Option<Response> {
-    let body = read_bounded(response, 256 * 1024, idle).await.ok()?;
+/// nothing when its body is not a JSON document.
+fn native_refusal(status: StatusCode, headers: HeaderMap, body: Vec<u8>) -> Option<Response> {
     serde_json::from_slice::<Value>(&body).ok()?;
     let mut refusal = (status, Body::from(body)).into_response();
     refusal.headers_mut().extend(headers);
@@ -1353,6 +1389,14 @@ async fn native_refusal(
         header::HeaderValue::from_static("application/json"),
     );
     Some(refusal)
+}
+
+/// A ledger error naming the upstream's own words when it gave any.
+fn with_excerpt(summary: &str, body: &[u8], account: &AccountCredential) -> String {
+    match crate::refusal::excerpt(body, &account.secrets()) {
+        Some(excerpt) => format!("{summary}: {excerpt}"),
+        None => summary.to_owned(),
+    }
 }
 
 /// The upstream went quiet for longer than the request timeout.

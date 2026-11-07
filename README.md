@@ -142,7 +142,7 @@ If clients reach the API at a different address than the dashboard (a reverse pr
 | `/admin/api/*` | Accounts, clients, quotas, models, request history, settings and OAuth |
 | `/v0/management`, `/v8/management` | A CLIProxyAPI-compatible subset of its management API |
 
-Translation between the three dialects covers text, tools and images; provider-specific extensions do not all have an equivalent. A failed request moves to another account only before its first byte reaches the client: started output is never replayed. A same-dialect request returns the provider's own rate-limit headers and request id, and client errors such as an oversized prompt come back as the provider wrote them.
+Translation between the three dialects covers text, tools and images; provider-specific extensions do not all have an equivalent. A failed request moves to another account only before its first byte reaches the client: started output is never replayed. A same-dialect request returns the provider's own rate-limit headers and request id, and client errors such as an oversized prompt come back as the provider wrote them. Every refusal keeps the first 300 characters of the provider's reply, with tokens redacted, in the call log and the service log; Google refusals keep only their reason code.
 
 ### Antigravity clients
 
@@ -210,6 +210,7 @@ Any OpenAI-, Anthropic- or Responses-compatible API becomes a route: its keys se
 | `base_url` | The API root, usually ending in `/v1` |
 | `dialect` | What the API speaks: `chat`, `responses` or `messages`; douane translates the client's format to it. Absent forwards the client's format unchanged |
 | `models` | Model ids to serve; empty serves every model the API lists at `/v1/models` |
+| `image_limit` | Images a Chat request carries at most, 0 to 1000, default 20. Past it, the oldest images become the text `[image omitted: upstream image limit]` and the newest stay. Mistral answers HTTP 503 to a 21st image, and an agent resends every image of its conversation each turn |
 
 ![Connect dialog adding a DeepSeek key as the deepseek route](docs/images/endpoint.png)
 
@@ -220,11 +221,12 @@ douanectl endpoint add deepseek https://api.deepseek.com/v1 --key-file deepseek.
 printf %s "$GROQ_API_KEY" | douanectl endpoint add groq https://api.groq.com/openai/v1 --key-file - --dialect chat
 douanectl endpoint set deepseek --models deepseek-v4-pro,deepseek-flash
 douanectl endpoint set deepseek --key-file new.key
+douanectl endpoint set mistral --image-limit 20
 douanectl endpoint list
 douanectl endpoint remove groq
 ```
 
-The same fields go through `POST /admin/api/accounts/import` with `{"type":"openai_compatible","route":...,"base_url":...,"api_key":...}`, and `PATCH /admin/api/accounts/{id}` changes `route`, `base_url`, `dialect`, `models` or `api_key`. An account without a route keeps its previous behavior under `openai_compatible/`.
+The same fields go through `POST /admin/api/accounts/import` with `{"type":"openai_compatible","route":...,"base_url":...,"api_key":...}`, and `PATCH /admin/api/accounts/{id}` changes `route`, `base_url`, `dialect`, `image_limit` (`null` returns to 20), `models` or `api_key`. An account without a route keeps its previous behavior under `openai_compatible/`.
 
 The **Models** page lists models under their provider or route, each one folded until opened. A provider rereads its catalog on its own (`POST /admin/api/models/refresh?pool=openrouter`; no `pool` rereads all), and its switch turns every shown model on or off in one write (`PATCH /admin/api/models` with `{"ids":[...],"enabled":false}`). Every catalog is reread each hour, so a model a provider adds or retires shows without a restart. When a live listing fails, the provider keeps its previous models, is marked as such, and is reread every minute.
 
@@ -304,7 +306,7 @@ douanectl disable <account-id>
 douanectl enable <account-id>
 douanectl remove <account-id>
 douanectl endpoint add <route> <base-url> --key-file <file|->
-douanectl endpoint set <route|account-id> [--base-url ...] [--dialect ...] [--models ...] [--key-file ...]
+douanectl endpoint set <route|account-id> [--base-url ...] [--dialect ...] [--image-limit <n|default>] [--models ...] [--key-file ...]
 douanectl client list
 douanectl client add <name> [--pools ...] [--accounts ...] [--share pool=percent,...] [--key-file <file>]
 douanectl client set <client-id> [--name ...] [--all|--pools ...] [--share ...] [--rotate-key]

@@ -245,6 +245,9 @@ enum Endpoint {
         /// chat, responses or messages; absent forwards the client's format.
         #[arg(long)]
         dialect: Option<String>,
+        /// Images per Chat request, older ones become a placeholder; absent uses 20.
+        #[arg(long)]
+        image_limit: Option<u32>,
         /// Comma-separated model ids to serve; absent serves every listed model.
         #[arg(long, value_delimiter = ',')]
         models: Option<Vec<String>>,
@@ -257,6 +260,9 @@ enum Endpoint {
         /// chat, responses or messages; `client` forwards the client's format.
         #[arg(long)]
         dialect: Option<String>,
+        /// Images per Chat request (0 to 1000); `default` returns to 20.
+        #[arg(long)]
+        image_limit: Option<String>,
         /// Comma-separated model ids; an empty value serves every model.
         #[arg(long, value_delimiter = ',')]
         models: Option<Vec<String>>,
@@ -341,7 +347,7 @@ async fn endpoint(client: &reqwest::Client, root: &str, command: Endpoint) -> Re
                 .filter(|a| a["provider"] == "openai_compatible")
                 .map(|a| {
                     json!({"id":a["id"],"name":a["name"],"route":a["route"],"base_url":a["base_url"],
-                        "dialect":a["dialect"],"models":a["models"],"enabled":a["enabled"],"status":a["status"]})
+                        "dialect":a["dialect"],"image_limit":a["image_limit"],"models":a["models"],"enabled":a["enabled"],"status":a["status"]})
                 })
                 .collect();
             Ok(json!({ "endpoints": rows }))
@@ -352,6 +358,7 @@ async fn endpoint(client: &reqwest::Client, root: &str, command: Endpoint) -> Re
             key_file,
             name,
             dialect,
+            image_limit,
             models,
         } => {
             let key = read_key(&key_file).await?;
@@ -359,6 +366,9 @@ async fn endpoint(client: &reqwest::Client, root: &str, command: Endpoint) -> Re
                 json!({"type":"openai_compatible","route":route,"base_url":base_url,"api_key":key});
             if let Some(dialect) = dialect {
                 content["dialect"] = json!(dialect);
+            }
+            if let Some(limit) = image_limit {
+                content["image_limit"] = json!(limit);
             }
             if let Some(models) = models {
                 content["models"] = json!(models);
@@ -374,6 +384,7 @@ async fn endpoint(client: &reqwest::Client, root: &str, command: Endpoint) -> Re
             route_or_id,
             base_url,
             dialect,
+            image_limit,
             models,
             route,
             key_file,
@@ -389,6 +400,16 @@ async fn endpoint(client: &reqwest::Client, root: &str, command: Endpoint) -> Re
                 } else {
                     json!(dialect)
                 };
+            }
+            if let Some(limit) = image_limit {
+                patch["image_limit"] =
+                    if limit == "default" {
+                        Value::Null
+                    } else {
+                        json!(limit.parse::<u32>().map_err(|_| anyhow::anyhow!(
+                            "--image-limit takes a number or default"
+                        ))?)
+                    };
             }
             if let Some(models) = models {
                 patch["models"] = json!(
@@ -411,7 +432,7 @@ async fn endpoint(client: &reqwest::Client, root: &str, command: Endpoint) -> Re
                 patch["api_key"] = json!(read_key(&path).await?);
             }
             if patch.as_object().is_some_and(|p| p.is_empty()) {
-                bail!("give --base-url, --dialect, --models, --route or --key-file");
+                bail!("give --base-url, --dialect, --image-limit, --models, --route or --key-file");
             }
             let mut changed = vec![];
             for account in accounts {

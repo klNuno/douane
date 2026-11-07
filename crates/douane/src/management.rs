@@ -441,6 +441,9 @@ pub struct AccountPatch {
     base_url: Option<String>,
     #[serde(default, deserialize_with = "present_text")]
     dialect: Option<Option<String>>,
+    /// Images per Chat request; `null` returns to the default of 20.
+    #[serde(default, deserialize_with = "present_count")]
+    image_limit: Option<Option<u32>>,
     models: Option<Vec<String>>,
     api_key: Option<String>,
 }
@@ -449,6 +452,12 @@ fn present_text<'de, D: serde::Deserializer<'de>>(
     value: D,
 ) -> Result<Option<Option<String>>, D::Error> {
     Option::<String>::deserialize(value).map(Some)
+}
+
+fn present_count<'de, D: serde::Deserializer<'de>>(
+    value: D,
+) -> Result<Option<Option<u32>>, D::Error> {
+    Option::<u32>::deserialize(value).map(Some)
 }
 
 fn present<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<Option<f64>>, D::Error> {
@@ -495,12 +504,14 @@ pub async fn update_account(
         route: body.route,
         base_url: body.base_url,
         dialect: body.dialect,
+        image_limit: body.image_limit,
         models: body.models,
         api_key: body.api_key,
     };
     let endpoint_change = endpoint.route.is_some()
         || endpoint.base_url.is_some()
         || endpoint.dialect.is_some()
+        || endpoint.image_limit.is_some()
         || endpoint.models.is_some()
         || endpoint.api_key.is_some();
     if name.is_none()

@@ -985,3 +985,181 @@ async fn only_an_endpoint_configured_for_chat_is_probed_for_levels() {
         assert_eq!(probes, 0, "{dialect:?}");
     }
 }
+
+/// Mistral's Chat API as seen on 2026-11-07: a request carrying more than 20
+/// images answers 503, whatever their size.
+async fn mistral_images() -> (Server, Arc<Upstream>) {
+    async fn chat(State(upstream): State<Arc<Upstream>>, body: Bytes) -> Response {
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        upstream.seen.lock().unwrap().push(Seen {
+            path: "/v1/chat/completions".into(),
+            headers: HeaderMap::new(),
+            body: body.clone(),
+        });
+        if chat_parts(&body, "image_url").len() > 20 {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    json!({"object":"error","message":"Too many images in request. Max is 20.",
+                    "type":"invalid_request_error","code":"3051"}),
+                ),
+            )
+                .into_response();
+        }
+        Json(json!({"id":"c1","object":"chat.completion","model":body["model"],
+            "choices":[{"index":0,"message":{"role":"assistant","content":"seen"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":3,"completion_tokens":1}}))
+        .into_response()
+    }
+    let upstream = Arc::new(Upstream::default());
+    let server = serve(
+        Router::new()
+            .route(
+                "/v1/models",
+                get(|| async {
+                    Json(
+                        json!({"object":"list","data":[{"id":"deepseek-v4-1-flash-1017",
+                        "capabilities":{"completion_chat":true,"vision":true}}]}),
+                    )
+                }),
+            )
+            .route("/v1/chat/completions", post(chat))
+            .with_state(upstream.clone()),
+    )
+    .await;
+    (server, upstream)
+}
+
+/// Every content part of a Chat request with this `type`, in order.
+fn chat_parts(body: &Value, kind: &str) -> Vec<Value> {
+    body["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .filter(|p| p["type"] == kind)
+        .cloned()
+        .collect()
+}
+
+/// A Claude Code session that read `images` PNGs, one per turn.
+fn image_session(images: usize) -> Value {
+    let mut messages = vec![json!({"role":"user","content":"look at the renders"})];
+    for n in 0..images {
+        messages.push(json!({"role":"assistant","content":[
+            {"type":"tool_use","id":format!("toolu_{n}"),"name":"Read","input":{"file_path":format!("r{n}.png")}}]}));
+        messages.push(json!({"role":"user","content":[{"type":"tool_result","tool_use_id":format!("toolu_{n}"),
+            "content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":format!("png{n}")}}]}]}));
+    }
+    json!({"model":"mistral/deepseek-v4-1-flash-1017","max_tokens":64,"messages":messages})
+}
+
+#[tokio::test]
+async fn a_session_past_twenty_images_reaches_mistral_with_the_newest_twenty() {
+    let (server, seen) = mistral_images().await;
+    let gateway = Gateway::new(&[endpoint("mistral", &server.url, "key-mistral")]).await;
+    let (status, body) = gateway.post("/v1/messages", image_session(21)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["content"], json!([{"type":"text","text":"seen"}]));
+    let sent = seen.seen.lock().unwrap().last().unwrap().body.clone();
+    let images = chat_parts(&sent, "image_url");
+    assert_eq!(images.len(), 20);
+    assert_eq!(images[0]["image_url"]["url"], "data:image/png;base64,png1");
+    assert_eq!(
+        images[19]["image_url"]["url"],
+        "data:image/png;base64,png20"
+    );
+    let omitted: Vec<Value> = chat_parts(&sent, "text")
+        .into_iter()
+        .filter(|p| p["text"] == "[image omitted: upstream image limit]")
+        .collect();
+    assert_eq!(omitted.len(), 1);
+    // The placeholder replaces the first tool's image, after its caption.
+    let first = sent["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| {
+            m["role"] == "user" && m["content"][0]["text"] == "Image returned by tool call toolu_0:"
+        })
+        .unwrap();
+    assert_eq!(
+        first["content"][1]["text"],
+        "[image omitted: upstream image limit]"
+    );
+}
+
+#[tokio::test]
+async fn an_upstream_refusal_keeps_its_own_words_in_the_call_log() {
+    let (server, _) = mistral_images().await;
+    // A limit above what Mistral takes lets the 21st image through.
+    let mut account = endpoint("mistral", &server.url, "key-mistral");
+    account["image_limit"] = json!(100);
+    let gateway = Gateway::new(&[account]).await;
+    let accounts = gateway.admin(reqwest::Method::GET, "/accounts", None).await;
+    assert_eq!(accounts["accounts"][0]["image_limit"], 100, "{accounts}");
+    let (status, body) = gateway.post("/v1/messages", image_session(21)).await;
+    assert_eq!(status, 503, "{body}");
+    assert!(
+        body.to_string()
+            .contains("Too many images in request. Max is 20."),
+        "{body}"
+    );
+    gateway.state.ledger.flush().await;
+    let calls = gateway.state.ledger.calls(10).await;
+    assert_eq!(calls.len(), 1);
+    let error = calls[0].error.as_deref().unwrap_or_default();
+    assert!(error.starts_with("upstream request refused: "), "{error}");
+    assert!(
+        error.contains("Too many images in request. Max is 20."),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn an_endpoint_image_limit_is_set_reset_and_bounded() {
+    let (server, seen) = mistral_images().await;
+    let gateway = Gateway::new(&[endpoint("mistral", &server.url, "key-mistral")]).await;
+    let accounts = gateway.admin(reqwest::Method::GET, "/accounts", None).await;
+    let id = accounts["accounts"][0]["id"].as_str().unwrap().to_owned();
+    assert!(accounts["accounts"][0].get("image_limit").is_none());
+    let patch = |body: Value| {
+        gateway
+            .client
+            .patch(format!("{}/admin/api/accounts/{id}", gateway.server.url))
+            .json(&body)
+            .send()
+    };
+    assert_eq!(
+        patch(json!({"image_limit":1001})).await.unwrap().status(),
+        400
+    );
+    assert_eq!(patch(json!({"image_limit":2})).await.unwrap().status(), 200);
+    let (status, _) = gateway.post("/v1/messages", image_session(3)).await;
+    assert_eq!(status, 200);
+    let sent = seen.seen.lock().unwrap().last().unwrap().body.clone();
+    assert_eq!(chat_parts(&sent, "image_url").len(), 2);
+    assert_eq!(
+        patch(json!({"image_limit":null})).await.unwrap().status(),
+        200
+    );
+    let accounts = gateway.admin(reqwest::Method::GET, "/accounts", None).await;
+    assert!(accounts["accounts"][0].get("image_limit").is_none());
+    // Subscriptions take no image limit.
+    let refused = gateway
+        .state
+        .accounts
+        .import(
+            json!({"type":"kimi","access_token":"t","image_limit":5}),
+            None,
+        )
+        .await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("image_limit")),
+        "{:?}",
+        refused.map(|_| ())
+    );
+}
