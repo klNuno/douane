@@ -21,7 +21,7 @@ pub fn excerpt(body: &[u8], secrets: &[&str]) -> Option<String> {
     if line.is_empty() {
         return None;
     }
-    for secret in secrets.iter().map(|s| s.trim()).filter(|s| s.len() >= 8) {
+    for secret in secrets.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         line = line.replace(secret, "[redacted]");
     }
     let mut out = String::with_capacity(line.len());
@@ -151,6 +151,11 @@ mod tests {
         assert_eq!(
             text,
             r#"{"error":"invalid key [redacted]","echo":"[redacted]"}"#
+        );
+        // Sol round 2: a short credential is still the account's own.
+        assert_eq!(
+            excerpt(br#"{"error":"bad key dev-key"}"#, &["dev-key", ""]).unwrap(),
+            r#"{"error":"bad key [redacted]"}"#
         );
         // Plain words stay, however long.
         let words = br#"{"message":"internationalization_configuration_unavailable"}"#;
