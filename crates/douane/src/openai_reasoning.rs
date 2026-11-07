@@ -113,7 +113,13 @@ pub(crate) async fn probe(
             tracing::warn!(model, %status, "reasoning level probe failed");
             return Probe::Retry;
         }
-        let text = response.text().await.unwrap_or_default();
+        let text = match response.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::warn!(model, error = %e, "reasoning level probe failed");
+                return Probe::Retry;
+            }
+        };
         if let Some(levels) = parse_supported(&error_message(&text)) {
             return Probe::Levels(levels);
         }
@@ -135,16 +141,14 @@ fn error_message(text: &str) -> String {
 }
 
 /// The effort a Messages request asks for. `Some("none")` for thinking
-/// switched off; `None` when it asks for nothing.
+/// switched off, whatever effort rides along; `None` when it asks for nothing.
 fn requested(original: &Value) -> Option<&str> {
-    if let Some(effort) = original
+    if original.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled") {
+        return Some("none");
+    }
+    original
         .pointer("/output_config/effort")
         .and_then(Value::as_str)
-    {
-        return Some(effort);
-    }
-    (original.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled"))
-        .then_some("none")
 }
 
 /// The level sent for `wanted`: itself when listed, otherwise the nearest one
@@ -283,6 +287,57 @@ mod tests {
         let mut out = json!({"model":"m"});
         configure(&mut out, &json!({"output_config":{"effort":"max"}}), None);
         assert_eq!(out, json!({"model":"m"}));
+    }
+
+    #[test]
+    fn thinking_switched_off_wins_over_an_effort() {
+        let thinking = json!({"levels":["none","low","high"]});
+        let mut out = json!({"model":"m"});
+        configure(
+            &mut out,
+            &json!({"thinking":{"type":"disabled"},"output_config":{"effort":"high"}}),
+            Some(&thinking),
+        );
+        assert_eq!(out["reasoning_effort"], "none");
+        // Without `none` listed, the request goes out with no effort at all.
+        let mut out = json!({"model":"m"});
+        configure(
+            &mut out,
+            &json!({"thinking":{"type":"disabled"},"output_config":{"effort":"high"}}),
+            Some(&json!({"levels":["low","high"]})),
+        );
+        assert_eq!(out, json!({"model":"m"}));
+    }
+
+    #[tokio::test]
+    async fn a_probe_whose_body_cannot_be_read_is_retried() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        // Every probe gets headers promising a body the connection then cuts
+        // short, as a timeout mid-body would.
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 400 Bad Request
+content-length: 1000
+
+{\"message\":",
+                    )
+                    .await;
+            }
+        });
+        let client = reqwest::Client::new();
+        assert_eq!(
+            probe(&client, &url, reqwest::header::HeaderMap::new(), "m").await,
+            Probe::Retry
+        );
     }
 
     #[test]

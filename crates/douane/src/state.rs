@@ -434,7 +434,11 @@ impl AppState {
                             })
                             .filter(|m| account.models.is_empty() || account.models.contains(&m.id))
                             .collect();
-                        if account.provider == SubscriptionProvider::OpenaiCompatible {
+                        // Only a Chat endpoint is probed: its requests are the
+                        // ones that carry `reasoning_effort`.
+                        if account.provider == SubscriptionProvider::OpenaiCompatible
+                            && account.dialect.as_deref() == Some("chat")
+                        {
                             let probe: BTreeSet<&str> = data
                                 .iter()
                                 .filter(|m| crate::openai_reasoning::needs_probe(m))

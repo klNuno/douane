@@ -945,3 +945,43 @@ async fn a_mistral_reasoning_model_lists_its_efforts_and_receives_the_chosen_one
         [json!("high"), json!("max"), json!("none"), Value::Null]
     );
 }
+
+#[tokio::test]
+async fn only_an_endpoint_configured_for_chat_is_probed_for_levels() {
+    for dialect in [None, Some("responses")] {
+        let (server, seen) = mistral(false).await;
+        let mut account = endpoint("mistral", &server.url, "key-mistral");
+        match dialect {
+            Some(dialect) => account["dialect"] = json!(dialect),
+            None => {
+                account.as_object_mut().unwrap().remove("dialect");
+            }
+        }
+        let gateway = Gateway::new(&[account]).await;
+        let models: Value = gateway
+            .client
+            .get(format!("{}/v1/models", gateway.server.url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let deepseek = models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "mistral/deepseek-v4-1-flash-1017")
+            .cloned()
+            .unwrap();
+        assert!(deepseek["thinking"].is_null(), "{dialect:?}");
+        let probes = seen
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.body["messages"].as_array().is_some_and(Vec::is_empty))
+            .count();
+        assert_eq!(probes, 0, "{dialect:?}");
+    }
+}
