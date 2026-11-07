@@ -2,13 +2,13 @@
 	import { onMount, type Snippet } from 'svelte';
 	import X from '@lucide/svelte/icons/x';
 	import { t } from '$lib/i18n.svelte';
-	let { title, close, locked = false, wide = false, children }: { title: string; close: () => void; locked?: boolean; wide?: boolean; children: Snippet } = $props();
+	let { title, close, locked = false, wide = false, dismissible = true, children }: { title: string; close: () => void; locked?: boolean; wide?: boolean; dismissible?: boolean; children: Snippet } = $props();
 	let dialog: HTMLDialogElement;
 	onMount(() => { dialog.showModal(); return () => dialog.close(); });
 </script>
 
-<dialog bind:this={dialog} class="modal" class:wide oncancel={(event) => { event.preventDefault(); if (!locked) close(); }}>
-	<header><h2>{title}</h2><button class="icon-button" aria-label={t('common.close')} disabled={locked} onclick={close}><X size={20}/></button></header>
+<dialog bind:this={dialog} class="modal" class:wide oncancel={(event) => { event.preventDefault(); if (!locked && dismissible) close(); }}>
+	<header><h2>{title}</h2>{#if dismissible}<button class="icon-button" aria-label={t('common.close')} disabled={locked} onclick={close}><X size={20}/></button>{/if}</header>
 	{@render children()}
 </dialog>
 

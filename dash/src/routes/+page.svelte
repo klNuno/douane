@@ -19,6 +19,8 @@
 	import ModelsView from '$lib/components/models-view.svelte';
 	import SettingsView from '$lib/components/settings-view.svelte';
 	import ConnectDialog from '$lib/components/connect-dialog.svelte';
+	import RiskNotice from '$lib/components/risk-notice.svelte';
+	import { acceptRisk, riskAccepted } from '$lib/risk';
 	import DouaneMark from '$lib/components/douane-mark.svelte';
 	import { management, importErrors, type Account, type Quota, type Provider, type Model, type ModelListing, type Call, type Status, type Settings, type QuotaDisplay, type QuotaWindowChoice, type ReserveWindow, type EndpointPatch, type ClientsReport } from '$lib/management';
 	import LanguageSetting from '$lib/components/language-setting.svelte';
@@ -31,6 +33,7 @@
 	let screen = $state('quotas');
 	let mobileOpen = $state(false);
 	let connectOpen = $state(false);
+	let riskOpen = $state(false);
 	let accounts = $state.raw<Account[]>([]);
 	let quotas = $state.raw<Quota[]>([]);
 	let providers = $state.raw<Provider[]>([]);
@@ -115,7 +118,7 @@
 		if (done) notice = t(restored === 1 ? 'notice.restored.one' : 'notice.restored.other', { count: restored });
 		return done;
 	}
-	onMount(() => { hashChange(); void load(); const timer = setInterval(() => { if (!document.hidden && !busy) void load(true); },15_000); return () => clearInterval(timer); });
+	onMount(() => { riskOpen = !riskAccepted(); hashChange(); void load(); const timer = setInterval(() => { if (!document.hidden && !busy) void load(true); },15_000); return () => clearInterval(timer); });
 </script>
 
 <svelte:head><title>{pageTitle} · douane</title><meta name="description" content={t('page.description')}/></svelte:head>
@@ -144,4 +147,5 @@
 	</div>
 </div>
 <nav class="mobile-nav" aria-label={t('nav.mobile')}>{#each mobileItems as item (item.id)}{@const Icon = item.icon}<button class:active={screen === item.id} aria-current={screen === item.id ? 'page' : undefined} onclick={() => navigate(item.id)}><Icon size={19}/><span>{t(item.label)}</span></button>{/each}<button onclick={() => mobileOpen = true} aria-label={t('nav.openMenu')} aria-expanded={mobileOpen} aria-controls="main-navigation"><Menu size={19}/><span>{t('nav.menu')}</span></button></nav>
+{#if riskOpen}<RiskNotice accept={() => { acceptRisk(); riskOpen = false; }}/>{/if}
 {#if connectOpen}<ConnectDialog {providers} close={() => connectOpen = false} completed={() => { notice = t('notice.accountConnected'); void load(true); }} {importFiles}/>{/if}

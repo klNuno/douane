@@ -19,7 +19,7 @@ import re
 import sys
 from urllib.parse import urlsplit
 
-REPOSITORY = "https://github.com/mtsu-dev/douane"
+REPOSITORY = "https://github.com/klNuno/douane"
 # Boite platform key -> release asset name.
 ASSETS = {
     "win32-x64": "douane-windows-x64.exe",
