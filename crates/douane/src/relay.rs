@@ -934,7 +934,14 @@ pub async fn forward(
                     last_reason = Some(UNSERVED.into());
                     continue;
                 }
-                call.fail(&with_excerpt("upstream request refused", &body));
+                call.fail(&with_excerpt("upstream request refused", &body, &account));
+                tracing::warn!(
+                    provider = account.pool(),
+                    model = %model,
+                    status = last_status.as_u16(),
+                    error = call.call.error.as_deref().unwrap_or_default(),
+                    "upstream refused the request"
+                );
                 if native && refusal.is_some() {
                     let mut answer = (last_status, Body::from(body)).into_response();
                     answer.headers_mut().extend(passed);
@@ -968,7 +975,7 @@ pub async fn forward(
             let excerpt = body
                 .as_deref()
                 .filter(|_| to != Dialect::Gemini)
-                .and_then(crate::refusal::excerpt);
+                .and_then(|body| crate::refusal::excerpt(body, &account.secrets()));
             // An Antigravity plan answers NOT_FOUND for a model it lacks
             // (the newest Claude on a trial or partner plan) while another
             // account of the pool may serve it: the account itself is fine.
@@ -1385,8 +1392,8 @@ fn native_refusal(status: StatusCode, headers: HeaderMap, body: Vec<u8>) -> Opti
 }
 
 /// A ledger error naming the upstream's own words when it gave any.
-fn with_excerpt(summary: &str, body: &[u8]) -> String {
-    match crate::refusal::excerpt(body) {
+fn with_excerpt(summary: &str, body: &[u8], account: &AccountCredential) -> String {
+    match crate::refusal::excerpt(body, &account.secrets()) {
         Some(excerpt) => format!("{summary}: {excerpt}"),
         None => summary.to_owned(),
     }

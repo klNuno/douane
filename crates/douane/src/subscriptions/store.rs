@@ -330,6 +330,20 @@ pub fn reserve_windows(kinds: &[String]) -> Option<Vec<String>> {
 }
 
 impl AccountCredential {
+    /// Every credential value this account holds, for redaction.
+    pub(crate) fn secrets(&self) -> Vec<&str> {
+        [
+            Some(self.access_token.as_str()),
+            self.refresh_token.as_deref(),
+            self.dca_token.as_deref(),
+            self.id_token.as_deref(),
+            self.client_secret.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     /// Images a Chat request to this account may carry.
     pub(crate) fn image_limit(&self) -> u32 {
         self.image_limit
