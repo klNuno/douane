@@ -136,6 +136,10 @@ pub struct AppState {
     /// listing returned last: one Google or GitHub plan can offer models
     /// another one of the same pool lacks.
     listed: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    /// Effort levels an OpenAI-compatible endpoint named for a model, by
+    /// account and model, read once and kept across refreshes. Empty when it
+    /// answered without a list.
+    reasoning_levels: Mutex<BTreeMap<(String, String), Vec<String>>>,
 }
 
 /// How long a refusal hides a model from an account: a plan change shows up
@@ -194,6 +198,7 @@ impl AppState {
             reserve_refresh: Mutex::new(BTreeMap::new()),
             refused: Mutex::new(BTreeMap::new()),
             listed: Mutex::new(BTreeMap::new()),
+            reasoning_levels: Mutex::new(BTreeMap::new()),
         }))
     }
 
@@ -414,6 +419,7 @@ impl AppState {
                                     context_length: m["context_length"]
                                         .as_u64()
                                         .or_else(|| m["context_window"].as_u64())
+                                        .or_else(|| m["max_context_length"].as_u64())
                                         .or_else(|| {
                                             native.and_then(|v| v["limit"]["context"].as_u64())
                                         }),
@@ -428,6 +434,15 @@ impl AppState {
                             })
                             .filter(|m| account.models.is_empty() || account.models.contains(&m.id))
                             .collect();
+                        if account.provider == SubscriptionProvider::OpenaiCompatible {
+                            let probe: BTreeSet<&str> = data
+                                .iter()
+                                .filter(|m| crate::openai_reasoning::needs_probe(m))
+                                .filter_map(|m| m["id"].as_str())
+                                .collect();
+                            self.reasoning_levels_for(&account, base, &probe, &mut available)
+                                .await;
+                        }
                     } else {
                         // A listing that times out or errors once must not
                         // empty the pool until the next restart: keep what
@@ -646,6 +661,68 @@ impl AppState {
             });
         }
         Some(models)
+    }
+
+    /// Fills the effort levels of `available` rows named in `probe`, asking
+    /// the endpoint only for the models this account has not answered yet.
+    async fn reasoning_levels_for(
+        &self,
+        account: &AccountCredential,
+        base: &str,
+        probe: &BTreeSet<&str>,
+        available: &mut [Model],
+    ) {
+        use futures_util::StreamExt;
+        let known = |model: &str| {
+            self.reasoning_levels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(account.id.clone(), model.to_owned()))
+                .cloned()
+        };
+        let missing: Vec<String> = available
+            .iter()
+            .filter(|m| probe.contains(m.id.as_str()) && known(&m.id).is_none())
+            .map(|m| m.id.clone())
+            .collect();
+        if !missing.is_empty() {
+            let url = crate::relay::endpoint(base, "/v1/chat/completions");
+            let headers = crate::relay::upstream_headers(account, &axum::http::HeaderMap::new());
+            let answers: Vec<(String, crate::openai_reasoning::Probe)> =
+                futures_util::stream::iter(missing)
+                    .map(|model| {
+                        let (url, headers) = (url.clone(), headers.clone());
+                        async move {
+                            let answer =
+                                crate::openai_reasoning::probe(&self.client, &url, headers, &model)
+                                    .await;
+                            (model, answer)
+                        }
+                    })
+                    .buffer_unordered(crate::openai_reasoning::PROBE_CONCURRENCY)
+                    .collect()
+                    .await;
+            let mut cache = self
+                .reasoning_levels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (model, answer) in answers {
+                let levels = match answer {
+                    crate::openai_reasoning::Probe::Levels(levels) => levels,
+                    crate::openai_reasoning::Probe::Silent => vec![],
+                    crate::openai_reasoning::Probe::Retry => continue,
+                };
+                cache.insert((account.id.clone(), model), levels);
+            }
+        }
+        for model in available
+            .iter_mut()
+            .filter(|m| probe.contains(m.id.as_str()))
+        {
+            if let Some(levels) = known(&model.id).filter(|levels| !levels.is_empty()) {
+                model.thinking = Some(json!({ "levels": levels }));
+            }
+        }
     }
 
     /// What an account's own live listing named, for routing its requests.

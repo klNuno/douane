@@ -765,3 +765,183 @@ async fn copilot_lists_enabled_models_and_uses_each_ones_path() {
     assert_eq!(calls[0].headers["anthropic-version"], "2023-06-01");
     assert_eq!(calls[0].body["model"], "claude-haiku-4.5");
 }
+
+/// Mistral's chat API as probed on 2026-11-07: `/models` says a model reasons
+/// without naming its efforts, a refused effort names them, and a reasoning
+/// answer is an array of thinking and text parts.
+async fn mistral(listed: bool) -> (Server, Arc<Upstream>) {
+    async fn chat(
+        State(upstream): State<Arc<Upstream>>,
+        OriginalUri(uri): OriginalUri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        upstream.seen.lock().unwrap().push(Seen {
+            path: uri.path().to_owned(),
+            headers,
+            body: body.clone(),
+        });
+        let supported = ["none", "low", "high", "xhigh", "max"];
+        if let Some(effort) = body["reasoning_effort"].as_str()
+            && !supported.contains(&effort)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"object":"error","message":format!(
+                    "reasoning_effort '{effort}' is not supported for this model; supported values: ['none', 'low', 'high', 'xhigh', 'max']"),
+                    "type":"invalid_request_invalid_args","code":"3051","raw_status_code":400})),
+            )
+                .into_response();
+        }
+        if body["messages"].as_array().is_none_or(Vec::is_empty) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"object":"error","message":"Conversation must have at least one message"})),
+            )
+                .into_response();
+        }
+        let content = if body["reasoning_effort"].is_string() && body["reasoning_effort"] != "none"
+        {
+            json!([{"type":"thinking","thinking":[{"type":"text","text":"2+4"}]},{"type":"text","text":"6"}])
+        } else {
+            json!("5")
+        };
+        Json(json!({"id":"c1","object":"chat.completion","model":body["model"],
+            "choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":3,"completion_tokens":2}}))
+        .into_response()
+    }
+    let upstream = Arc::new(Upstream::default());
+    let server = serve(
+        Router::new()
+            .route(
+                "/v1/models",
+                get(move || async move {
+                    let mut deepseek = json!({"id":"deepseek-v4-1-flash-1017","object":"model","max_context_length":1048576,
+                         "capabilities":{"completion_chat":true,"reasoning":true,"vision":true}});
+                    if listed {
+                        deepseek["thinking"] = json!({"levels":["none","low","high","xhigh","max"]});
+                    }
+                    Json(json!({"object":"list","data":[
+                        deepseek,
+                        {"id":"mistral-embed","object":"model","max_context_length":8192,
+                         "capabilities":{"completion_chat":false,"reasoning":false}}
+                    ]}))
+                }),
+            )
+            .route("/v1/chat/completions", post(chat))
+            .with_state(upstream.clone()),
+    )
+    .await;
+    (server, upstream)
+}
+
+/// Sends four Messages requests the way Claude Code words effort, and returns
+/// the `reasoning_effort` each one reached the endpoint with.
+async fn efforts_sent(gateway: &Gateway, seen: &Upstream) -> Vec<Value> {
+    let ask = |extra: Value| {
+        let mut body = json!({"model":"mistral/deepseek-v4-1-flash-1017","max_tokens":64,
+            "messages":[{"role":"user","content":"2+4?"}]});
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        body
+    };
+    // Claude Code 2.1.319 with `--effort medium` on a non-Claude model name.
+    let (status, body) = gateway
+        .post(
+            "/v1/messages",
+            ask(json!({"thinking":{"type":"adaptive","display":"omitted"},"output_config":{"effort":"medium"}})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["content"], json!([{"type":"text","text":"6"}]));
+    let (status, _) = gateway
+        .post(
+            "/v1/messages",
+            ask(json!({"output_config":{"effort":"max"}})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = gateway
+        .post("/v1/messages", ask(json!({"thinking":{"type":"disabled"}})))
+        .await;
+    assert_eq!(status, 200);
+    let (status, body) = gateway.post("/v1/messages", ask(json!({}))).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["content"][0]["text"], "5");
+    seen.seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.body["messages"].as_array().is_some_and(|m| !m.is_empty()))
+        .map(|c| {
+            c.body
+                .get("reasoning_effort")
+                .cloned()
+                .unwrap_or(Value::Null)
+        })
+        .collect()
+}
+
+/// A model whose row already names its levels: only the request translation
+/// stands between a Messages client's effort and the endpoint.
+#[tokio::test]
+async fn a_messages_effort_reaches_a_chat_endpoint_as_a_listed_level() {
+    let (server, seen) = mistral(true).await;
+    let gateway = Gateway::new(&[endpoint("mistral", &server.url, "key-mistral")]).await;
+    assert_eq!(
+        efforts_sent(&gateway, &seen).await,
+        [json!("high"), json!("max"), json!("none"), Value::Null]
+    );
+}
+
+#[tokio::test]
+async fn a_mistral_reasoning_model_lists_its_efforts_and_receives_the_chosen_one() {
+    let (server, seen) = mistral(false).await;
+    let gateway = Gateway::new(&[endpoint("mistral", &server.url, "key-mistral")]).await;
+    let models: Value = gateway
+        .client
+        .get(format!("{}/v1/models", gateway.server.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = |id: &str| {
+        models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    let deepseek = row("mistral/deepseek-v4-1-flash-1017");
+    assert_eq!(
+        deepseek["thinking"]["levels"],
+        json!(["none", "low", "high", "xhigh", "max"])
+    );
+    assert_eq!(deepseek["context_length"], 1048576);
+    assert!(row("mistral/mistral-embed")["thinking"].is_null());
+    let probes = |seen: &Upstream| {
+        seen.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.body["messages"].as_array().is_some_and(Vec::is_empty))
+            .count()
+    };
+    // One probe per reasoning model: the second value is never needed here,
+    // and a refresh reads the cache instead of asking again.
+    assert_eq!(probes(&seen), 1);
+    gateway.state.refresh_models().await;
+    assert_eq!(probes(&seen), 1);
+
+    assert_eq!(
+        efforts_sent(&gateway, &seen).await,
+        [json!("high"), json!("max"), json!("none"), Value::Null]
+    );
+}

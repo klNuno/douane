@@ -621,6 +621,26 @@ pub async fn forward(
             Ok(v) => v,
             Err(e) => return error(StatusCode::BAD_REQUEST, &e),
         };
+        // Chat Completions has no `output_config`: a Messages client's effort
+        // reaches a custom endpoint only as the `reasoning_effort` its model
+        // lists.
+        if account.provider == SubscriptionProvider::OpenaiCompatible
+            && from == Dialect::Messages
+            && to == Dialect::Chat
+        {
+            let thinking = state
+                .models
+                .read()
+                .await
+                .iter()
+                .find(|m| {
+                    m.provider == account.provider
+                        && m.upstream_id == model
+                        && m.route == account.route
+                })
+                .and_then(|m| m.thinking.clone());
+            crate::openai_reasoning::configure(&mut translated, &value, thinking.as_ref());
+        }
         let mut replay = if account.provider == SubscriptionProvider::Antigravity {
             crate::antigravity_system::normalize_system(&mut translated);
             let mut history = match translate::antigravity_history(&value, from) {
