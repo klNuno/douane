@@ -33,6 +33,17 @@ test('a browser without storage shows the warning instead of failing', () => {
   assert.equal(risk.riskAccepted(undefined), false);
 });
 
+test('a browser that blocks localStorage itself still opens the dashboard', () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, get() { throw new DOMException('blocked', 'SecurityError'); } });
+  try {
+    assert.equal(risk.riskAccepted(), false);
+    assert.doesNotThrow(() => risk.acceptRisk());
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'localStorage', original); else delete globalThis.localStorage;
+  }
+});
+
 test('the warning names the ban risk and can only be closed by accepting it', () => {
   const html = render(Notice, { props: { accept() {} } }).body;
   assert.match(html, /suspend or ban the account/);
