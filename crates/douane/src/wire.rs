@@ -191,6 +191,7 @@ fn translate_turn(turn: &Value, out: &mut Vec<Value>) -> Result<(), Untranslatab
     let mut has_image = false;
     let mut tool_calls = Vec::new();
     let mut results = Vec::new();
+    let mut tool_images = Vec::new();
 
     for b in blocks {
         match b.get("type").and_then(Value::as_str) {
@@ -201,29 +202,7 @@ fn translate_turn(turn: &Value, out: &mut Vec<Value>) -> Result<(), Untranslatab
                 }
             }
             Some("image") => {
-                let source = b
-                    .get("source")
-                    .ok_or_else(|| Untranslatable("image source is missing".into()))?;
-                let url = match source.get("type").and_then(Value::as_str) {
-                    Some("url") => source
-                        .get("url")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| Untranslatable("image URL is missing".into()))?
-                        .to_owned(),
-                    Some("base64") => {
-                        let media = source
-                            .get("media_type")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| Untranslatable("image media type is missing".into()))?;
-                        let data = source
-                            .get("data")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| Untranslatable("image data is missing".into()))?;
-                        format!("data:{media};base64,{data}")
-                    }
-                    _ => return Err(Untranslatable("unsupported image source".into())),
-                };
-                multimodal.push(json!({"type":"image_url","image_url":{"url":url}}));
+                multimodal.push(json!({"type":"image_url","image_url":{"url":image_url(b)?}}));
                 has_image = true;
             }
             Some("tool_use") => tool_calls.push(json!({
@@ -242,19 +221,44 @@ fn translate_turn(turn: &Value, out: &mut Vec<Value>) -> Result<(), Untranslatab
                 }
             })),
             Some("tool_result") => {
-                if b.get("content")
+                let id = b.get("tool_use_id").cloned().unwrap_or(Value::Null);
+                let parts = b
+                    .get("content")
                     .and_then(Value::as_array)
-                    .is_some_and(|parts| parts.iter().any(|part| part["type"] != "text"))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                if parts
+                    .iter()
+                    .any(|part| part["type"] != "text" && part["type"] != "image")
                 {
                     return Err(Untranslatable(
-                        "tool results containing non-text blocks cannot use this dialect".into(),
+                        "tool results containing non-text, non-image blocks cannot use this dialect".into(),
                     ));
+                }
+                // A tool message carries text only. Its images (Claude Code
+                // reading a PNG) follow the tool messages as one user message
+                // naming the call each came from.
+                let images = parts
+                    .iter()
+                    .filter(|part| part["type"] == "image")
+                    .map(|part| {
+                        Ok(json!({"type":"image_url","image_url":{"url":image_url(part)?}}))
+                    })
+                    .collect::<Result<Vec<_>, Untranslatable>>()?;
+                let mut content =
+                    flatten_text(b.get("content").unwrap_or(&Value::Null)).unwrap_or_default();
+                if !images.is_empty() {
+                    if content.is_empty() {
+                        content =
+                            "The tool returned an image, attached in the next message.".into();
+                    }
+                    tool_images.push(json!({"type":"text","text":format!("Image returned by tool call {}:", id.as_str().unwrap_or("?"))}));
+                    tool_images.extend(images);
                 }
                 results.push(json!({
                 "role": "tool",
-                "tool_call_id": b.get("tool_use_id").cloned().unwrap_or(Value::Null),
-                "content": flatten_text(b.get("content").unwrap_or(&Value::Null))
-                    .unwrap_or_default(),
+                "tool_call_id": id,
+                "content": content,
                 }));
             }
             // Signed thinking from a previous turn. Dropping it is safe in this
@@ -291,7 +295,58 @@ fn translate_turn(turn: &Value, out: &mut Vec<Value>) -> Result<(), Untranslatab
         out.push(Value::Object(m));
     }
     out.extend(results);
+    if !tool_images.is_empty() {
+        out.push(json!({"role": "user", "content": tool_images}));
+    }
     Ok(())
+}
+
+/// An Anthropic image block's source as an OpenAI `image_url` address.
+fn image_url(block: &Value) -> Result<String, Untranslatable> {
+    let source = block
+        .get("source")
+        .ok_or_else(|| Untranslatable("image source is missing".into()))?;
+    match source.get("type").and_then(Value::as_str) {
+        Some("url") => Ok(source
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Untranslatable("image URL is missing".into()))?
+            .to_owned()),
+        Some("base64") => {
+            let media = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Untranslatable("image media type is missing".into()))?;
+            let data = source
+                .get("data")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Untranslatable("image data is missing".into()))?;
+            Ok(format!("data:{media};base64,{data}"))
+        }
+        _ => Err(Untranslatable("unsupported image source".into())),
+    }
+}
+
+/// The answer text of an OpenAI message or delta `content`: the string, or
+/// the `text` parts of an array. Mistral sends the array when the model
+/// reasons, its `thinking` parts first; those are dropped for the reason
+/// `reasoning_content` is (see the module doc).
+pub(crate) fn chat_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(parts) => Some(
+            parts
+                .iter()
+                .filter(|p| {
+                    p.get("type")
+                        .and_then(Value::as_str)
+                        .is_none_or(|t| t == "text")
+                })
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<String>(),
+        ),
+        _ => None,
+    }
 }
 
 fn tool_choice_to_openai(tc: &Value) -> Value {
@@ -368,7 +423,7 @@ pub fn response_to_anthropic(body: &[u8], model: &str) -> Option<Vec<u8>> {
     let message = choice.get("message")?;
 
     let mut content = Vec::new();
-    if let Some(t) = message.get("content").and_then(Value::as_str)
+    if let Some(t) = message.get("content").and_then(chat_text)
         && !t.is_empty()
     {
         content.push(json!({"type": "text", "text": t}));
@@ -592,15 +647,15 @@ impl StreamTranslator {
             );
         }
 
-        if let Some(t) = delta.get("content").and_then(Value::as_str)
+        if let Some(t) = delta.get("content").and_then(chat_text)
             && !t.is_empty()
         {
             // Text can arrive between two fragments of the same tool. Hold it
             // behind the call until the terminal frame proves the call whole.
             if self.tools.is_empty() {
-                self.emit_text(t, out);
+                self.emit_text(&t, out);
             } else {
-                self.pending_text.push_str(t);
+                self.pending_text.push_str(&t);
             }
         }
 
@@ -995,6 +1050,79 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.0.contains("image"), "{}", e.0);
+    }
+
+    /// Claude Code reading a PNG sends an image inside a tool result. Chat
+    /// Completions tool messages carry text only, so the image follows them.
+    #[test]
+    fn a_tool_result_image_follows_the_tool_messages_as_a_user_image() {
+        let v = openai(
+            r#"{"model":"m","messages":[
+                {"role":"assistant","content":[
+                  {"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"a.png"}},
+                  {"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"b.txt"}}]},
+                {"role":"user","content":[
+                  {"type":"tool_result","tool_use_id":"t1","content":[
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0"}}]},
+                  {"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"hello"}]}]}]}"#,
+        );
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4, "{msgs:?}");
+        assert_eq!(msgs[1]["role"], "tool");
+        assert_eq!(msgs[1]["tool_call_id"], "t1");
+        assert!(msgs[1]["content"].as_str().unwrap().contains("image"));
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["content"], "hello");
+        assert_eq!(msgs[3]["role"], "user");
+        assert_eq!(msgs[3]["content"][0]["type"], "text");
+        assert!(
+            msgs[3]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("t1")
+        );
+        assert_eq!(msgs[3]["content"][1]["type"], "image_url");
+        assert_eq!(
+            msgs[3]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0"
+        );
+        let doc = request_to_openai(
+            br#"{"model":"m","messages":[{"role":"user","content":[
+              {"type":"tool_result","tool_use_id":"t1","content":[{"type":"document","source":{}}]}]}]}"#,
+        )
+        .unwrap_err();
+        assert!(doc.0.contains("non-image"), "{}", doc.0);
+    }
+
+    /// Mistral answers a reasoning model with an array: thinking, then text.
+    #[test]
+    fn an_array_answer_keeps_its_text_and_drops_its_thinking() {
+        let body = br#"{"id":"c1","choices":[{"index":0,"finish_reason":"stop",
+            "message":{"role":"assistant","content":[
+              {"type":"thinking","thinking":[{"type":"text","text":"2+4 is 6"}]},
+              {"type":"text","text":"6"}]}}],
+            "usage":{"prompt_tokens":10,"completion_tokens":5,
+                     "completion_tokens_details":{"reasoning_tokens":4}}}"#;
+        let v: Value = serde_json::from_slice(&response_to_anthropic(body, "m").unwrap()).unwrap();
+        assert_eq!(v["content"], json!([{"type":"text","text":"6"}]));
+        assert_eq!(v["usage"]["output_tokens"], 5);
+    }
+
+    /// The streamed shape captured from Mistral on 2026-11-07.
+    #[test]
+    fn array_deltas_stream_their_text_and_drop_their_thinking() {
+        let mut t = StreamTranslator::new("m");
+        let mut all = Vec::new();
+        all.extend(t.push(b"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n"));
+        all.extend(t.push(b"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"index\":0,\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"We\"}],\"closed\":true}]},\"finish_reason\":null}]}\n\n"));
+        all.extend(t.push(b"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"index\":0,\"content\":[{\"type\":\"text\",\"text\":\"6\"}]},\"finish_reason\":null}]}\n\n"));
+        all.extend(t.push(b"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"index\":0,\"content\":\"!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":43,\"completion_tokens\":21,\"completion_tokens_details\":{\"reasoning_tokens\":18}}}\n\ndata: [DONE]\n\n"));
+        let text: String = frames(&all)
+            .iter()
+            .filter(|f| f["type"] == "content_block_delta")
+            .map(|f| f["delta"]["text"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(text, "6!");
     }
 
     #[test]

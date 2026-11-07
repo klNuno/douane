@@ -6,6 +6,7 @@ mod antigravity_thinking;
 pub mod clients;
 pub mod ledger;
 pub mod management;
+mod openai_reasoning;
 pub mod quota_history;
 pub mod quota_view;
 pub mod relay;

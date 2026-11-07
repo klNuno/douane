@@ -725,7 +725,7 @@ fn to_chat_response(body: &Value, from: Dialect, model: &str) -> Result<Value, S
 fn chat_response_to_responses(body: &Value, model: &str, custom: &BTreeSet<String>) -> Value {
     let message = &body["choices"][0]["message"];
     let mut output = vec![];
-    if let Some(t) = message["content"].as_str().filter(|s| !s.is_empty()) {
+    if let Some(t) = crate::wire::chat_text(&message["content"]).filter(|s| !s.is_empty()) {
         output.push(json!({"type":"message","id":"msg_douane","role":"assistant","status":"completed","content":[{"type":"output_text","text":t,"annotations":[]}]}));
     }
     if let Some(calls) = message["tool_calls"].as_array() {
@@ -1293,12 +1293,12 @@ impl Bridge {
             out.push_str(&self.event("response.created",json!({"response":{"id":self.id,"object":"response","status":"in_progress","model":self.model,"output":[]}})));
         }
         let delta = &v["choices"][0]["delta"];
-        if let Some(t) = delta["content"].as_str().filter(|s| !s.is_empty()) {
+        if let Some(t) = crate::wire::chat_text(&delta["content"]).filter(|s| !s.is_empty()) {
             if self.text.is_empty() {
                 out.push_str(&self.event("response.output_item.added",json!({"output_index":0,"item":{"id":"msg_douane","type":"message","role":"assistant","status":"in_progress","content":[]}})));
                 out.push_str(&self.event("response.content_part.added",json!({"item_id":"msg_douane","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}})));
             }
-            self.text.push_str(t);
+            self.text.push_str(&t);
             if self.text.len() > 8 * 1024 * 1024 {
                 return Err("translated response exceeds 8 MiB".into());
             }
