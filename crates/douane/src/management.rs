@@ -1,7 +1,9 @@
 use crate::{
     relay::error,
     state::AppState,
-    subscriptions::{DetectError, OAuthClientError, SubscriptionError, SubscriptionProvider},
+    subscriptions::{
+        DetectError, DetectRequest, OAuthClientError, SubscriptionError, SubscriptionProvider,
+    },
 };
 use axum::{
     Json,
@@ -1213,10 +1215,11 @@ pub async fn delete_oauth_client(
     };
     change_oauth_client(&state, move |oauth| oauth.remove_oauth_client(provider)).await
 }
-/// Detects an installed Antigravity CLI and configures its OAuth client from
-/// the validated secret. Only Antigravity is detectable. The optional body
-/// `{"path": "..."}` overrides the default install location. The secret is
-/// never returned.
+/// Detects the Antigravity OAuth client and saves it. Only Antigravity is
+/// detectable. The optional JSON body: `path` to scan a given CLI binary
+/// instead of the known install locations, `client_secret` to check a secret
+/// douanectl detected on another machine instead of scanning, and `force` to
+/// replace another client set by hand. The secret is never returned.
 pub async fn detect_oauth_client(
     State(state): State<Arc<AppState>>,
     Path(provider): Path<String>,
@@ -1228,31 +1231,36 @@ pub async fn detect_oauth_client(
             "client detection is only available for antigravity",
         );
     }
-    // The body is optional: an empty body means detect at the default path.
-    let path = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|body| text_field(&body, "path"));
-    detect_response(state.oauth.detect_antigravity_client(path).await)
-}
-/// A trimmed, non-empty string field, or `None`.
-fn text_field(body: &Value, key: &str) -> Option<String> {
-    body.get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+    let request = match DetectRequest::parse(&body) {
+        Ok(request) => request,
+        Err(e) => return detect_response(Err(e)),
+    };
+    let force = request.force;
+    let oauth = state.oauth.clone();
+    let detected = match oauth.detect_antigravity_client(request).await {
+        Ok(detected) => detected,
+        Err(e) => return detect_response(Err(e)),
+    };
+    // Saving writes the file (and, on Windows, runs icacls): keep it off the
+    // async workers, as PUT and DELETE do.
+    detect_response(
+        tokio::task::spawn_blocking(move || oauth.save_antigravity_client(detected, force))
+            .await
+            .unwrap_or(Err(DetectError::Storage)),
+    )
 }
 fn detect_response(result: Result<crate::subscriptions::OAuthClientView, DetectError>) -> Response {
     match result {
         Ok(view) => Json(json!(view)).into_response(),
         Err(e) => error(
             match e {
-                DetectError::NotFound => StatusCode::NOT_FOUND,
-                DetectError::NoMatchingClient | DetectError::Unreadable => {
-                    StatusCode::UNPROCESSABLE_ENTITY
-                }
+                DetectError::Invalid(_) => StatusCode::BAD_REQUEST,
+                DetectError::NotFound | DetectError::PathNotFound => StatusCode::NOT_FOUND,
+                DetectError::NoMatchingClient
+                | DetectError::RejectedSecret
+                | DetectError::Unreadable => StatusCode::UNPROCESSABLE_ENTITY,
                 DetectError::GoogleUnreachable => StatusCode::BAD_GATEWAY,
-                DetectError::EnvManaged => StatusCode::CONFLICT,
+                DetectError::EnvManaged | DetectError::Conflict => StatusCode::CONFLICT,
                 DetectError::Storage => StatusCode::INTERNAL_SERVER_ERROR,
             },
             &e.to_string(),

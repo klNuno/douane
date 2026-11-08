@@ -131,13 +131,25 @@ impl OAuthManager {
         self.google.remove_client(provider)
     }
 
-    /// Detects an installed Antigravity CLI and configures its client from the
-    /// validated secret. `path` overrides the default install location.
+    /// Finds and validates the Antigravity client secret, from an installed
+    /// Antigravity CLI or a secret douanectl detected elsewhere. Nothing is
+    /// saved: pass the result to `save_antigravity_client`.
     pub async fn detect_antigravity_client(
         &self,
-        path: Option<String>,
+        request: super::DetectRequest,
+    ) -> Result<super::DetectedClient, super::DetectError> {
+        self.google.detect_antigravity(request).await
+    }
+
+    /// Saves a detected Antigravity client, effective at once; the Cloud
+    /// project already set is kept. Blocking file IO: run it on the blocking
+    /// pool.
+    pub fn save_antigravity_client(
+        &self,
+        detected: super::DetectedClient,
+        force: bool,
     ) -> Result<OAuthClientView, super::DetectError> {
-        self.google.detect_antigravity(path).await
+        self.google.save_detected(detected, force)
     }
 
     /// Imports a credential file. A Google account without a Cloud project

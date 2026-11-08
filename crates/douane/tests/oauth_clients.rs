@@ -113,11 +113,17 @@ async fn google_clients_are_read_changed_and_reset_without_restart_or_secret_exp
 
     let (status, text) = call(&app, "GET", "/admin/api/oauth-clients", None).await;
     assert_eq!(status, 200);
-    let body: Value = serde_json::from_str(&text).unwrap();
-    // Douane ships no client: both providers start with none.
+    let mut body: Value = serde_json::from_str(&text).unwrap();
+    // Douane ships no client: both providers start with none. Whether
+    // Antigravity is detectable depends on this machine; Gemini never is.
+    assert!(body["clients"][0]["detectable"].is_boolean());
+    body["clients"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("detectable");
     assert_eq!(
         body["clients"][1],
-        json!({"provider":"gemini","source":"none","client_id":null,"has_secret":false,"project_id":null,"origin":null,"read_only":false})
+        json!({"provider":"gemini","source":"none","client_id":null,"has_secret":false,"project_id":null,"origin":null,"detectable":false,"read_only":false})
     );
     assert_eq!(
         body["clients"][0],
@@ -140,7 +146,7 @@ async fn google_clients_are_read_changed_and_reset_without_restart_or_secret_exp
     let view: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
         view,
-        json!({"provider":"gemini","source":"file","client_id":"fixture-id","has_secret":true,"project_id":"fixture-project","origin":null,"read_only":false})
+        json!({"provider":"gemini","source":"file","client_id":"fixture-id","has_secret":true,"project_id":"fixture-project","origin":null,"detectable":false,"read_only":false})
     );
     let saved: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
     assert_eq!(saved["gemini"]["client_secret"], "fixture-client-secret");
@@ -399,7 +405,10 @@ async fn antigravity_detection_reports_clear_errors_without_a_network_call() {
     )
     .await;
     assert_eq!(status, 404, "{text}");
-    assert!(text.contains("no Antigravity CLI"), "{text}");
+    assert!(
+        text.contains("no file was found at the given Antigravity CLI path"),
+        "{text}"
+    );
 
     // A binary without douane's client id is no match, and no secret of any
     // kind reaches the response. The scan runs; no Google call is made.
@@ -420,6 +429,61 @@ async fn antigravity_detection_reports_clear_errors_without_a_network_call() {
     assert!(!text.contains("GOCSPX-"), "{text}");
     assert!(!file.exists());
     assert_eq!(oauth_flag(&app, "antigravity").await, false);
+
+    // A malformed request is refused, and a submitted secret is not echoed.
+    for body in [
+        json!([]),
+        json!({"force":"yes"}),
+        json!({"path":"agy","client_secret":"leaked-secret"}),
+    ] {
+        let (status, text) = call(
+            &app,
+            "POST",
+            "/admin/api/oauth-clients/antigravity/detect",
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, 400, "{text}");
+        assert!(!text.contains("leaked"), "{text}");
+    }
+
+    // A client set by hand is never replaced without force: refused before
+    // any scan or Google call, and left as it was.
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/admin/api/oauth-clients/antigravity",
+        Some(json!({"client_id":"hand-id","client_secret":"hand-secret","project_id":"hand-project"})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let before = std::fs::read(&file).unwrap();
+    for body in [
+        json!({ "path": binary.display().to_string() }),
+        json!({ "client_secret": "leaked-secret" }),
+    ] {
+        let (status, text) = call(
+            &app,
+            "POST",
+            "/admin/api/oauth-clients/antigravity/detect",
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, 409, "{text}");
+        assert!(text.contains("force"), "{text}");
+        assert!(!text.contains("leaked"), "{text}");
+    }
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+    // With force, the scan runs (and finds no match here).
+    let (status, text) = call(
+        &app,
+        "POST",
+        "/admin/api/oauth-clients/antigravity/detect",
+        Some(json!({ "path": binary.display().to_string(), "force": true })),
+    )
+    .await;
+    assert_eq!(status, 422, "{text}");
+    assert_eq!(std::fs::read(&file).unwrap(), before);
 }
 
 async fn gemini_start(app: &axum::Router) -> (u16, Value) {

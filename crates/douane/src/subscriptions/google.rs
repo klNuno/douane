@@ -3,7 +3,8 @@
 //! ships no secret: a client is configured through env, `oauth-clients.json`,
 //! the API, or detected from an installed Antigravity CLI.
 
-use super::antigravity_detect::{self, DetectError};
+use super::antigravity_detect::{self, DetectError, DetectRequest, DetectedClient};
+use super::antigravity_scan;
 use super::oauth::{google_verification_error, send_json};
 use super::store::text;
 use super::{SubscriptionError, SubscriptionProvider, timestamp};
@@ -11,8 +12,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock, RwLock, TryLockError},
+    sync::{Arc, Mutex, OnceLock, RwLock, TryLockError},
     time::{Duration, SystemTime},
 };
 
@@ -66,6 +68,15 @@ const GOOGLE_CLIENTS: [(SubscriptionProvider, &str, &str); 2] = [
 /// The largest `oauth-clients.json` douane reads.
 const MAX_CLIENT_FILE: u64 = 65_536;
 
+/// The `origin` douane records for a client detected from an Antigravity CLI.
+/// Only detection sets it; the API never takes an origin from a caller.
+const DETECTED_ORIGIN: &str = "antigravity-cli";
+/// Each Google call that checks a detected secret gives up after this long.
+const DETECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Checking every candidate of one detection gives up after this long, so a
+/// detection can never hang.
+const DETECT_DEADLINE: Duration = Duration::from_secs(60);
+
 #[derive(Clone)]
 struct ClientMetadata {
     id: String,
@@ -95,6 +106,9 @@ pub struct OAuthClientView {
     /// How a `file` client was obtained, e.g. `"antigravity-cli"` for one
     /// detected from an installed Antigravity CLI; `null` otherwise.
     pub origin: Option<String>,
+    /// An Antigravity CLI is installed on the douane machine, so one-click
+    /// detection can work. Always false for Gemini.
+    pub detectable: bool,
     /// Set by environment variables, which the API cannot change.
     pub read_only: bool,
 }
@@ -180,6 +194,7 @@ fn resolve_clients(file: &Value, env: &dyn Fn(&str) -> Option<String>) -> Client
             has_secret: secret.is_some(),
             project_id: project,
             origin,
+            detectable: false,
             read_only: source == OAuthClientSource::Env,
         });
         if let Some(secret) = secret {
@@ -267,11 +282,21 @@ fn client_field(
 
 /// Reads one environment variable; tests replace the process environment.
 type Environment = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
+/// Reads one environment variable as the OS has it, to find an installed
+/// Antigravity CLI (`PATH` may not be UTF-8); tests replace it too.
+type InstallEnvironment = Arc<dyn Fn(&str) -> Option<OsString> + Send + Sync>;
+
+/// Whether detecting replaces a client the operator chose: one with another
+/// id than Antigravity's that douane did not detect itself.
+fn detect_replaces(client_id: Option<&str>, origin: Option<&str>) -> bool {
+    client_id.is_some_and(|id| id != ANTIGRAVITY_CLIENT) && origin != Some(DETECTED_ORIGIN)
+}
 
 pub(crate) struct GoogleOAuth {
     client: reqwest::Client,
     path: PathBuf,
     env: Environment,
+    install_env: InstallEnvironment,
     clients: RwLock<Clients>,
     /// Serializes changes to `oauth-clients.json`.
     write: Mutex<()>,
@@ -280,6 +305,8 @@ pub(crate) struct GoogleOAuth {
     codeassist_url: String,
     daily_url: String,
     poll_delay: Duration,
+    detect_request_timeout: Duration,
+    detect_deadline: Duration,
 }
 
 impl GoogleOAuth {
@@ -296,6 +323,7 @@ impl GoogleOAuth {
             client,
             path: path.to_owned(),
             env: Box::new(process_env),
+            install_env: Arc::new(|name: &str| std::env::var_os(name)),
             clients: RwLock::new(clients),
             write: Mutex::new(()),
             token_url: "https://oauth2.googleapis.com/token".into(),
@@ -303,6 +331,8 @@ impl GoogleOAuth {
             codeassist_url: "https://cloudcode-pa.googleapis.com/v1internal".into(),
             daily_url: "https://daily-cloudcode-pa.googleapis.com/v1internal".into(),
             poll_delay: Duration::from_secs(5),
+            detect_request_timeout: DETECT_REQUEST_TIMEOUT,
+            detect_deadline: DETECT_DEADLINE,
         }
     }
 
@@ -374,12 +404,35 @@ impl GoogleOAuth {
     }
 
     /// Re-reads `oauth-clients.json` and the environment, applies them and
-    /// returns the clients, so hand edits to the file show and take effect.
-    /// A file that cannot be read is reported and changes nothing.
+    /// returns the clients as the API shows them, so hand edits to the file
+    /// show and take effect. A file that cannot be read is reported and
+    /// changes nothing. Blocking: it reads files.
     pub(crate) fn reload_views(&self) -> Vec<OAuthClientView> {
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         self.reread(file_stamp(&self.path));
-        self.client_views()
+        let detectable = self.detectable();
+        let mut views = self.client_views();
+        for view in &mut views {
+            view.detectable = detectable && view.provider == SubscriptionProvider::Antigravity;
+        }
+        views
+    }
+
+    /// One client as the API shows it, with `detectable` filled in.
+    /// Blocking: it looks for an installed CLI.
+    fn public_view(
+        &self,
+        provider: SubscriptionProvider,
+    ) -> Result<OAuthClientView, OAuthClientError> {
+        let mut view = self.view(provider)?;
+        view.detectable = provider == SubscriptionProvider::Antigravity && self.detectable();
+        Ok(view)
+    }
+
+    /// Whether an Antigravity CLI is installed on the douane machine, at its
+    /// known location or on `PATH`.
+    fn detectable(&self) -> bool {
+        !antigravity_scan::install_paths(&*self.install_env).is_empty()
     }
 
     fn view(&self, provider: SubscriptionProvider) -> Result<OAuthClientView, OAuthClientError> {
@@ -468,22 +521,22 @@ impl GoogleOAuth {
             256,
             "project_id must be a non-empty single-line string of at most 256 bytes, or null",
         )?;
-        // How the client was obtained (e.g. "antigravity-cli"); internal.
-        let origin = client_field(
-            body,
-            "origin",
-            64,
-            "origin must be a non-empty single-line string of at most 64 bytes",
-        )?;
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let mut file = self.writable(provider)?;
         let stored = file.get(provider.as_str()).unwrap_or(&Value::Null);
-        let secret = match secret {
-            Some(secret) => secret,
-            None => text(stored, &["client_secret"])
-                .filter(|_| text(stored, &["client_id"]).as_deref() == Some(id.as_str()))
-                .ok_or(OAuthClientError::Invalid("client_secret is required"))?,
-        };
+        let stored_secret = text(stored, &["client_secret"])
+            .filter(|_| text(stored, &["client_id"]).as_deref() == Some(id.as_str()));
+        // The origin is never read from the body: only detection records
+        // one. An edit that keeps the same client (same id and secret, e.g. a
+        // new project) keeps it; any other client is a manual one.
+        let keeps_client = stored_secret.is_some()
+            && secret
+                .as_ref()
+                .is_none_or(|s| Some(s) == stored_secret.as_ref());
+        let origin = text(stored, &["origin"]).filter(|_| keeps_client);
+        let secret = secret
+            .or(stored_secret)
+            .ok_or(OAuthClientError::Invalid("client_secret is required"))?;
         let mut entry = json!({"client_id": id, "client_secret": secret});
         if let Some(project) = project {
             entry["project_id"] = json!(project);
@@ -493,7 +546,7 @@ impl GoogleOAuth {
         }
         file[provider.as_str()] = entry;
         self.save(&file)?;
-        self.view(provider)
+        self.public_view(provider)
     }
 
     /// Removes a provider's custom client: it falls back to none, so sign-in
@@ -512,7 +565,7 @@ impl GoogleOAuth {
         } else {
             self.apply(&file, file_stamp(&self.path));
         }
-        self.view(provider)
+        self.public_view(provider)
     }
 
     /// The client id and secret for an account or a sign-in started with
@@ -544,66 +597,125 @@ impl GoogleOAuth {
         }
     }
 
-    /// Detects an Antigravity CLI on this machine, validates its embedded
-    /// client secret against Google, and saves the matching client through the
-    /// normal set-client path (atomic write, hardened permissions, live
-    /// reload). The scan runs on the blocking pool; validation and the save
-    /// follow. The secret is never logged or returned.
-    pub(crate) async fn detect_antigravity(
-        &self,
-        explicit: Option<String>,
-    ) -> Result<OAuthClientView, DetectError> {
-        // A client the environment sets cannot be changed: fail before the scan.
-        if self
+    /// Refuses a detection that cannot be saved, before any scan or Google
+    /// call: a client set by environment variables, or another client chosen
+    /// by hand unless `force` says to replace it. It reads the live clients
+    /// without touching the file; saving reads the file and checks again.
+    fn check_detect_target(&self, force: bool) -> Result<(), DetectError> {
+        let view = self
             .view(SubscriptionProvider::Antigravity)
-            .map(|view| view.read_only)
-            .unwrap_or(false)
-        {
+            .map_err(|_| DetectError::Storage)?;
+        if view.read_only {
             return Err(DetectError::EnvManaged);
         }
-        let path = match explicit.map(|path| path.trim().to_owned()) {
-            Some(path) if !path.is_empty() => {
-                let path = PathBuf::from(path);
-                if !path.is_file() {
-                    return Err(DetectError::NotFound);
-                }
-                path
-            }
-            _ => antigravity_detect::default_install_path().ok_or(DetectError::NotFound)?,
-        };
-        let scan = tokio::task::spawn_blocking(move || {
-            antigravity_detect::scan_file(&path, ANTIGRAVITY_CLIENT)
-        })
-        .await
-        .map_err(|_| DetectError::Storage)??;
-        if !scan.client_id_present {
-            return Err(DetectError::NoMatchingClient);
+        if !force
+            && view.source == OAuthClientSource::File
+            && detect_replaces(view.client_id.as_deref(), view.origin.as_deref())
+        {
+            return Err(DetectError::Conflict);
         }
-        for candidate in scan.candidates {
-            if self.validate_antigravity_secret(&candidate).await? {
-                let body = json!({
-                    "client_id": ANTIGRAVITY_CLIENT,
-                    "client_secret": candidate,
-                    "origin": "antigravity-cli",
-                });
-                return self
-                    .set_client(SubscriptionProvider::Antigravity, &body)
-                    .map_err(|error| match error {
-                        OAuthClientError::Environment(_) => DetectError::EnvManaged,
-                        _ => DetectError::Storage,
-                    });
-            }
-        }
-        Err(DetectError::NoMatchingClient)
+        Ok(())
     }
 
-    /// True when `candidate` is the Antigravity client's secret: a refresh with
+    /// Finds the Antigravity client secret: from an Antigravity CLI on this
+    /// machine (an explicit path, else the known install locations), or the
+    /// secret douanectl detected elsewhere, and keeps it only once Google's
+    /// token endpoint accepts it. The scan runs on the blocking pool, and
+    /// checking the candidates gives up after `detect_deadline`. Nothing is
+    /// saved here: `save_detected` does that. The secret is never logged.
+    pub(crate) async fn detect_antigravity(
+        &self,
+        request: DetectRequest,
+    ) -> Result<DetectedClient, DetectError> {
+        self.check_detect_target(request.force)?;
+        let remote = request.client_secret.is_some();
+        let candidates = match request.client_secret {
+            Some(secret) => vec![secret],
+            None => {
+                // Looking for the CLI and reading it is file IO: all of it
+                // runs on the blocking pool.
+                let (path, install_env) = (request.path, self.install_env.clone());
+                tokio::task::spawn_blocking(move || {
+                    let (paths, explicit) = match path {
+                        Some(path) if !path.is_file() => return Err(DetectError::PathNotFound),
+                        Some(path) => (vec![path], true),
+                        None => match antigravity_scan::install_paths(&*install_env) {
+                            paths if paths.is_empty() => return Err(DetectError::NotFound),
+                            paths => (paths, false),
+                        },
+                    };
+                    antigravity_detect::scan_installs(&paths, ANTIGRAVITY_CLIENT, explicit)
+                })
+                .await
+                .map_err(|_| DetectError::Unreadable)??
+                .candidates
+            }
+        };
+        let found = tokio::time::timeout(self.detect_deadline, async {
+            for candidate in candidates {
+                if self.validate_antigravity_secret(&candidate).await? {
+                    return Ok(Some(candidate));
+                }
+            }
+            Ok(None)
+        })
+        .await
+        .map_err(|_| DetectError::GoogleUnreachable)??;
+        match found {
+            Some(secret) => Ok(DetectedClient { secret }),
+            None if remote => Err(DetectError::RejectedSecret),
+            None => Err(DetectError::NoMatchingClient),
+        }
+    }
+
+    /// Saves a detected client as Antigravity's, through the same atomic,
+    /// owner-only write as the API, recorded with the `antigravity-cli`
+    /// origin. The Cloud project already set is kept. Blocking: run it on the
+    /// blocking pool.
+    pub(crate) fn save_detected(
+        &self,
+        detected: DetectedClient,
+        force: bool,
+    ) -> Result<OAuthClientView, DetectError> {
+        let provider = SubscriptionProvider::Antigravity;
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let mut file = self.writable(provider).map_err(|error| match error {
+            OAuthClientError::Environment(_) => DetectError::EnvManaged,
+            _ => DetectError::Storage,
+        })?;
+        let stored = file.get(provider.as_str()).unwrap_or(&Value::Null);
+        if !force
+            && detect_replaces(
+                text(stored, &["client_id"]).as_deref(),
+                text(stored, &["origin"]).as_deref(),
+            )
+        {
+            return Err(DetectError::Conflict);
+        }
+        let mut entry = json!({
+            "client_id": ANTIGRAVITY_CLIENT,
+            "client_secret": detected.secret,
+            "origin": DETECTED_ORIGIN,
+        });
+        if let Some(project) = text(stored, &["project_id"]) {
+            entry["project_id"] = json!(project);
+        }
+        file[provider.as_str()] = entry;
+        self.save(&file).map_err(|_| DetectError::Storage)?;
+        self.public_view(provider).map_err(|_| DetectError::Storage)
+    }
+
+    /// Whether `candidate` is the Antigravity client's secret: a refresh with
     /// a deliberately invalid refresh token answers `invalid_grant` for the
-    /// right secret and `invalid_client` for a wrong one. Never logs the value.
+    /// right secret and `invalid_client` for a wrong one. Anything else (no
+    /// answer in time, a 429 or 5xx, another error such as
+    /// `temporarily_unavailable`) says nothing about the secret, so detection
+    /// stops and asks to try again. Never logs the value.
     async fn validate_antigravity_secret(&self, candidate: &str) -> Result<bool, DetectError> {
         let response = self
             .client
             .post(&self.token_url)
+            .timeout(self.detect_request_timeout)
             .form(&[
                 ("client_id", ANTIGRAVITY_CLIENT),
                 ("client_secret", candidate),
@@ -613,11 +725,19 @@ impl GoogleOAuth {
             .send()
             .await
             .map_err(|_| DetectError::GoogleUnreachable)?;
+        let status = response.status();
+        if status.as_u16() == 429 || status.is_server_error() {
+            return Err(DetectError::GoogleUnreachable);
+        }
         let body: Value = response
             .json()
             .await
             .map_err(|_| DetectError::GoogleUnreachable)?;
-        Ok(text(&body, &["error"]).as_deref() == Some("invalid_grant"))
+        match text(&body, &["error"]).as_deref() {
+            Some("invalid_grant") => Ok(true),
+            Some("invalid_client") => Ok(false),
+            _ => Err(DetectError::GoogleUnreachable),
+        }
     }
 
     /// Replaces the process environment, so tests do not depend on the
@@ -627,7 +747,10 @@ impl GoogleOAuth {
         &mut self,
         env: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
     ) {
-        self.env = Box::new(env);
+        let env = Arc::new(env);
+        let install = env.clone();
+        self.install_env = Arc::new(move |name| install(name).map(OsString::from));
+        self.env = Box::new(move |name| env(name));
         let stamp = file_stamp(&self.path);
         let file = read_client_file(&self.path).unwrap_or(Value::Null);
         self.apply(&file, stamp);
@@ -641,6 +764,13 @@ impl GoogleOAuth {
         self.codeassist_url = format!("{endpoint}/v1internal");
         self.daily_url = format!("{endpoint}/daily");
         self.poll_delay = Duration::ZERO;
+    }
+
+    /// Shortens detection's per-call timeout and overall deadline.
+    #[cfg(test)]
+    pub(crate) fn use_test_detect_timeouts(&mut self, request: Duration, deadline: Duration) {
+        self.detect_request_timeout = request;
+        self.detect_deadline = deadline;
     }
 
     /// The Google sign-in URL, and the client and project it starts with;
@@ -1527,16 +1657,17 @@ mod tests {
             assert_eq!(error.to_string(), message);
         }
         // The public Antigravity id can be saved as a custom client (a pasted
-        // or detected client uses exactly that id); `origin` is recorded.
+        // or detected client uses exactly that id). Only detection records an
+        // origin: a body's `origin` is ignored.
         let view = google
             .set_client(
                 SubscriptionProvider::Antigravity,
-                &json!({"client_id":ANTIGRAVITY_CLIENT,"client_secret":"detected-secret","origin":"antigravity-cli"}),
+                &json!({"client_id":ANTIGRAVITY_CLIENT,"client_secret":"pasted-secret","origin":"antigravity-cli"}),
             )
             .unwrap();
         assert_eq!(view.source, OAuthClientSource::File);
         assert_eq!(view.client_id.as_deref(), Some(ANTIGRAVITY_CLIENT));
-        assert_eq!(view.origin.as_deref(), Some("antigravity-cli"));
+        assert_eq!(view.origin, None);
         assert!(view.has_secret);
         // A provider without a client is refused before its body is read.
         for body in [json!({"client_id":"id","client_secret":"s"}), json!([])] {
@@ -2172,6 +2303,31 @@ mod tests {
         (endpoint, calls, task)
     }
 
+    /// A loopback token endpoint answering every call with `status` and
+    /// `body`, or never answering when `body` is None.
+    async fn answering_fixture(
+        status: u16,
+        body: Option<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || async move {
+                match body {
+                    Some(body) => (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        [("content-type", "application/json")],
+                        body,
+                    ),
+                    None => std::future::pending().await,
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (endpoint, task)
+    }
+
     /// Writes a synthetic CLI binary holding the client id and `secrets`.
     fn synthetic_binary(directory: &Path, present: bool, secrets: &[String]) -> PathBuf {
         let mut data: Vec<u8> = b"ELF noise before".to_vec();
@@ -2188,6 +2344,34 @@ mod tests {
         path
     }
 
+    /// A Google client configured for detection tests: no `DOUANE_*`
+    /// variable and no installed CLI from the developer's machine.
+    fn detect_google(clients_path: &Path, endpoint: &str) -> GoogleOAuth {
+        let mut google = GoogleOAuth::load(reqwest::Client::new(), clients_path);
+        google.use_test_env(|_| None);
+        google.use_test_endpoint(endpoint);
+        google
+    }
+
+    fn scan_request(path: &Path) -> DetectRequest {
+        DetectRequest {
+            path: Some(path.to_owned()),
+            ..DetectRequest::default()
+        }
+    }
+
+    impl GoogleOAuth {
+        /// Detects and saves, as the detect route does.
+        async fn detect_and_save(
+            &self,
+            request: DetectRequest,
+        ) -> Result<OAuthClientView, DetectError> {
+            let force = request.force;
+            let detected = self.detect_antigravity(request).await?;
+            self.save_detected(detected, force)
+        }
+    }
+
     #[tokio::test]
     async fn detection_validates_and_saves_the_matching_client_without_exposing_the_secret() {
         let right = detect_secret("rightrightrightrightright012");
@@ -2195,15 +2379,10 @@ mod tests {
         let (endpoint, calls, task) = detect_fixture(right.clone()).await;
         let directory = tempfile::tempdir().unwrap();
         let clients_path = directory.path().join("oauth-clients.json");
-        let mut google = GoogleOAuth::load(reqwest::Client::new(), &clients_path);
-        google.use_test_env(|_| None);
-        google.use_test_endpoint(&endpoint);
+        let google = detect_google(&clients_path, &endpoint);
         // The wrong secret is tried first, then the right one.
         let binary = synthetic_binary(directory.path(), true, &[wrong, right.clone()]);
-        let view = google
-            .detect_antigravity(Some(binary.display().to_string()))
-            .await
-            .unwrap();
+        let view = google.detect_and_save(scan_request(&binary)).await.unwrap();
         assert_eq!(view.source, OAuthClientSource::File);
         assert_eq!(view.client_id.as_deref(), Some(ANTIGRAVITY_CLIENT));
         assert_eq!(view.origin.as_deref(), Some("antigravity-cli"));
@@ -2224,40 +2403,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detection_finds_the_cli_on_path_and_reports_it_detectable() {
+        let right = detect_secret("onpathonpathonpathonpath0123");
+        let (endpoint, _calls, task) = detect_fixture(right.clone()).await;
+        let directory = tempfile::tempdir().unwrap();
+        let clients_path = directory.path().join("oauth-clients.json");
+        let mut google = detect_google(&clients_path, &endpoint);
+        // No CLI anywhere: not detectable, and detection says where to go.
+        assert!(!google.reload_views().iter().any(|view| view.detectable));
+        let error = google
+            .detect_and_save(DetectRequest::default())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, DetectError::NotFound));
+        assert!(error.to_string().contains("douanectl"));
+
+        // A CLI named `agy` on PATH is found without a path.
+        let bin = directory.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let binary = synthetic_binary(directory.path(), true, &[right]);
+        std::fs::rename(
+            &binary,
+            bin.join(format!("agy{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .unwrap();
+        let path = bin.display().to_string();
+        google.use_test_env(move |name| (name == "PATH").then(|| path.clone()));
+        let views = google.reload_views();
+        assert!(views[0].detectable && !views[1].detectable);
+        let view = google
+            .detect_and_save(DetectRequest::default())
+            .await
+            .unwrap();
+        assert!(view.detectable);
+        assert_eq!(view.origin.as_deref(), Some("antigravity-cli"));
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
     async fn detection_reports_no_match_an_env_managed_client_and_an_unreachable_google() {
         let right = detect_secret("abcdefghijklmnopqrstuvwx0123");
         let (endpoint, _calls, task) = detect_fixture(right.clone()).await;
         let directory = tempfile::tempdir().unwrap();
         let clients_path = directory.path().join("oauth-clients.json");
-        let mut google = GoogleOAuth::load(reqwest::Client::new(), &clients_path);
-        google.use_test_env(|_| None);
-        google.use_test_endpoint(&endpoint);
+        let mut google = detect_google(&clients_path, &endpoint);
 
         // A binary without the client id is no match.
-        let without_id = synthetic_binary(directory.path(), false, &[right.clone()]);
+        let without_id = synthetic_binary(directory.path(), false, std::slice::from_ref(&right));
         assert!(matches!(
-            google
-                .detect_antigravity(Some(without_id.display().to_string()))
-                .await,
+            google.detect_and_save(scan_request(&without_id)).await,
             Err(DetectError::NoMatchingClient)
         ));
         // A binary with the id but no matching secret is no match.
         let wrong = detect_secret("zzzzzzzzzzzzzzzzzzzzzzzz9999");
         let no_secret = synthetic_binary(directory.path(), true, &[wrong]);
         assert!(matches!(
-            google
-                .detect_antigravity(Some(no_secret.display().to_string()))
-                .await,
+            google.detect_and_save(scan_request(&no_secret)).await,
             Err(DetectError::NoMatchingClient)
         ));
-        // A missing path is not found.
+        // A missing path is reported as such.
         assert!(matches!(
             google
-                .detect_antigravity(Some(
-                    directory.path().join("absent.bin").display().to_string()
-                ))
+                .detect_and_save(scan_request(&directory.path().join("absent.bin")))
                 .await,
-            Err(DetectError::NotFound)
+            Err(DetectError::PathNotFound)
         ));
         // Nothing was saved by a failed detection.
         assert!(!clients_path.exists());
@@ -2266,9 +2477,7 @@ mod tests {
         google.use_test_endpoint("http://127.0.0.1:1");
         let binary = synthetic_binary(directory.path(), true, &[right]);
         assert!(matches!(
-            google
-                .detect_antigravity(Some(binary.display().to_string()))
-                .await,
+            google.detect_and_save(scan_request(&binary)).await,
             Err(DetectError::GoogleUnreachable)
         ));
 
@@ -2278,10 +2487,231 @@ mod tests {
             (name == "DOUANE_ANTIGRAVITY_CLIENT_ID").then(|| "env-id".to_owned())
         });
         assert!(matches!(
-            google.detect_antigravity(None).await,
+            google.detect_and_save(DetectRequest::default()).await,
             Err(DetectError::EnvManaged)
         ));
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_silent_google_times_out_instead_of_hanging_detection() {
+        let (endpoint, task) = answering_fixture(200, None).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut google = detect_google(&directory.path().join("oauth-clients.json"), &endpoint);
+        let binary = synthetic_binary(
+            directory.path(),
+            true,
+            &[detect_secret("silentsilentsilentsilent0123")],
+        );
+        // Each call gives up on its own...
+        google.use_test_detect_timeouts(Duration::from_millis(200), Duration::from_secs(30));
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            google.detect_and_save(scan_request(&binary)).await,
+            Err(DetectError::GoogleUnreachable)
+        ));
+        // ...and the overall deadline ends detection even when each call may
+        // wait longer.
+        google.use_test_detect_timeouts(Duration::from_secs(30), Duration::from_millis(200));
+        assert!(matches!(
+            google.detect_and_save(scan_request(&binary)).await,
+            Err(DetectError::GoogleUnreachable)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(DETECT_REQUEST_TIMEOUT, Duration::from_secs(15));
+        assert_eq!(DETECT_DEADLINE, Duration::from_secs(60));
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn only_invalid_client_means_a_wrong_secret() {
+        let directory = tempfile::tempdir().unwrap();
+        let clients_path = directory.path().join("oauth-clients.json");
+        let binary = synthetic_binary(
+            directory.path(),
+            true,
+            &[detect_secret("outageoutageoutageoutage0123")],
+        );
+        for (status, body) in [
+            (503, r#"{"error":"backend_error"}"#),
+            (429, r#"{"error":"rate_limited"}"#),
+            (400, r#"{"error":"temporarily_unavailable"}"#),
+            (200, "not json"),
+        ] {
+            let (endpoint, task) = answering_fixture(status, Some(body)).await;
+            let google = detect_google(&clients_path, &endpoint);
+            assert!(
+                matches!(
+                    google.detect_and_save(scan_request(&binary)).await,
+                    Err(DetectError::GoogleUnreachable)
+                ),
+                "{status} {body}"
+            );
+            task.abort();
+            let _ = task.await;
+        }
+        let (endpoint, task) = answering_fixture(401, Some(r#"{"error":"invalid_client"}"#)).await;
+        let google = detect_google(&clients_path, &endpoint);
+        assert!(matches!(
+            google.detect_and_save(scan_request(&binary)).await,
+            Err(DetectError::NoMatchingClient)
+        ));
+        assert!(!clients_path.exists());
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn detection_keeps_the_project_and_never_silently_replaces_a_hand_set_client() {
+        let right = detect_secret("keepkeepkeepkeepkeepkeep0123");
+        let (endpoint, calls, task) = detect_fixture(right.clone()).await;
+        let directory = tempfile::tempdir().unwrap();
+        let clients_path = directory.path().join("oauth-clients.json");
+        let google = detect_google(&clients_path, &endpoint);
+        let binary = synthetic_binary(directory.path(), true, std::slice::from_ref(&right));
+
+        // A client set by hand with another id is refused without force,
+        // before any Google call, and stays as it was.
+        google
+            .set_client(
+                SubscriptionProvider::Antigravity,
+                &json!({"client_id":"hand-id","client_secret":"hand-secret","project_id":"my-project"}),
+            )
+            .unwrap();
+        let before = std::fs::read_to_string(&clients_path).unwrap();
+        let error = google
+            .detect_and_save(scan_request(&binary))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, DetectError::Conflict));
+        assert!(error.to_string().contains("force"));
+        assert_eq!(*calls.lock().unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&clients_path).unwrap(), before);
+        // Saving checks again, so a client set meanwhile is not replaced.
+        let detected = google
+            .detect_antigravity(DetectRequest {
+                force: true,
+                ..scan_request(&binary)
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            google.save_detected(detected, false),
+            Err(DetectError::Conflict)
+        ));
+
+        // With force it is replaced, and the project is kept.
+        let view = google
+            .detect_and_save(DetectRequest {
+                force: true,
+                ..scan_request(&binary)
+            })
+            .await
+            .unwrap();
+        assert_eq!(view.client_id.as_deref(), Some(ANTIGRAVITY_CLIENT));
+        assert_eq!(view.project_id.as_deref(), Some("my-project"));
+        assert_eq!(view.origin.as_deref(), Some("antigravity-cli"));
+
+        // Detecting again replaces a detected client without force and still
+        // keeps the project.
+        let view = google.detect_and_save(scan_request(&binary)).await.unwrap();
+        assert_eq!(view.project_id.as_deref(), Some("my-project"));
+
+        // A pasted client with Antigravity's own id is no other client.
+        google
+            .set_client(
+                SubscriptionProvider::Antigravity,
+                &json!({"client_id":ANTIGRAVITY_CLIENT,"client_secret":"pasted"}),
+            )
+            .unwrap();
+        assert!(google.detect_and_save(scan_request(&binary)).await.is_ok());
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_secret_detected_elsewhere_is_checked_before_it_is_saved() {
+        let right = detect_secret("remoteremoteremoteremote0123");
+        let (endpoint, calls, task) = detect_fixture(right.clone()).await;
+        let directory = tempfile::tempdir().unwrap();
+        let clients_path = directory.path().join("oauth-clients.json");
+        let google = detect_google(&clients_path, &endpoint);
+        let remote = |secret: &str| DetectRequest {
+            client_secret: Some(secret.to_owned()),
+            ..DetectRequest::default()
+        };
+        assert!(matches!(
+            google
+                .detect_and_save(remote(&detect_secret("notitnotitnotitnotitnotit012")))
+                .await,
+            Err(DetectError::RejectedSecret)
+        ));
+        assert!(!clients_path.exists());
+        let view = google.detect_and_save(remote(&right)).await.unwrap();
+        assert_eq!(view.origin.as_deref(), Some("antigravity-cli"));
+        assert!(
+            std::fs::read_to_string(&clients_path)
+                .unwrap()
+                .contains(&right)
+        );
+        assert_eq!(*calls.lock().unwrap(), 2);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[test]
+    fn an_edit_that_keeps_the_client_keeps_its_origin_and_callers_cannot_set_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let clients_path = directory.path().join("oauth-clients.json");
+        let mut google = GoogleOAuth::load(reqwest::Client::new(), &clients_path);
+        google.use_test_env(|_| None);
+        let antigravity = SubscriptionProvider::Antigravity;
+        std::fs::write(
+            &clients_path,
+            json!({"antigravity":{"client_id":ANTIGRAVITY_CLIENT,"client_secret":"detected","origin":"antigravity-cli"}})
+                .to_string(),
+        )
+        .unwrap();
+        // A project-only edit keeps the detected origin.
+        let view = google
+            .set_client(
+                antigravity,
+                &json!({"client_id":ANTIGRAVITY_CLIENT,"project_id":"my-project"}),
+            )
+            .unwrap();
+        assert_eq!(view.origin.as_deref(), Some("antigravity-cli"));
+        assert_eq!(view.project_id.as_deref(), Some("my-project"));
+        // Sending the same secret again keeps it too.
+        let view = google
+            .set_client(
+                antigravity,
+                &json!({"client_id":ANTIGRAVITY_CLIENT,"client_secret":"detected"}),
+            )
+            .unwrap();
+        assert_eq!(view.origin.as_deref(), Some("antigravity-cli"));
+        // Another secret is a manual client, whatever origin the body claims.
+        let view = google
+            .set_client(
+                antigravity,
+                &json!({"client_id":ANTIGRAVITY_CLIENT,"client_secret":"pasted","origin":"antigravity-cli"}),
+            )
+            .unwrap();
+        assert_eq!(view.origin, None);
+        // So is another id, and a caller cannot set an origin on it.
+        let view = google
+            .set_client(
+                antigravity,
+                &json!({"client_id":"other-id","client_secret":"other","origin":"anything"}),
+            )
+            .unwrap();
+        assert_eq!(view.origin, None);
+        assert!(
+            !std::fs::read_to_string(&clients_path)
+                .unwrap()
+                .contains("anything")
+        );
     }
 }

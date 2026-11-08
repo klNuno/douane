@@ -4,6 +4,7 @@
 //! explicit allowlist. Provider failures never copy response bodies into errors.
 
 mod antigravity_detect;
+mod antigravity_scan;
 mod google;
 pub(crate) mod meta;
 mod oauth;
@@ -11,7 +12,7 @@ mod quota;
 mod reset;
 mod store;
 
-pub use antigravity_detect::DetectError;
+pub use antigravity_detect::{DetectError, DetectRequest, DetectedClient};
 pub(crate) use google::antigravity_user_agent;
 pub use google::{OAuthClientError, OAuthClientSource, OAuthClientView};
 pub use oauth::{OAuthAttempt, OAuthManager};
