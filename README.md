@@ -33,7 +33,7 @@ douane connects your Claude, ChatGPT (Codex), Antigravity, Muse Code, Grok, GitH
 | Claude (Pro, Max) | OAuth in the dashboard, or credential import | Five-hour, weekly and weekly Opus windows, extra usage, banked resets |
 | Codex (ChatGPT plans) | OAuth in the dashboard, or credential import | Five-hour and weekly windows, credits, banked resets |
 | Muse Code (Meta subscription) | Meta device code in the dashboard, or credential import | Subscription windows observed in inference responses |
-| Antigravity | Google OAuth once a client is configured, or import | Per-model quotas |
+| Antigravity | Google OAuth in the dashboard once its client is set up ([detect from an installed Antigravity CLI](#set-up-the-antigravity-sign-in-client), paste a client, or [import a CLI login](#import-an-antigravity-cli-login)) | Per-model quotas |
 | Grok (SuperGrok) | Device code in the dashboard | Weekly or monthly credit windows |
 | OpenCode Go | Subscription key in the manual form | Five-hour, weekly and monthly windows |
 | Gemini CLI, Kimi | Credential import | Read from the provider |
@@ -140,6 +140,10 @@ If clients reach the API at a different address than the dashboard (a reverse pr
 | `POST /v1/responses/compact` | Native compaction on compatible upstreams |
 | `GET /v1/responses` (WebSocket) | Native Codex sessions, and a streaming bridge for the other subscriptions |
 | `/admin/api/*` | Accounts, clients, quotas, models, request history, settings and OAuth |
+| `GET /admin/api/oauth-clients` | The Google sign-in clients (`antigravity`, `gemini`): `source` (`env`, `file` or `none`), `client_id`, `has_secret`, `project_id`, `origin` (e.g. `antigravity-cli` for a detected client), `read_only`. Reads `oauth-clients.json` again first, so hand edits show and apply. The secret is never returned |
+| `PUT /admin/api/oauth-clients/{provider}` | Sets a custom client (`{"client_id":...,"client_secret":...,"project_id":...}`), saved in `oauth-clients.json` and applied without a restart; 409 when environment variables set it |
+| `DELETE /admin/api/oauth-clients/{provider}` | Removes the custom client; sign-in for that provider is then unavailable until a client is configured again |
+| `POST /admin/api/oauth-clients/antigravity/detect` | Detects the Antigravity client from an installed Antigravity CLI on the douane machine (optional `{"path":"..."}`), validates its secret against Google, and saves it; returns the client view, never the secret; 409 when environment variables set it |
 | `/v0/management`, `/v8/management` | A CLIProxyAPI-compatible subset of its management API |
 
 Translation between the three dialects covers text, tools and images; provider-specific extensions do not all have an equivalent. A failed request moves to another account only before its first byte reaches the client: started output is never replayed. A same-dialect request returns the provider's own rate-limit headers and request id, and client errors such as an oversized prompt come back as the provider wrote them. Every refusal keeps the first 300 characters of the provider's reply, with tokens redacted, in the call log and the service log; Google refusals keep only their reason code.
@@ -187,6 +191,29 @@ account's list, and a request goes only to the accounts whose own list names its
 model. An account that still answers `NOT_FOUND` for a model is skipped for it
 for 24 hours or until a restart, the next account is tried, and the account
 stays usable.
+
+### Set up the Antigravity sign-in client
+
+douane ships no OAuth secret, so Antigravity sign-in needs a Google client with a secret before **Connect** can open it. The connect dialog and **Settings > Google sign-in clients** guide you through the options:
+
+- **Detect from an installed Antigravity CLI.** If the Antigravity CLI is installed on the douane machine, click **Detect from Antigravity CLI** in the Settings Antigravity row (or call `POST /admin/api/oauth-clients/antigravity/detect`). douane streams the CLI binary (on Windows `%LOCALAPPDATA%\agy\bin\agy.exe`, or a path you pass), reads the client secret it embeds, validates it against Google, and saves it. The secret is never shown.
+- **Detect from another machine.** If the CLI is on a laptop but douane runs on a server, install and sign in to the CLI there, then run `douanectl oauth-client detect-antigravity` pointed at the douane server; it detects the client locally and sends it to the server over the existing `PUT` route.
+- **Paste a client.** Enter a Google OAuth client id and secret in Settings. A detected or pasted Antigravity client may use the public Antigravity client id.
+- **Import a CLI login.** [Importing an Antigravity CLI credential](#import-an-antigravity-cli-login) also works, but those accounts only refresh once an Antigravity client is set up.
+
+### Import an Antigravity CLI login
+
+Without signing in again, import the credential JSON the Antigravity CLI saved, from **Connect** in the dashboard, `douanectl import file.json`, or `POST /admin/api/accounts/import`. The file needs no `type`: a `token` object with an `access_token` (and usually a `refresh_token`), beside `id_token_email` or `auth_method`, imports as `antigravity`, and the email names the account.
+
+```json
+{"token": {"access_token": "...", "refresh_token": "...", "expiry": "..."}, "id_token_email": "you@example.com", "auth_method": "..."}
+```
+
+On Windows the CLI keeps this login in Credential Manager under the target `gemini:antigravity`, not in a file. Copy its JSON content into a file before importing; douane does not read Credential Manager itself.
+
+These tokens belong to Antigravity's own Google client (the public installed-app client id), so douane refreshes them with the configured Antigravity client when its id matches that public id; until an Antigravity client is set up, these accounts cannot refresh and ask you to set up the Antigravity sign-in client in Settings. The same holds for any Antigravity import that names neither `client_id` nor `client_secret`, such as a typed CLIProxyAPI record. A record without a `refresh_token` works only until its access token expires; after that, import a fresh file or sign in.
+
+An Antigravity or Gemini account imported without a `project_id` gets its Google Cloud project on import: an access token that has expired, or has no known expiry, is refreshed first when a refresh token exists (an expired token without one is refused at once), then the project is looked up and onboarded as during sign-in. This needs network access to Google and can take about a minute per file while Google onboards the account; `douanectl import` waits up to 10 minutes. A project already stored for the same sign-in is reused without network calls. When the refresh or the lookup fails, the file is not imported. When no client in douane can refresh the token (for example a Gemini file while no Gemini client is set), the import is not refused for that reason: a token without a known expiry looks its project up as is, and an expired one is stored without a project. A file that names a custom `client_id` douane does not have, without its `client_secret`, is refused when its token must be refreshed (expired, or no known expiry); otherwise it imports but cannot refresh later. When Google returns no project, its entry in `errors` carries `"error_code": "google_project_unavailable"`; open Antigravity (or Gemini CLI) with that account to finish setup, then import again. If an import fails after its token was refreshed for discovery, Google may have rotated the refresh token, and douane did not keep the new one: export a fresh copy of the credential before trying again.
 
 ### Muse Code subscription
 
@@ -278,7 +305,9 @@ In Boite, paste the key in the subscription proxy settings.
 - On Linux and macOS, `auth_dir` is mode 0700 and each credential file 0600. On Windows, douane removes inherited permissions from `auth_dir` and grants full control to the current user alone; keep the configuration under that user's own profile, for example `%LOCALAPPDATA%\douane`.
 - SQLite stores request metadata only: time, model, account, client, status, latency and token or cache counts.
 - The default listener is loopback. To expose douane, put it behind a reverse proxy that authenticates the dashboard, and set `server.management_token_env` to require a bearer token on `/admin/api`. That token is separate from client keys.
-- Google OAuth clients for Gemini and Antigravity are read from `oauth-clients.json` beside `auth_dir`, or from `DOUANE_GEMINI_*` and `DOUANE_ANTIGRAVITY_*` environment variables; douane ships none.
+- douane ships no Google OAuth client or secret. Antigravity uses the public installed-app client *id* as its default id, but a secret must be provided before sign-in works: detect it from an installed Antigravity CLI (**Settings**, `POST /admin/api/oauth-clients/antigravity/detect`, or `douanectl oauth-client detect-antigravity`), set it with `DOUANE_ANTIGRAVITY_CLIENT_ID` and `_CLIENT_SECRET`, with `oauth-clients.json` beside `auth_dir`, or paste it on the **Settings** page. The client id and secret always come together from one place: the environment variables if either is set (which makes the client read-only in the API), else the file. `_PROJECT_ID` alone only sets the Cloud project. Gemini is configured the same way (`DOUANE_GEMINI_*`). A detected or pasted Antigravity client may use the public client id; a detected client is recorded with `origin` `antigravity-cli`. The client secret is never returned by the management API, logged, or sent anywhere but Google, only whether one is set.
+- `oauth-clients.json` is read at startup, on every change through the API, and each time the client list is read (`GET /admin/api/oauth-clients`, as the **Settings** page does). Before any other use of the clients (provider list, sign-in, refresh), douane checks the file's modification time and length and reads it again when they changed, so hand edits apply everywhere without a restart. A file douane cannot read or parse is ignored with a warning in the log naming its path and the reason, and the clients stay as they were; changes through the API are refused until it is fixed or removed.
+- Each Google account keeps the client it signed in with, and a sign-in finishes with the client and Cloud project it started with. An account refreshes only with a client whose id matches its own; an account whose client was replaced or removed stops refreshing and must reconnect. Imports pinned to Antigravity's public id refresh once an Antigravity client with that id is set up.
 
 ## Export and restore
 
