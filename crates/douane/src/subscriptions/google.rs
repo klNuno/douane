@@ -766,6 +766,14 @@ impl GoogleOAuth {
         self.poll_delay = Duration::ZERO;
     }
 
+    /// Sends Code Assist calls (project lookup and onboarding) elsewhere than
+    /// the token endpoint.
+    #[cfg(test)]
+    pub(crate) fn use_test_codeassist_endpoint(&mut self, endpoint: &str) {
+        self.codeassist_url = format!("{endpoint}/v1internal");
+        self.daily_url = format!("{endpoint}/daily");
+    }
+
     /// Shortens detection's per-call timeout and overall deadline.
     #[cfg(test)]
     pub(crate) fn use_test_detect_timeouts(&mut self, request: Duration, deadline: Duration) {

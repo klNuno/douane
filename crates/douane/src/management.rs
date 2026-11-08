@@ -1,9 +1,7 @@
 use crate::{
     relay::error,
     state::AppState,
-    subscriptions::{
-        DetectError, DetectRequest, OAuthClientError, SubscriptionError, SubscriptionProvider,
-    },
+    subscriptions::{DetectError, DetectRequest, OAuthClientError, SubscriptionProvider},
 };
 use axum::{
     Json,
@@ -222,13 +220,7 @@ pub async fn import(State(state): State<Arc<AppState>>, Json(body): Json<Value>)
             .await
         {
             Ok(a) => accounts.push(a),
-            Err(e) => {
-                let mut entry = json!({"name":file["name"],"error":e.to_string()});
-                if matches!(e, SubscriptionError::GoogleProjectUnavailable) {
-                    entry["error_code"] = json!("google_project_unavailable");
-                }
-                errors.push(entry);
-            }
+            Err(e) => errors.push(json!({"name":file["name"],"error":e.to_string()})),
         }
     }
     state.refresh_models().await;

@@ -153,9 +153,10 @@ impl OAuthManager {
     }
 
     /// Imports a credential file. A Google account without a Cloud project
-    /// gets one from Code Assist, as sign-in does; when none is found the
-    /// import fails and nothing is stored. Tokens no client can refresh are
-    /// handled as `discover_without_client` says.
+    /// gets one from Code Assist, as sign-in does. Finding it is best effort:
+    /// when it fails for any reason the account is stored anyway without a
+    /// project, as before discovery existed, with the reason in `last_error`,
+    /// and tokens refreshed meanwhile are kept.
     pub async fn import(
         &self,
         value: Value,
@@ -166,8 +167,9 @@ impl OAuthManager {
             account.provider,
             SubscriptionProvider::Gemini | SubscriptionProvider::Antigravity
         ) && account.project_id.is_none()
+            && let Err(error) = self.discover_project(&mut account).await
         {
-            self.discover_project(&mut account).await?;
+            account.last_error = Some(discovery_failure(&error));
         }
         self.store.import_account(account, explicit_name).await
     }
@@ -196,11 +198,12 @@ impl OAuthManager {
                     Err(error) => return self.discover_without_client(account, error).await,
                 };
                 let response = send_refresh(request).await?;
-                account.access_token =
-                    text(&response, &["access_token"]).ok_or(SubscriptionError::InvalidResponse)?;
+                // Keep a rotated refresh token first: the old one may be dead.
                 if let Some(rotated) = text(&response, &["refresh_token"]) {
                     account.refresh_token = Some(rotated);
                 }
+                account.access_token =
+                    text(&response, &["access_token"]).ok_or(SubscriptionError::InvalidResponse)?;
                 if let Some(token) = text(&response, &["id_token"]) {
                     account.id_token = Some(token);
                 }
@@ -221,7 +224,7 @@ impl OAuthManager {
     /// provider's public id without its secret), the import goes on as it
     /// did before discovery: a token that has not expired still looks its
     /// project up, an expired one is stored without a project. A file that
-    /// names a custom client douane does not have is refused.
+    /// names a custom client douane does not have fails the lookup.
     async fn discover_without_client(
         &self,
         account: &mut AccountCredential,
@@ -251,6 +254,7 @@ impl OAuthManager {
     }
 
     /// Looks up and onboards the Cloud project of an imported account.
+    /// `import` stores the account even when this fails.
     async fn onboard_import(
         &self,
         account: &mut AccountCredential,
@@ -1130,6 +1134,17 @@ const REFRESH_ERROR_BODY_LIMIT: usize = 16_384;
 /// reused refresh token cannot recover by retrying, so it surfaces as
 /// `SessionRevoked` instead of a bare HTTP status. The body is never logged
 /// or stored: only the standard `error` code is read.
+/// The `last_error` of an account imported without its Cloud project: why
+/// the lookup failed. An import refusal's "invalid authentication file"
+/// prefix is left out, since the account was imported.
+fn discovery_failure(error: &SubscriptionError) -> String {
+    let reason = match error {
+        SubscriptionError::InvalidImport(reason) => (*reason).to_owned(),
+        error => error.to_string(),
+    };
+    format!("no Cloud project was found at import: {reason}")
+}
+
 async fn send_refresh(request: reqwest::RequestBuilder) -> Result<Value, SubscriptionError> {
     let mut response = request
         .timeout(Duration::from_secs(30))
@@ -2508,23 +2523,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn importing_a_google_account_without_a_discoverable_project_stores_nothing() {
+    async fn an_import_without_a_discoverable_project_is_stored_with_the_reason() {
         let (endpoint, _, task) = google_fixture(None).await;
         let directory = tempfile::tempdir().unwrap();
         let (manager, store) = google_manager(&endpoint, directory.path()).await;
         manager
             .set_oauth_client(SubscriptionProvider::Antigravity, &antigravity_client())
             .unwrap();
-        let error = manager
+        let summary = manager
             .import(antigravity_cli_record("fixture@example.test"), None)
             .await
-            .unwrap_err();
-        assert!(matches!(error, SubscriptionError::GoogleProjectUnavailable));
-        assert!(!format!("{error:?} {error}").contains("fixture-private"));
-        assert!(store.list().await.is_empty());
-        assert_eq!(stored_files(directory.path()), 0);
+            .unwrap();
+        let account = store.get(&summary.id).await.unwrap();
+        assert_eq!(account.project_id, None);
+        assert_eq!(
+            account.last_error.as_deref(),
+            Some(
+                "no Cloud project was found at import: Google did not return a Cloud project for this account; check account setup in Antigravity"
+            )
+        );
+        assert_eq!(summary.status, "error");
+        // The tokens refreshed for the lookup are kept, rotated refresh token
+        // included.
+        assert_eq!(account.access_token, "fixture-rotated");
+        assert_eq!(
+            account.refresh_token.as_deref(),
+            Some("fixture-rotated-refresh")
+        );
+        assert!(
+            !serde_json::to_string(&account)
+                .unwrap()
+                .contains("fixture-private")
+        );
+        assert_eq!(stored_files(directory.path()), 1);
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn an_import_is_stored_when_google_cannot_be_reached() {
+        let (endpoint, seen, task) = google_fixture(Some("discovered-project")).await;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut manager, store) = google_manager(&endpoint, directory.path()).await;
+        manager
+            .set_oauth_client(SubscriptionProvider::Antigravity, &antigravity_client())
+            .unwrap();
+        // The token refresh works, then Code Assist is unreachable: the
+        // account keeps the rotated tokens.
+        manager
+            .google
+            .use_test_codeassist_endpoint("http://127.0.0.1:1");
+        let summary = manager
+            .import(antigravity_cli_record("first@example.test"), None)
+            .await
+            .unwrap();
+        let account = store.get(&summary.id).await.unwrap();
+        assert_eq!(account.project_id, None);
+        assert!(
+            account
+                .last_error
+                .as_deref()
+                .unwrap()
+                .starts_with("no Cloud project was found at import: ")
+        );
+        assert_eq!(
+            account.refresh_token.as_deref(),
+            Some("fixture-rotated-refresh")
+        );
+        assert_eq!(*seen.lock().unwrap(), [antigravity_call("refresh")]);
+        // Google is not reached at all: the account is stored as imported.
+        task.abort();
+        let _ = task.await;
+        manager.google.use_test_endpoint("http://127.0.0.1:1");
+        let summary = manager
+            .import(antigravity_cli_record("second@example.test"), None)
+            .await
+            .unwrap();
+        let account = store.get(&summary.id).await.unwrap();
+        assert_eq!(account.project_id, None);
+        assert!(account.last_error.is_some());
+        assert_eq!(account.access_token, "fixture-expired");
+        assert_eq!(account.refresh_token.as_deref(), Some("fixture-refresh"));
+        assert_eq!(stored_files(directory.path()), 2);
     }
 
     #[tokio::test]
@@ -2647,12 +2727,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_import_naming_an_unknown_custom_client_is_refused() {
+    async fn an_import_naming_an_unknown_custom_client_is_stored_and_says_why() {
         let (endpoint, seen, task) = google_fixture(Some("discovered-project")).await;
         let directory = tempfile::tempdir().unwrap();
         let (manager, store) = google_manager(&endpoint, directory.path()).await;
         for provider in ["antigravity", "gemini"] {
-            let error = manager
+            let summary = manager
                 .import(
                     json!({"type":provider,"email":"custom@example.test","access_token":"fixture-expired",
                         "refresh_token":"fixture-refresh","client_id":"unknown-custom-id",
@@ -2660,21 +2740,25 @@ mod tests {
                     None,
                 )
                 .await
-                .unwrap_err();
+                .unwrap();
             assert_eq!(
-                error.to_string(),
-                "invalid authentication file: the file names a Google OAuth client douane does not have; set that client in douane first, or add its client_secret to the file"
+                summary.last_error.as_deref(),
+                Some(
+                    "no Cloud project was found at import: the file names a Google OAuth client douane does not have; set that client in douane first, or add its client_secret to the file"
+                )
             );
+            let account = store.get(&summary.id).await.unwrap();
+            assert_eq!(account.client_id.as_deref(), Some("unknown-custom-id"));
+            assert_eq!(account.project_id, None);
         }
         assert!(seen.lock().unwrap().is_empty());
-        assert!(store.list().await.is_empty());
-        assert_eq!(stored_files(directory.path()), 0);
+        assert_eq!(stored_files(directory.path()), 2);
         task.abort();
         let _ = task.await;
     }
 
     #[tokio::test]
-    async fn an_import_whose_refresh_is_refused_stores_nothing() {
+    async fn an_import_whose_refresh_is_refused_is_stored_with_the_reason() {
         let (endpoint, seen, task) = google_fixture(Some("discovered-project")).await;
         let directory = tempfile::tempdir().unwrap();
         let (manager, store) = google_manager(&endpoint, directory.path()).await;
@@ -2683,18 +2767,25 @@ mod tests {
             .unwrap();
         let mut record = antigravity_cli_record("fixture@example.test");
         record["token"]["refresh_token"] = json!("fixture-revoked");
-        let error = manager.import(record, None).await.unwrap_err();
-        assert!(matches!(error, SubscriptionError::SessionRevoked));
+        let summary = manager.import(record, None).await.unwrap();
+        assert_eq!(
+            summary.last_error.as_deref(),
+            Some(
+                "no Cloud project was found at import: the provider revoked this account's session; reconnect the account"
+            )
+        );
+        let account = store.get(&summary.id).await.unwrap();
+        assert_eq!(account.refresh_token.as_deref(), Some("fixture-revoked"));
+        assert_eq!(account.project_id, None);
         // The refresh was asked once, and Code Assist never.
         assert_eq!(seen.lock().unwrap().len(), 1);
-        assert!(store.list().await.is_empty());
-        assert_eq!(stored_files(directory.path()), 0);
+        assert_eq!(stored_files(directory.path()), 1);
         task.abort();
         let _ = task.await;
     }
 
     #[tokio::test]
-    async fn an_expired_import_without_refresh_token_fails_before_any_call() {
+    async fn an_expired_import_without_refresh_token_is_stored_without_any_call() {
         let (endpoint, seen, task) = google_fixture(Some("discovered-project")).await;
         let directory = tempfile::tempdir().unwrap();
         let (manager, store) = google_manager(&endpoint, directory.path()).await;
@@ -2703,21 +2794,23 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("refresh_token");
-        let error = manager.import(record, None).await.unwrap_err();
+        let summary = manager.import(record, None).await.unwrap();
+        assert_eq!(summary.status, "expired");
         assert_eq!(
-            error.to_string(),
-            "invalid authentication file: the access token has expired and there is no refresh token; sign in again"
+            summary.last_error.as_deref(),
+            Some(
+                "no Cloud project was found at import: the access token has expired and there is no refresh token; sign in again"
+            )
         );
-        assert!(!error.to_string().contains("fixture-expired"));
+        assert_eq!(store.get(&summary.id).await.unwrap().project_id, None);
         assert!(seen.lock().unwrap().is_empty());
-        assert!(store.list().await.is_empty());
-        assert_eq!(stored_files(directory.path()), 0);
+        assert_eq!(stored_files(directory.path()), 1);
         task.abort();
         let _ = task.await;
     }
 
     #[tokio::test]
-    async fn the_import_route_reports_a_missing_google_project_with_its_code() {
+    async fn the_import_route_stores_an_account_whose_project_is_missing() {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
         let (endpoint, _, task) = google_fixture(None).await;
@@ -2745,19 +2838,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["imported"], 0);
+        assert_eq!(body["imported"], 1);
+        assert_eq!(body["errors"], json!([]));
         assert_eq!(
-            body["errors"],
-            json!([{
-                "name": "antigravity.json",
-                "error": "Google did not return a Cloud project for this account; check account setup in Antigravity",
-                "error_code": "google_project_unavailable"
-            }])
+            body["accounts"][0]["last_error"],
+            "no Cloud project was found at import: Google did not return a Cloud project for this account; check account setup in Antigravity"
         );
-        assert_eq!(stored_files(directory.path()), 0);
+        assert_eq!(stored_files(directory.path()), 1);
         task.abort();
         let _ = task.await;
     }
