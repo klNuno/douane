@@ -59,6 +59,34 @@ export function replacesClient(view: OAuthClientView, clientId: string) {
 	return view.source === 'file' && !!view.client_id && clientId.trim() !== view.client_id;
 }
 
+/** Antigravity's public client id (not a secret): a detected client always uses it. */
+export const ANTIGRAVITY_CLIENT_ID = '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com';
+
+/**
+ * Detecting replaces a client chosen by hand (another id, not detected by
+ * douane), whose accounts must then reconnect: confirm first, then ask the
+ * server with `force`, which refuses otherwise. Replacing a detected client,
+ * or detecting with none set, needs no confirmation.
+ */
+export function detectNeedsConfirm(view: OAuthClientView | null | undefined) {
+	return !!view && view.source === 'file' && !!view.client_id && view.client_id !== ANTIGRAVITY_CLIENT_ID && view.origin !== 'antigravity-cli';
+}
+
+/**
+ * The douane address douanectl must use: this page's origin plus any reverse
+ * proxy prefix in front of the dashboard's base path (`/admin`), so
+ * `https://host/douane/admin/` gives `https://host/douane`.
+ */
+export function serverUrl(origin: string, pathname: string, base: string) {
+	if (!base) return origin;
+	const inner = pathname.indexOf(`${base}/`);
+	const at = inner >= 0 ? inner : pathname.endsWith(base) ? pathname.length - base.length : 0;
+	return `${origin}${pathname.slice(0, at).replace(/\/+$/, '')}`;
+}
+
+/** The douanectl command that detects the client on another machine and sends it to `server`. */
+export function detectCommand(server: string) { return `douanectl --url ${server} oauth-client detect-antigravity`; }
+
 /** The hint beside the callback field; the Claude code hint is never shown for Antigravity. */
 export function callbackHintKey(provider: string) {
 	return provider === 'antigravity' ? 'connect.callbackHint.antigravity' : 'connect.callbackHint';

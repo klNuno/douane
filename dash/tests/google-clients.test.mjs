@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { connectMode, canEdit, canReset, initialDraft, secretRequired, draftProblem, clientInput, replacesClient, callbackHintKey, signsInFromDashboard } from '../src/lib/google-clients.ts';
+import { connectMode, canEdit, canReset, initialDraft, secretRequired, draftProblem, clientInput, replacesClient, callbackHintKey, signsInFromDashboard, detectNeedsConfirm, serverUrl, detectCommand, ANTIGRAVITY_CLIENT_ID } from '../src/lib/google-clients.ts';
 import { en } from '../src/lib/strings/en.ts';
 import { fr } from '../src/lib/strings/fr.ts';
 
-const view = (source, extra = {}) => ({ provider: 'antigravity', source, client_id: source === 'none' ? null : 'id.apps.googleusercontent.com', has_secret: source !== 'none', project_id: null, origin: null, read_only: source === 'env', ...extra });
+const view = (source, extra = {}) => ({ provider: 'antigravity', source, client_id: source === 'none' ? null : 'id.apps.googleusercontent.com', has_secret: source !== 'none', project_id: null, origin: null, detectable: true, read_only: source === 'env', ...extra });
 const draft = (client_id, client_secret = '', project_id = '') => ({ client_id, client_secret, project_id });
 
 test('Antigravity uses its OAuth flow when offered and never the token form otherwise', () => {
@@ -80,13 +80,33 @@ test('Google texts fit the provider, in every language', () => {
 		// Gemini is used through douanectl, the API and import, never a dashboard sign-in.
 		for (const key of ['googleClients.description', 'googleClients.geminiUsage']) assert.match(strings[key], /douanectl/);
 		assert.ok(!Object.keys(strings).some((key) => key.endsWith('.gemini')));
-		// The missing-project text names no single provider.
-		assert.match(strings['api.googleProjectUnavailable'], /Antigravity/);
-		assert.match(strings['api.googleProjectUnavailable'], /Gemini/);
+		// The remote command's help says how to pass a management token.
+		assert.match(strings['connect.googleSetupRemoteToken'], /DOUANE_MANAGEMENT_TOKEN/);
+		// Without a CLI on the douane machine, Settings points to douanectl.
+		assert.match(strings['googleClients.detectUnavailable'], /douanectl oauth-client detect-antigravity/);
 		for (const key of ['googleClients.resetConfirm.none', 'googleClients.replaceWarning']) assert.match(strings[key], /reconnect/);
 		// The setup guide and detect strings exist in both languages.
-		for (const key of ['connect.googleSetupIntro', 'connect.googleSetupDetect', 'connect.googleSetupRemoteText', 'googleClients.detect', 'googleClients.origin.antigravity-cli', 'notice.googleClientDetected']) assert.ok(strings[key], key);
+		for (const key of ['connect.googleSetupIntro', 'connect.googleSetupDetect', 'connect.googleSetupRemoteText', 'connect.googleSetupDetectUnavailable', 'connect.googleSetupReplace', 'googleClients.detect', 'googleClients.detectReplace', 'googleClients.origin.antigravity-cli', 'notice.googleClientDetected']) assert.ok(strings[key], key);
 	}
+});
+
+test('detecting asks to confirm only before replacing a client set by hand', () => {
+	assert.ok(detectNeedsConfirm(view('file')));
+	assert.ok(!detectNeedsConfirm(view('file', { origin: 'antigravity-cli' })));
+	assert.ok(!detectNeedsConfirm(view('file', { client_id: ANTIGRAVITY_CLIENT_ID })));
+	assert.ok(!detectNeedsConfirm(view('none')));
+	assert.ok(!detectNeedsConfirm(view('env')));
+	assert.ok(!detectNeedsConfirm(null));
+});
+
+test('the douanectl command reaches douane through any reverse proxy prefix', () => {
+	assert.equal(serverUrl('https://host', '/admin/', '/admin'), 'https://host');
+	assert.equal(serverUrl('https://host', '/admin', '/admin'), 'https://host');
+	assert.equal(serverUrl('https://host', '/douane/admin/', '/admin'), 'https://host/douane');
+	assert.equal(serverUrl('http://127.0.0.1:8787', '/proxy/x/admin', '/admin'), 'http://127.0.0.1:8787/proxy/x');
+	assert.equal(serverUrl('https://host', '/elsewhere/', '/admin'), 'https://host');
+	assert.equal(serverUrl('https://host', '/douane/', ''), 'https://host');
+	assert.equal(detectCommand('https://host/douane'), 'douanectl --url https://host/douane oauth-client detect-antigravity');
 });
 
 test('no built-in source or secret is referenced any more', () => {

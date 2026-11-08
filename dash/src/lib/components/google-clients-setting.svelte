@@ -6,7 +6,7 @@
 	import Radar from '@lucide/svelte/icons/radar';
 	import ProviderMark from './provider-mark.svelte';
 	import { management, providerName, type OAuthClientView } from '$lib/management';
-	import { canEdit, canReset, clientInput, draftProblem, initialDraft, replacesClient, secretRequired, signsInFromDashboard, type ClientDraft } from '$lib/google-clients';
+	import { canEdit, canReset, clientInput, detectNeedsConfirm, draftProblem, initialDraft, replacesClient, secretRequired, signsInFromDashboard, type ClientDraft } from '$lib/google-clients';
 	import { t } from '$lib/i18n.svelte';
 	let { busy, updated }: { busy: string; updated: (message: string) => void | Promise<void> } = $props();
 	let clients = $state.raw<OAuthClientView[]>([]);
@@ -16,6 +16,8 @@
 	let failure = $state('');
 	let editing = $state('');
 	let confirming = $state('');
+	// A detection that would replace a client set by hand waits for this confirmation.
+	let confirmingDetect = $state('');
 	// The secret lives only in this draft while the form is open; it is cleared on save, cancel and unmount.
 	let draft = $state<ClientDraft>({ client_id: '', client_secret: '', project_id: '' });
 	const editedView = $derived(clients.find(client => client.provider === editing));
@@ -28,15 +30,17 @@
 	}
 	onMount(() => { void load(); return () => { draft.client_secret = ''; }; });
 
-	function open(view: OAuthClientView) { failure = ''; confirming = ''; editing = view.provider; draft = initialDraft(view); }
+	function open(view: OAuthClientView) { failure = ''; confirming = ''; confirmingDetect = ''; editing = view.provider; draft = initialDraft(view); }
 	function cancel() { editing = ''; draft = { client_id: '', client_secret: '', project_id: '' }; failure = ''; }
 	function replace(view: OAuthClientView) { clients = clients.map(client => client.provider === view.provider ? view : client); }
 
-	async function detect(view: OAuthClientView) {
+	async function detect(view: OAuthClientView, force = false) {
 		if (detecting || saving) return;
-		detecting = view.provider; failure = ''; confirming = ''; cancel();
+		failure = ''; confirming = ''; cancel();
+		if (!force && detectNeedsConfirm(view)) { confirmingDetect = view.provider; return; }
+		detecting = view.provider; confirmingDetect = '';
 		try {
-			replace(await management.detectAntigravityClient());
+			replace(await management.detectAntigravityClient({ force }));
 			await updated(t('notice.googleClientDetected', { provider: providerName(view.provider) }));
 		} catch (error) { failure = (error as Error).message; }
 		finally { detecting = ''; }
@@ -86,6 +90,7 @@
 						{:else}<p class="muted small">{t('googleClients.noClient')}</p>{/if}
 						{#if client.origin === 'antigravity-cli'}<p class="muted small origin-note"><Radar size={14}/>{t('googleClients.origin.antigravity-cli')}</p>{/if}
 						{#if !signsInFromDashboard(client.provider)}<p class="muted small">{t('googleClients.geminiUsage')}</p>{/if}
+						{#if client.provider === 'antigravity' && canEdit(client) && !client.detectable && editing !== client.provider}<p class="muted small">{t('googleClients.detectUnavailable')}</p>{/if}
 						{#if client.source === 'env'}
 							<p class="env-note"><Lock size={15}/><span>{t('googleClients.envNote', { prefix: client.provider.toUpperCase() })}</span></p>
 						{:else if editing === client.provider}
@@ -105,11 +110,16 @@
 								<p>{t('googleClients.resetConfirm.none', { provider: providerName(client.provider) })}</p>
 								<div class="client-actions"><button class="button danger" type="button" disabled={saving || !!busy} onclick={() => reset(client)}>{t('googleClients.reset')}</button><button class="button" type="button" disabled={saving} onclick={() => confirming = ''}>{t('common.cancel')}</button></div>
 							</div>
+						{:else if confirmingDetect === client.provider}
+							<div class="reset-confirmation" role="group" aria-label={t('googleClients.detect')}>
+								<p>{t('googleClients.replaceWarning')}</p>
+								<div class="client-actions"><button class="button danger" type="button" disabled={!!detecting || saving || !!busy} onclick={() => detect(client, true)}><Radar size={16}/>{detecting === client.provider ? t('googleClients.detecting') : t('googleClients.detectReplace')}</button><button class="button" type="button" disabled={!!detecting} onclick={() => confirmingDetect = ''}>{t('common.cancel')}</button></div>
+							</div>
 						{:else if canEdit(client)}
 							<div class="client-actions">
-								{#if client.provider === 'antigravity'}<button class="button" type="button" disabled={!!detecting || saving || !!busy} title={t('googleClients.detectHint')} onclick={() => detect(client)}><Radar size={16}/>{detecting === client.provider ? t('googleClients.detecting') : t('googleClients.detect')}</button>{/if}
+								{#if client.provider === 'antigravity' && client.detectable}<button class="button" type="button" disabled={!!detecting || saving || !!busy} title={t('googleClients.detectHint')} onclick={() => detect(client)}><Radar size={16}/>{detecting === client.provider ? t('googleClients.detecting') : t('googleClients.detect')}</button>{/if}
 								<button class="button" type="button" disabled={!!detecting || saving || !!busy} onclick={() => open(client)}><KeyRound size={16}/>{t(client.source === 'file' ? 'googleClients.edit' : 'googleClients.setCustom')}</button>
-								{#if canReset(client)}<button class="button subtle" type="button" disabled={!!detecting || saving || !!busy} onclick={() => { failure = ''; confirming = client.provider; }}><RotateCcw size={16}/>{t('googleClients.reset')}</button>{/if}
+								{#if canReset(client)}<button class="button subtle" type="button" disabled={!!detecting || saving || !!busy} onclick={() => { failure = ''; confirmingDetect = ''; confirming = client.provider; }}><RotateCcw size={16}/>{t('googleClients.reset')}</button>{/if}
 							</div>
 						{/if}
 					</div>

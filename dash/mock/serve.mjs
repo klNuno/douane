@@ -107,7 +107,8 @@ const providers = [
 	['kimi', 'Kimi', false, true], ['qwen', 'Qwen', false, false], ['openai_compatible', 'OpenAI-compatible', false, false]
 ].map(([id, name, oauth, quota]) => ({ id, name, oauth, quota, docs_url: 'https://example.com' }));
 // Google sign-in clients. Only `has_secret` is kept: a secret sent here is dropped at once.
-// MOCK_ANTIGRAVITY_CLIENT=env shows a read-only client, =file a detected client, =nosecret a client without secret.
+// MOCK_ANTIGRAVITY_CLIENT=env shows a read-only client, =file a detected client, =nosecret a client without secret,
+// =hand a client set by hand (detecting asks to confirm). MOCK_ANTIGRAVITY_DETECTABLE=0 shows a douane machine without the CLI.
 const googleDefaults = {
 	antigravity: { source: 'none', client_id: null, has_secret: false, project_id: null, origin: null },
 	gemini: { source: 'none', client_id: null, has_secret: false, project_id: null, origin: null }
@@ -116,11 +117,14 @@ const googleClients = {
 	antigravity: {
 		env: { source: 'env', client_id: 'env-sample.apps.googleusercontent.com', has_secret: true, project_id: 'env-project', origin: null },
 		file: { source: 'file', client_id: '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com', has_secret: true, project_id: null, origin: 'antigravity-cli' },
-		nosecret: { source: 'file', client_id: 'custom-sample.apps.googleusercontent.com', has_secret: false, project_id: null, origin: null }
+		nosecret: { source: 'file', client_id: 'custom-sample.apps.googleusercontent.com', has_secret: false, project_id: null, origin: null },
+		hand: { source: 'file', client_id: 'hand-sample.apps.googleusercontent.com', has_secret: true, project_id: 'hand-project', origin: null }
 	}[process.env.MOCK_ANTIGRAVITY_CLIENT] ?? googleDefaults.antigravity,
 	gemini: googleDefaults.gemini
 };
-const clientView = (provider) => ({ provider, ...googleClients[provider], read_only: googleClients[provider].source === 'env' });
+const ANTIGRAVITY_CLIENT_ID = '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com';
+const detectable = process.env.MOCK_ANTIGRAVITY_DETECTABLE !== '0';
+const clientView = (provider) => ({ provider, ...googleClients[provider], detectable: provider === 'antigravity' && detectable, read_only: googleClients[provider].source === 'env' });
 // The server's check: trimmed, non-empty, no control character (Rust's char::is_control), at most `max` UTF-8 bytes.
 const singleLine = (value, max) => typeof value === 'string' && !!value.trim() && !/[\u0000-\u001f\u007f-\u009f]/.test(value.trim()) && Buffer.byteLength(value.trim()) <= max;
 function changeGoogleClient(method, name, body) {
@@ -141,16 +145,20 @@ function changeGoogleClient(method, name, body) {
 	const id = body.client_id.trim();
 	const kept = current.source === 'file' && current.has_secret && current.client_id === id;
 	if (body.client_secret == null && !kept) return fail(400, 'client_secret is required');
-	googleClients[provider] = { source: 'file', client_id: id, has_secret: true, project_id: body.project_id?.trim() || null, origin: singleLine(body.origin, 64) ? body.origin.trim() : null };
+	// The origin is never taken from the body: an edit that keeps the client (no new secret) keeps it.
+	googleClients[provider] = { source: 'file', client_id: id, has_secret: true, project_id: body.project_id?.trim() || null, origin: kept && body.client_secret == null ? current.origin : null };
 	return clientView(provider);
 }
-// Mock detection: pretends an Antigravity CLI is installed and holds douane's client.
-function detectGoogleClient(name) {
+// Mock detection: pretends an Antigravity CLI is installed (unless MOCK_ANTIGRAVITY_DETECTABLE=0) and holds douane's client.
+function detectGoogleClient(name, body) {
 	const provider = name === 'gemini-cli' ? 'gemini' : name;
 	const fail = (status, message) => [status, { error: { type: 'proxy_error', message } }];
 	if (provider !== 'antigravity') return fail(404, 'client detection is only available for antigravity');
-	if (googleClients.antigravity.source === 'env') return fail(409, 'this OAuth client is set by DOUANE_ANTIGRAVITY_* environment variables; change or unset them and restart douane');
-	googleClients.antigravity = { source: 'file', client_id: '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com', has_secret: true, project_id: null, origin: 'antigravity-cli' };
+	const current = googleClients.antigravity;
+	if (current.source === 'env') return fail(409, 'this OAuth client is set by DOUANE_ANTIGRAVITY_* environment variables; change or unset them and restart douane');
+	if (body?.force !== true && current.source === 'file' && current.client_id && current.client_id !== ANTIGRAVITY_CLIENT_ID && current.origin !== 'antigravity-cli') return fail(409, 'another Antigravity client is set; confirm replacing it ("force": true, or douanectl --force): accounts signed in with it must reconnect');
+	if (!detectable && !body?.client_secret) return fail(404, 'no Antigravity CLI was found on the douane machine; run `douanectl oauth-client detect-antigravity` on a machine that has it, or set the client manually');
+	googleClients.antigravity = { source: 'file', client_id: ANTIGRAVITY_CLIENT_ID, has_secret: true, project_id: current.project_id ?? null, origin: 'antigravity-cli' };
 	return clientView('antigravity');
 }
 const model = (provider, id, name, context_length) => ({ id: `${provider}/${id}`, provider, name, context_length, enabled: true });
@@ -291,7 +299,7 @@ function api(method, path, body, query = new URLSearchParams()) {
 	const googleClient = path.match(/^\/oauth-clients\/([^/]+)$/);
 	if (googleClient && ['PUT', 'DELETE'].includes(method)) return changeGoogleClient(method, decodeURIComponent(googleClient[1]), body);
 	const detectClient = path.match(/^\/oauth-clients\/([^/]+)\/detect$/);
-	if (detectClient && method === 'POST') return detectGoogleClient(decodeURIComponent(detectClient[1]));
+	if (detectClient && method === 'POST') return detectGoogleClient(decodeURIComponent(detectClient[1]), body);
 	const target = path.match(/^\/clients(?:\/([^/]+))?$/);
 	if (target && method !== 'GET') return changeClient(method, target[1] && decodeURIComponent(target[1]), body ?? {});
 	if (method === 'POST' && path === '/restore') return { restored: 2, accounts: [], errors: [], settings: false };

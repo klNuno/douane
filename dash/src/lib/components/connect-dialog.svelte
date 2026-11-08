@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { base } from '$app/paths';
 	import X from '@lucide/svelte/icons/x';
 	import ExternalLink from '@lucide/svelte/icons/external-link';
 	import Upload from '@lucide/svelte/icons/upload';
@@ -11,8 +12,8 @@
 	import ProviderMark from './provider-mark.svelte';
 	import { copyText } from '$lib/clipboard';
 	import { t } from '$lib/i18n.svelte';
-	import { callbackHintKey, connectMode } from '$lib/google-clients';
-	import { management, importErrors, providerName, dialects, dialectLabel, type Dialect, type Provider, type OAuthSession, type OAuthStatus } from '$lib/management';
+	import { callbackHintKey, connectMode, detectCommand as buildDetectCommand, detectNeedsConfirm, serverUrl } from '$lib/google-clients';
+	import { management, importErrors, providerName, dialects, dialectLabel, type Dialect, type Provider, type OAuthClientView, type OAuthSession, type OAuthStatus } from '$lib/management';
 	let { providers, close, completed, importFiles, openGoogleClients }: { providers: Provider[]; close: () => void; completed: () => void; importFiles: (files: FileList) => void; openGoogleClients: () => void } = $props();
 	let dialog: HTMLDialogElement;
 	let fileInput = $state<HTMLInputElement>();
@@ -27,6 +28,9 @@
 	// A Google provider without a usable OAuth client: a guided setup, never the token form.
 	let setup = $state<'antigravity' | ''>('');
 	let detecting = $state(false);
+	// The Antigravity client as the server shows it: whether a CLI is installed there, and whether detecting would replace a client set by hand.
+	let setupClient = $state.raw<OAuthClientView | null>(null);
+	let confirmDetect = $state(false);
 	let cmdCopied = $state(false);
 	let detectCommand = $state('');
 	let accountName = $state('');
@@ -38,7 +42,7 @@
 	let codeCopied = $state(false);
 	let mounted = false;
 	const endpoints: Record<string,string> = { opencode_go:'https://opencode.ai/zen/go',xai:'https://cli-chat-proxy.grok.com/v1',openai_compatible:'',kimi:'https://api.kimi.com/coding/v1',qwen:'https://portal.qwen.ai/v1' };
-	onMount(() => { mounted = true; detectCommand = `douanectl --url ${location.origin} oauth-client detect-antigravity`; dialog.showModal(); return () => { mounted = false; dialog.close(); credential = ''; callback = ''; }; });
+	onMount(() => { mounted = true; detectCommand = buildDetectCommand(serverUrl(location.origin, location.pathname, base)); dialog.showModal(); return () => { mounted = false; dialog.close(); credential = ''; callback = ''; }; });
 	async function start(provider: string) {
 		pending = true; failure = ''; callback = ''; status = ''; terminal = false; codeCopied = false;
 		try { const attempt = await management.startOAuth(provider); if (mounted) { session = attempt; status = attempt.user_code ? t('connect.waiting') : ''; } }
@@ -103,15 +107,22 @@
 		const mode = connectMode(provider);
 		if (mode === 'oauth') { void start(provider.id); return; }
 		failure = '';
-		if (mode === 'google-setup') { setup = 'antigravity'; return; }
+		if (mode === 'google-setup') { setup = 'antigravity'; void loadSetupClient(); return; }
 		manual = provider.id; endpoint = provider.base_url ?? endpoints[provider.id] ?? ''; accountName = mode === 'endpoint' ? '' : providerName(provider.id, provider.name);
 	}
 	const optionKeys = { oauth: 'connect.oauthOption', 'google-setup': 'connect.googleSetupOption', endpoint: 'connect.apiKeyOption', token: 'connect.tokenOption' } as const;
-	function reset() { session = null; setup = ''; manual = ''; credential = ''; callback = ''; failure = ''; status = ''; terminal = false; route = ''; dialect = 'chat'; detecting = false; cmdCopied = false; }
-	async function detectClient() {
+	function reset() { session = null; setup = ''; manual = ''; credential = ''; callback = ''; failure = ''; status = ''; terminal = false; route = ''; dialect = 'chat'; detecting = false; cmdCopied = false; setupClient = null; confirmDetect = false; }
+	async function loadSetupClient() {
+		// Without it the detect button stays, and the server reports what goes wrong.
+		try { const { clients } = await management.oauthClients(); if (mounted && setup) setupClient = clients.find(client => client.provider === 'antigravity') ?? null; }
+		catch { /* Keep the guide as it is. */ }
+	}
+	async function detectClient(force = false) {
 		if (detecting) return;
-		detecting = true; failure = '';
-		try { await management.detectAntigravityClient(); if (mounted) { setup = ''; await start('antigravity'); } }
+		failure = '';
+		if (!force && detectNeedsConfirm(setupClient)) { confirmDetect = true; return; }
+		detecting = true; confirmDetect = false;
+		try { await management.detectAntigravityClient({ force }); if (mounted) { setup = ''; await start('antigravity'); } }
 		catch (error) { if (mounted) failure = (error as Error).message; }
 		finally { if (mounted) detecting = false; }
 	}
@@ -154,13 +165,22 @@
 			<ol class="setup-steps">
 				<li>
 					<h4>{t('connect.googleSetupDetectTitle')}</h4>
-					<p>{t('connect.googleSetupDetectText')}</p>
-					<button class="button primary" disabled={detecting} onclick={detectClient}><Radar size={15}/>{detecting ? t('connect.googleSetupDetecting') : t('connect.googleSetupDetect')}</button>
+					{#if setupClient && !setupClient.detectable}
+						<p>{t('connect.googleSetupDetectUnavailable')}</p>
+					{:else if confirmDetect}
+						<p>{t('connect.googleSetupDetectText')}</p>
+						<p class="replace-note" role="note">{t('googleClients.replaceWarning')}</p>
+						<div class="setup-actions"><button class="button danger" disabled={detecting} onclick={() => detectClient(true)}><Radar size={15}/>{detecting ? t('connect.googleSetupDetecting') : t('connect.googleSetupReplace')}</button><button class="button" disabled={detecting} onclick={() => confirmDetect = false}>{t('common.cancel')}</button></div>
+					{:else}
+						<p>{t('connect.googleSetupDetectText')}</p>
+						<button class="button primary" disabled={detecting} onclick={() => detectClient()}><Radar size={15}/>{detecting ? t('connect.googleSetupDetecting') : t('connect.googleSetupDetect')}</button>
+					{/if}
 				</li>
 				<li>
 					<h4>{t('connect.googleSetupRemoteTitle')}</h4>
 					<p>{t('connect.googleSetupRemoteText')}</p>
 					<div class="setup-command"><code>{detectCommand}</code><button class="icon-button" onclick={copyCommand} aria-label={t('connect.googleSetupCopy')}>{#if cmdCopied}<Check size={16}/>{:else}<Copy size={16}/>{/if}</button></div>
+					<p class="setup-note">{t('connect.googleSetupRemoteToken')}</p>
 				</li>
 				<li>
 					<h4>{t('connect.googleSetupPasteTitle')}</h4>
@@ -203,6 +223,10 @@
 	.setup-command { display: flex; align-items: center; gap: 8px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
 	.setup-command code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; font-size: 13px; }
 	.setup-command .icon-button { flex-shrink: 0; }
+	.google-setup .setup-steps .setup-note { margin: 11px 0 0; }
+	.google-setup .setup-steps .replace-note { color: var(--text); }
+	.setup-actions { display: flex; gap: 8px; }
+	.setup-actions :global(.button) { flex: 1; }
 	.device-code { display: flex; align-items: center; justify-content: space-between; border: 1px solid var(--border); background: var(--background); border-radius: 10px; padding: 14px 17px; margin: 20px 0; }.device-code>span { font-family: var(--font-display); font-size: 28px; letter-spacing: .08em; }
 	.connection-success { padding: 15px 0; text-align: center; }.connection-success>span { display: inline-grid; place-items: center; width: 50px; height: 50px; background: #10b98115; color: var(--green); border-radius: 50%; }.connection-success h3 { font-size: 18px; }.connection-success p { color: var(--muted); font-size: 15px; margin-bottom: 24px; }
 	@media(max-width:600px) { .connect-dialog { padding: 22px 18px; border-radius: 15px; }.dialog-heading h2 { font-size: 24px; }.provider-options { grid-template-columns: 1fr; gap: 9px; }.provider-option { min-height: 75px; padding: 13px 15px; gap: 15px; }.provider-option>span:not(.provider-logo) { font-size: 15px; }.provider-option small { font-size: 15px; }.dialog-import { align-items: flex-start; flex-direction: column; } }
