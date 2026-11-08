@@ -55,7 +55,14 @@ export type PlanWeights = Record<string, Record<string, number>>;
 export type ShareRelease = 'last-seventh' | 'before-reset';
 export type OAuthSession = { id: string; provider: string; url: string; state: string; redirect_uri: string; expires_at: string; status: string; account_id?: string | null; error?: string | null; user_code?: string | null; interval?: number | null; error_code?: string | null; verification_required?: boolean; verification_available?: boolean };
 export type OAuthStatus = Partial<OAuthSession> & { status: string; account?: Account };
-export type ImportError = string | { name?: string | null; error: string };
+/** `error_code` names a failure the dashboard explains in its own words, such as `google_project_unavailable`. */
+export type ImportError = string | { name?: string | null; error: string; error_code?: string | null };
+/** Where a Google sign-in client comes from: environment variables, `oauth-clients.json`, or nowhere. */
+export type OAuthClientSource = 'env' | 'file' | 'none';
+/** A Google sign-in client as the server shows it; the secret never leaves the server, only `has_secret`. `origin` says how a file client was obtained (e.g. `antigravity-cli`). */
+export type OAuthClientView = { provider: 'antigravity' | 'gemini'; source: OAuthClientSource; client_id: string | null; has_secret: boolean; project_id: string | null; origin: string | null; read_only: boolean };
+/** An omitted secret keeps the one stored for the same client id; a null project removes it. */
+export type OAuthClientInput = { client_id: string; client_secret?: string; project_id: string | null };
 export type ImportResult = { accounts?: Account[]; imported: number; errors: ImportError[] };
 export type RestoreResult = { accounts?: Account[]; restored: number; errors: ImportError[]; settings: boolean };
 /** A configuration export: settings, disabled models and every account with its tokens. */
@@ -107,6 +114,10 @@ export const management = {
 	oauth: (id: string) => request<OAuthStatus>(`/oauth/${encodeURIComponent(id)}`),
 	oauthCallback: (id: string, code: string, state: string) => request<{ account: Account }>('/oauth/callback', { method: 'POST', body: JSON.stringify({ id, code, state }) }),
 	setModelEnabled: (id: string, enabled: boolean) => request(`/models/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
+	oauthClients: () => request<{ clients: OAuthClientView[] }>('/oauth-clients'),
+	saveOAuthClient: (provider: string, input: OAuthClientInput) => request<OAuthClientView>(`/oauth-clients/${encodeURIComponent(provider)}`, { method: 'PUT', body: JSON.stringify(input) }),
+	resetOAuthClient: (provider: string) => request<OAuthClientView>(`/oauth-clients/${encodeURIComponent(provider)}`, { method: 'DELETE' }),
+	detectAntigravityClient: (path?: string) => request<OAuthClientView>('/oauth-clients/antigravity/detect', { method: 'POST', body: JSON.stringify(path ? { path } : {}) }),
 	settingsSave: (settings: Partial<Settings>) => request<Settings>('/settings', { method: 'PATCH', body: JSON.stringify(settings) }),
 	clients: () => request<ClientsReport>('/clients'),
 	clientStats: (hours: number) => request<ClientStats>(`/clients/stats?hours=${hours}`),
@@ -135,7 +146,14 @@ export function pools(accounts: Account[]): Pool[] {
 	return [...byId.values()];
 }
 export function privateLabel(value: string, showEmails = false) { return showEmails ? value : value.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, t('private.account')); }
-export function importErrors(errors: ImportError[]) { return errors.map(error => typeof error === 'string' ? error : error.name ? t('api.errorPrefix', { name: privateLabel(error.name), error: error.error }) : error.error).join(' '); }
+const importErrorKeys: Record<string, StringKey> = { google_project_unavailable: 'api.googleProjectUnavailable' };
+export function importErrors(errors: ImportError[]) {
+	return errors.map(error => {
+		if (typeof error === 'string') return error;
+		const message = error.error_code && importErrorKeys[error.error_code] ? t(importErrorKeys[error.error_code]) : error.error;
+		return error.name ? t('api.errorPrefix', { name: privateLabel(error.name), error: message }) : message;
+	}).join(' ');
+}
 const statusKeys: Record<string, StringKey> = { ready: 'status.active', active: 'status.active', disabled: 'common.disabled', exhausted: 'status.exhausted', cooldown: 'status.cooldown', expired: 'status.expired', error: 'status.check' };
 export function accountStatus(account: Account) { return t(!account.enabled ? 'common.disabled' : statusKeys[account.status] ?? 'status.check'); }
 export function accountWarning(account: Account) { return account.enabled && (!!account.last_error || !['ready','active'].includes(account.status)); }

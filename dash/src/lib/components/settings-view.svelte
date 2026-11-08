@@ -5,10 +5,11 @@
 	import ProviderMark from './provider-mark.svelte';
 	import LanguageSetting from './language-setting.svelte';
 	import BackupSetting from './backup-setting.svelte';
+	import GoogleClientsSetting from './google-clients-setting.svelte';
 	import { providerName, type Settings, type Provider, type Strategy, type Account, type Quota } from '$lib/management';
 	import { rawWeight } from '$lib/pool';
 	import { t } from '$lib/i18n.svelte';
-	let { settings, providers, accounts = [], quotas = [], busy, save, restore }: { settings: Settings; providers: Provider[]; accounts?: Account[]; quotas?: Quota[]; busy: string; save: (settings: Settings) => Promise<boolean>; restore: (bundle: unknown, settings: boolean) => Promise<boolean> } = $props();
+	let { settings, providers, accounts = [], quotas = [], busy, save, restore, clientsUpdated }: { settings: Settings; providers: Provider[]; accounts?: Account[]; quotas?: Quota[]; busy: string; save: (settings: Settings) => Promise<boolean>; restore: (bundle: unknown, settings: boolean) => Promise<boolean>; clientsUpdated: (message: string) => void | Promise<void> } = $props();
 	let draft = $state<Settings>(untrack(() => ({ share_release: 'last-seventh', ...settings, provider_strategies: { ...settings.provider_strategies }, plan_weights: Object.fromEntries(Object.entries(settings.plan_weights ?? {}).map(([provider, plans]) => [provider, { ...plans }])) })));
 	// Every provider and plan among the accounts, with the weight it gets when left empty.
 	let plans = $derived.by(() => {
@@ -56,6 +57,7 @@
 	<section class="settings-section"><div><h2>{t('settings.weekEnd')}</h2><p>{t('settings.weekEndDescription')}</p></div><div class="settings-fields"><label>{t('settings.freeBefore')}<span class="unit-field"><input type="number" min="0" max="168" step="1" bind:value={draft.free_before_reset_hours} required/><span>{t('settings.hours')}</span></span></label><label>{t('settings.shareRelease')}<select bind:value={draft.share_release}><option value="last-seventh">{t('settings.shareRelease.lastSeventh')}</option><option value="before-reset">{t('settings.shareRelease.beforeReset')}</option></select></label><p class="muted small">{t('settings.shareReleaseDescription')}</p></div></section>
 	<div class="settings-footer"><button class="button primary" type="submit" disabled={!!busy}><Save size={14}/>{busy === 'settings' ? t('settings.saving') : t('settings.save')}</button></div>
 </form>
+<GoogleClientsSetting {busy} updated={clientsUpdated}/>
 <BackupSetting {busy} {restore}/>
 <LanguageSetting/>
 

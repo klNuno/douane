@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import Gauge from '@lucide/svelte/icons/gauge';
 	import LayoutDashboard from '@lucide/svelte/icons/layout-dashboard';
 	import Users from '@lucide/svelte/icons/users';
@@ -108,6 +108,11 @@
 			if (!result.imported) throw new Error(t('notice.nothingImported'));
 		},t('notice.imported'));
 	}
+	/** Opens the Google sign-in clients section of Settings, from the connect dialog. */
+	async function openGoogleClients() {
+		connectOpen = false; navigate('settings');
+		await tick(); document.getElementById('google-clients')?.scrollIntoView({ block: 'start' });
+	}
 	async function restoreBackup(bundle: unknown, applySettings: boolean) {
 		let restored = 0;
 		const done = await mutate('restore', async () => {
@@ -140,7 +145,7 @@
 			{#if screen === 'quotas'}<QuotasView {accounts} {quotas} {providers} {busy} {settings} {refresh} resetUpdated={() => load(true)} manageAccounts={() => navigate('accounts')}/>
 			{:else if screen === 'accounts'}<AccountsView {accounts} {quotas} {settings} {providers} {refresh} {setQuotaDisplay} {setQuotaWindows} {busy} {rename} {setReserve} {updateEndpoint} connect={() => connectOpen = true} {importFiles} toggle={(account) => mutate('account',() => management.setAccountEnabled(account.id,!account.enabled),t(account.enabled ? 'notice.accountDisabled' : 'notice.accountEnabled'))} remove={(account) => mutate('account',() => management.deleteAccount(account.id),t('notice.accountDeleted'))}/>
 			{:else if screen === 'clients'}<ClientsView report={clients} {accounts} {busy} updated={async (message) => { await load(true); notice = message; }}/>
-			{:else if screen === 'settings'}{#if settings}{#key JSON.stringify(settings)}<SettingsView {settings} {providers} {accounts} {quotas} {busy} restore={restoreBackup} save={(next) => mutate('settings',() => management.settingsSave(next),t('notice.settingsSaved'))}/>{/key}{:else}<div class="page-heading"><div><h1>{t('nav.settings')}</h1><p class="page-description">{t('page.settingsUnavailable')}</p></div></div><LanguageSetting/>{/if}
+			{:else if screen === 'settings'}{#if settings}{#key JSON.stringify(settings)}<SettingsView {settings} {providers} {accounts} {quotas} {busy} restore={restoreBackup} clientsUpdated={async (message) => { await load(true); notice = message; }} save={(next) => mutate('settings',() => management.settingsSave(next),t('notice.settingsSaved'))}/>{/key}{:else}<div class="page-heading"><div><h1>{t('nav.settings')}</h1><p class="page-description">{t('page.settingsUnavailable')}</p></div></div><LanguageSetting/>{/if}
 			{:else if screen === 'models'}<ModelsView {models} listings={modelListings} {accounts} {busy} {navigate} toggleModel={(model) => mutate('model',() => management.setModelEnabled(model.id,model.enabled === false),t('notice.modelUpdated'))} setModels={(ids, enabled) => mutate('models',() => management.setModelsEnabled(ids,enabled),t('notice.modelsUpdated', { count: ids.length }))} refreshModels={(pool) => mutate(`models:${pool ?? '*'}`,() => management.refreshModels(pool))}/>
 			{:else}{#key screen}<DataViews {screen} {summary} {calls} {accounts} clients={clients?.clients ?? []} {navigate}/>{/key}{/if}
 		</main>
@@ -148,4 +153,4 @@
 </div>
 <nav class="mobile-nav" aria-label={t('nav.mobile')}>{#each mobileItems as item (item.id)}{@const Icon = item.icon}<button class:active={screen === item.id} aria-current={screen === item.id ? 'page' : undefined} onclick={() => navigate(item.id)}><Icon size={19}/><span>{t(item.label)}</span></button>{/each}<button onclick={() => mobileOpen = true} aria-label={t('nav.openMenu')} aria-expanded={mobileOpen} aria-controls="main-navigation"><Menu size={19}/><span>{t('nav.menu')}</span></button></nav>
 {#if riskOpen}<RiskNotice accept={() => { acceptRisk(); riskOpen = false; }}/>{/if}
-{#if connectOpen}<ConnectDialog {providers} close={() => connectOpen = false} completed={() => { notice = t('notice.accountConnected'); void load(true); }} {importFiles}/>{/if}
+{#if connectOpen}<ConnectDialog {providers} {openGoogleClients} close={() => connectOpen = false} completed={() => { notice = t('notice.accountConnected'); void load(true); }} {importFiles}/>{/if}
