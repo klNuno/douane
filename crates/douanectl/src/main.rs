@@ -3,6 +3,8 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
+mod detect;
+
 #[derive(Parser)]
 #[command(
     version,
@@ -70,6 +72,21 @@ enum Command {
     /// each provider's quota windows.
     #[command(subcommand)]
     Client(ClientCommand),
+    /// Google sign-in clients (Antigravity, Gemini).
+    #[command(subcommand)]
+    OauthClient(OauthClientCommand),
+}
+#[derive(Subcommand)]
+enum OauthClientCommand {
+    /// Detect the Antigravity OAuth client from an installed Antigravity CLI on
+    /// this machine and send it to the configured douane server, so a douane
+    /// without the CLI can be set up from a laptop that has it.
+    DetectAntigravity {
+        /// Path to the Antigravity CLI binary; its default install location is
+        /// used when omitted.
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
 }
 #[derive(Subcommand)]
 enum ClientCommand {
@@ -484,6 +501,55 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// How long `import` waits for douane. An Antigravity or Gemini file without
+/// a Cloud project is refreshed and onboarded before douane answers: at worst
+/// a 30 s token refresh, a 30 s loadCodeAssist, then 12 onboarding calls of
+/// up to 30 s each with 5 s between them (475 s in all), and the model
+/// catalogs are refreshed after the import.
+const IMPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn import_request(
+    client: &reqwest::Client,
+    root: &str,
+    name: Option<String>,
+    content: Value,
+) -> reqwest::RequestBuilder {
+    client
+        .post(format!("{root}/admin/api/accounts/import"))
+        .timeout(IMPORT_TIMEOUT)
+        .json(&json!({"files":[{"name":name,"content":content}]}))
+}
+
+/// The PUT that configures a detected Antigravity client on the server. The
+/// body carries the secret to douane; the server never returns it.
+fn antigravity_put_request(
+    client: &reqwest::Client,
+    root: &str,
+    detected: &detect::Detected,
+) -> reqwest::RequestBuilder {
+    client
+        .put(format!("{root}/admin/api/oauth-clients/antigravity"))
+        .json(&json!({
+            "client_id": detected.client_id,
+            "client_secret": detected.client_secret,
+            "origin": "antigravity-cli",
+        }))
+}
+
+async fn oauth_client_command(
+    client: &reqwest::Client,
+    root: &str,
+    command: OauthClientCommand,
+) -> Result<Value> {
+    match command {
+        OauthClientCommand::DetectAntigravity { path } => {
+            let detected = detect::detect(client, detect::GOOGLE_TOKEN_URL, path).await?;
+            // The server returns the client view (never the secret).
+            send(antigravity_put_request(client, root, &detected)).await
+        }
+    }
+}
+
 async fn export(client: &reqwest::Client, root: &str, output: &std::path::Path) -> Result<Value> {
     let bundle = send(client.get(format!("{root}/admin/api/export"))).await?;
     write_private(output, &serde_json::to_vec_pretty(&bundle)?)?;
@@ -511,6 +577,11 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&value)?);
             return Ok(());
         }
+        Command::OauthClient(command) => {
+            let value = oauth_client_command(&client, root, command).await?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            return Ok(());
+        }
         Command::Export { output } => {
             let value = export(&client, root, &output).await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
@@ -531,9 +602,7 @@ async fn main() -> Result<()> {
             let content: Value =
                 serde_json::from_slice(&tokio::fs::read(&path).await.context("reading auth file")?)
                     .context("invalid auth JSON")?;
-            client
-                .post(format!("{root}/admin/api/accounts/import"))
-                .json(&json!({"files":[{"name":name,"content":content}]}))
+            import_request(&client, root, name, content)
         }
         Command::Remove { id } => client.delete(format!("{root}/admin/api/accounts/{id}")),
         Command::Enable { id } => client
@@ -560,7 +629,10 @@ async fn main() -> Result<()> {
                 .post(format!("{root}/admin/api/restore"))
                 .json(&json!({"bundle":bundle,"settings":settings}))
         }
-        Command::Endpoint(_) | Command::Client(_) | Command::Export { .. } => {
+        Command::Endpoint(_)
+        | Command::Client(_)
+        | Command::OauthClient(_)
+        | Command::Export { .. } => {
             unreachable!("handled above")
         }
     };
@@ -572,6 +644,57 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_antigravity_parses_its_path_and_builds_the_put() {
+        let cli = Cli::parse_from([
+            "douanectl",
+            "--url",
+            "http://server:8787",
+            "oauth-client",
+            "detect-antigravity",
+            "--path",
+            "/opt/agy",
+        ]);
+        let Command::OauthClient(OauthClientCommand::DetectAntigravity { path }) = cli.command
+        else {
+            panic!("expected detect-antigravity");
+        };
+        assert_eq!(path.as_deref(), Some(std::path::Path::new("/opt/agy")));
+        // The path is optional.
+        let cli = Cli::parse_from(["douanectl", "oauth-client", "detect-antigravity"]);
+        assert!(matches!(
+            cli.command,
+            Command::OauthClient(OauthClientCommand::DetectAntigravity { path: None })
+        ));
+        // The PUT carries the detected client to the server's existing route.
+        let detected = detect::Detected {
+            client_id: detect::ANTIGRAVITY_CLIENT.to_owned(),
+            client_secret: "placeholder-secret".to_owned(),
+        };
+        let request =
+            antigravity_put_request(&reqwest::Client::new(), "http://127.0.0.1:8317", &detected)
+                .build()
+                .unwrap();
+        assert_eq!(request.method(), reqwest::Method::PUT);
+        assert_eq!(request.url().path(), "/admin/api/oauth-clients/antigravity");
+    }
+
+    #[test]
+    fn import_waits_for_the_slowest_google_project_discovery() {
+        let worst_case = std::time::Duration::from_secs(30 + 30 + 12 * 30 + 11 * 5);
+        assert!(IMPORT_TIMEOUT > worst_case);
+        let request = import_request(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:8317",
+            None,
+            json!({}),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(request.timeout(), Some(&IMPORT_TIMEOUT));
+        assert_eq!(request.url().path(), "/admin/api/accounts/import");
+    }
 
     #[test]
     fn client_account_shares_can_be_added_updated_and_cleared() {
