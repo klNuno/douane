@@ -1,13 +1,17 @@
 //! Detects an installed Antigravity CLI on this machine and reads its OAuth
 //! client secret, so `douanectl` can configure a remote douane that has no CLI.
-//! The binary is streamed in overlapping chunks; candidates that follow the
-//! `GOCSPX-` prefix are validated against Google's token endpoint. The secret
-//! is only ever sent to the configured douane server, never printed.
+//! The scan itself is douane's own (`antigravity_scan.rs`, compiled here
+//! through a `#[path]` module, never copied); candidates are validated against
+//! Google's token endpoint. The secret is only ever sent to the configured
+//! douane server, never printed.
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::time::Duration;
+
+#[path = "../../douane/src/subscriptions/antigravity_scan.rs"]
+mod scan;
 
 /// Antigravity's public installed-app OAuth client id (not a secret). Kept in
 /// sync with the douane server's `ANTIGRAVITY_CLIENT`.
@@ -16,139 +20,39 @@ pub const ANTIGRAVITY_CLIENT: &str =
 /// Google's token endpoint, used to validate a candidate secret.
 pub const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
-const SECRET_PREFIX: &[u8] = b"GOCSPX-";
-const SECRET_BODY_LEN: usize = 28;
-const CHUNK: usize = 1 << 20;
-const MAX_CANDIDATES: usize = 16;
+/// How long validation may take: each Google call, and all of them together,
+/// so detection can never hang.
+pub struct Limits {
+    pub request: Duration,
+    pub deadline: Duration,
+}
+
+/// The same limits as the douane server.
+pub const LIMITS: Limits = Limits {
+    request: Duration::from_secs(15),
+    deadline: Duration::from_secs(60),
+};
 
 /// A validated Antigravity client. The secret is sent to douane, never printed.
 pub struct Detected {
-    pub client_id: String,
     pub client_secret: String,
 }
 
-struct Scan {
-    client_id_present: bool,
-    candidates: Vec<String>,
-}
-
-/// The default Antigravity CLI path on this machine, if known.
-pub fn default_install_path() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            let path = PathBuf::from(local).join("agy").join("bin").join("agy.exe");
-            if path.is_file() {
-                return Some(path);
-            }
-        }
-    }
-    None
-}
-
-fn is_secret_char(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    let first = needle[0];
-    let last = haystack.len() - needle.len();
-    let mut index = 0;
-    while index <= last {
-        if haystack[index] == first && &haystack[index..index + needle.len()] == needle {
-            return Some(index);
-        }
-        index += 1;
-    }
-    None
-}
-
-fn scan_window(
-    window: &[u8],
-    client_id: &[u8],
-    scan: &mut Scan,
-    seen: &mut std::collections::BTreeSet<String>,
-) {
-    if !scan.client_id_present && find(window, client_id).is_some() {
-        scan.client_id_present = true;
-    }
-    let mut from = 0;
-    while let Some(relative) = find(&window[from..], SECRET_PREFIX) {
-        let start = from + relative;
-        let body = start + SECRET_PREFIX.len();
-        let end = body + SECRET_BODY_LEN;
-        from = body;
-        if end > window.len() || !window[body..end].iter().all(|byte| is_secret_char(*byte)) {
-            continue;
-        }
-        let Ok(text) = std::str::from_utf8(&window[start..end]) else {
-            continue;
-        };
-        if seen.insert(text.to_owned()) && scan.candidates.len() < MAX_CANDIDATES {
-            scan.candidates.push(text.to_owned());
-        }
-    }
-}
-
-fn read_full(reader: &mut impl Read, buffer: &mut [u8]) -> Result<usize> {
-    let mut filled = 0;
-    while filled < buffer.len() {
-        match reader.read(&mut buffer[filled..]) {
-            Ok(0) => break,
-            Ok(read) => filled += read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error).context("reading the Antigravity CLI"),
-        }
-    }
-    Ok(filled)
-}
-
-fn scan_reader(reader: &mut impl Read) -> Result<Scan> {
-    let client_id = ANTIGRAVITY_CLIENT.as_bytes();
-    let overlap = client_id
-        .len()
-        .max(SECRET_PREFIX.len() + SECRET_BODY_LEN)
-        .saturating_sub(1);
-    let mut scan = Scan {
-        client_id_present: false,
-        candidates: Vec::new(),
-    };
-    let mut seen = std::collections::BTreeSet::new();
-    let mut carry: Vec<u8> = Vec::new();
-    let mut chunk = vec![0u8; CHUNK];
-    loop {
-        let read = read_full(reader, &mut chunk)?;
-        if read == 0 {
-            break;
-        }
-        let mut window = Vec::with_capacity(carry.len() + read);
-        window.extend_from_slice(&carry);
-        window.extend_from_slice(&chunk[..read]);
-        scan_window(&window, client_id, &mut scan, &mut seen);
-        let keep = window.len().min(overlap);
-        carry = window[window.len() - keep..].to_vec();
-        if read < chunk.len() {
-            break;
-        }
-    }
-    Ok(scan)
-}
-
-fn scan_file(path: &Path) -> Result<Scan> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("opening the Antigravity CLI at {}", path.display()))?;
-    scan_reader(&mut std::io::BufReader::new(file))
-}
-
-/// True when `candidate` is the Antigravity client's secret: a refresh with a
+/// Whether `candidate` is the Antigravity client's secret: a refresh with a
 /// deliberately invalid refresh token answers `invalid_grant` for the right
-/// secret and `invalid_client` for a wrong one. Never prints the value.
-async fn validate(client: &reqwest::Client, token_url: &str, candidate: &str) -> Result<bool> {
+/// secret and `invalid_client` for a wrong one. Any other answer (a timeout,
+/// a 429 or 5xx, another error code) says nothing about the secret and fails.
+/// Never prints the value.
+async fn validate(
+    client: &reqwest::Client,
+    token_url: &str,
+    candidate: &str,
+    timeout: Duration,
+) -> Result<bool> {
+    const UNREACHABLE: &str = "Google could not check the Antigravity client; try again";
     let response = client
         .post(token_url)
+        .timeout(timeout)
         .form(&[
             ("client_id", ANTIGRAVITY_CLIENT),
             ("client_secret", candidate),
@@ -157,46 +61,68 @@ async fn validate(client: &reqwest::Client, token_url: &str, candidate: &str) ->
         ])
         .send()
         .await
-        .context("reaching Google to validate the Antigravity client")?;
-    let body: Value = response
-        .json()
-        .await
-        .context("reading Google's validation response")?;
-    Ok(body.get("error").and_then(Value::as_str) == Some("invalid_grant"))
+        .context(UNREACHABLE)?;
+    let status = response.status();
+    if status.as_u16() == 429 || status.is_server_error() {
+        bail!("{UNREACHABLE} (HTTP {})", status.as_u16());
+    }
+    let body: Value = response.json().await.context(UNREACHABLE)?;
+    match body.get("error").and_then(Value::as_str) {
+        Some("invalid_grant") => Ok(true),
+        Some("invalid_client") => Ok(false),
+        _ => bail!(UNREACHABLE),
+    }
 }
 
-/// Finds the Antigravity CLI, scans it, and returns the validated client pair.
+/// Finds the Antigravity CLI, scans it, and returns the validated client.
 pub async fn detect(
     client: &reqwest::Client,
     token_url: &str,
     path: Option<PathBuf>,
+    limits: &Limits,
 ) -> Result<Detected> {
-    let path = match path {
-        Some(path) => {
-            if !path.is_file() {
-                bail!("no Antigravity CLI at {}", path.display());
+    let paths = match path {
+        Some(path) if !path.is_file() => bail!("no Antigravity CLI at {}", path.display()),
+        Some(path) => vec![path],
+        None => {
+            let paths = scan::install_paths(&|name| std::env::var_os(name));
+            if paths.is_empty() {
+                bail!("no Antigravity CLI found on this machine; pass --path to its binary");
             }
-            path
+            paths
         }
-        None => default_install_path()
-            .context("no Antigravity CLI found on this machine; pass --path to its binary")?,
     };
-    let scan = scan_file(&path)?;
-    if !scan.client_id_present {
+    let mut found = None;
+    for path in &paths {
+        let scan = scan::scan_file(path, ANTIGRAVITY_CLIENT)
+            .with_context(|| format!("reading the Antigravity CLI at {}", path.display()))?;
+        if scan.client_id_present {
+            found = Some(scan);
+            break;
+        }
+    }
+    let Some(scan) = found else {
         bail!(
             "the Antigravity CLI at {} does not hold douane's Antigravity client",
-            path.display()
+            paths[0].display()
         );
-    }
-    for candidate in scan.candidates {
-        if validate(client, token_url, &candidate).await? {
-            return Ok(Detected {
-                client_id: ANTIGRAVITY_CLIENT.to_owned(),
-                client_secret: candidate,
-            });
+    };
+    let validated = tokio::time::timeout(limits.deadline, async {
+        for candidate in scan.candidates {
+            if validate(client, token_url, &candidate, limits.request).await? {
+                return Ok(Some(candidate));
+            }
         }
+        Ok::<_, anyhow::Error>(None)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Google did not answer in time; try again"))??;
+    match validated {
+        Some(client_secret) => Ok(Detected { client_secret }),
+        None => bail!(
+            "no matching Antigravity client secret was found in the CLI; set the client manually"
+        ),
     }
-    bail!("no matching Antigravity client secret was found in the CLI; set the client manually")
 }
 
 #[cfg(test)]
@@ -206,38 +132,121 @@ mod tests {
     /// A `GOCSPX-…` secret built at runtime, so no literal matching
     /// `GOCSPX-[A-Za-z0-9_-]{28}` appears in this source.
     fn secret(body: &str) -> String {
-        assert_eq!(body.len(), SECRET_BODY_LEN);
+        assert_eq!(body.len(), scan::SECRET_BODY_LEN);
         format!(
             "{}{body}",
-            String::from_utf8(SECRET_PREFIX.to_vec()).unwrap()
+            String::from_utf8(scan::SECRET_PREFIX.to_vec()).unwrap()
         )
     }
 
-    #[test]
-    fn scans_the_client_id_and_distinct_candidates() {
-        let first = secret("aaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let second = secret("bbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let mut data = b"noise".to_vec();
-        data.extend_from_slice(ANTIGRAVITY_CLIENT.as_bytes());
-        data.extend_from_slice(b"\x00");
-        data.extend_from_slice(first.as_bytes());
-        data.extend_from_slice(b"\x00");
-        data.extend_from_slice(second.as_bytes());
-        data.extend_from_slice(b"\x00");
-        data.extend_from_slice(first.as_bytes());
-        let scan = scan_reader(&mut &data[..]).unwrap();
-        assert!(scan.client_id_present);
-        assert_eq!(scan.candidates, vec![first, second]);
+    /// A synthetic CLI holding the client id and `secrets`, in its own
+    /// directory.
+    fn synthetic_cli(secrets: &[String]) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("douanectl-detect-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut data = ANTIGRAVITY_CLIENT.as_bytes().to_vec();
+        for secret in secrets {
+            data.push(0);
+            data.extend_from_slice(secret.as_bytes());
+        }
+        let path = directory.join("agy");
+        std::fs::write(&path, data).unwrap();
+        path
     }
 
-    #[test]
-    fn finds_a_candidate_split_across_a_chunk_boundary() {
-        let value = secret("cccccccccccccccccccccccccccc");
-        let mut data = vec![b'.'; CHUNK - 3];
-        data.extend_from_slice(value.as_bytes());
-        data.extend_from_slice(ANTIGRAVITY_CLIENT.as_bytes());
-        let scan = scan_reader(&mut &data[..]).unwrap();
-        assert!(scan.client_id_present);
-        assert_eq!(scan.candidates, vec![value]);
+    /// A loopback token endpoint answering every request with `status` and
+    /// `body`, or never answering at all when `body` is None.
+    fn token_endpoint(status: u16, body: Option<&'static str>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for socket in listener.incoming() {
+                let Ok(mut socket) = socket else { return };
+                let mut buffer = vec![0u8; 8192];
+                let _ = socket.read(&mut buffer);
+                match body {
+                    Some(body) => {
+                        let response = format!(
+                            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes());
+                    }
+                    // Keep the connection open and silent.
+                    None => held.push(socket),
+                }
+            }
+        });
+        url
+    }
+
+    const QUICK: Limits = Limits {
+        request: Duration::from_millis(300),
+        deadline: Duration::from_secs(5),
+    };
+
+    #[tokio::test]
+    async fn a_silent_google_times_out_instead_of_hanging() {
+        let cli = synthetic_cli(&[secret("aaaaaaaaaaaaaaaaaaaaaaaaaaaa")]);
+        let url = token_endpoint(200, None);
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        let error = detect(&client, &url, Some(cli.clone()), &QUICK)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("try again"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The overall deadline ends it even when each call may wait longer.
+        let slow = Limits {
+            request: Duration::from_secs(30),
+            deadline: Duration::from_millis(300),
+        };
+        let error = detect(&client, &url, Some(cli), &slow).await.err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "Google did not answer in time; try again"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_invalid_client_means_a_wrong_secret() {
+        let cli = synthetic_cli(&[secret("bbbbbbbbbbbbbbbbbbbbbbbbbbbb")]);
+        let client = reqwest::Client::new();
+        for (status, body) in [
+            (503, r#"{"error":"backend_error"}"#),
+            (429, r#"{"error":"rate_limited"}"#),
+            (400, r#"{"error":"temporarily_unavailable"}"#),
+            (200, "not json"),
+        ] {
+            let url = token_endpoint(status, Some(body));
+            let error = detect(&client, &url, Some(cli.clone()), &QUICK)
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                error.to_string().contains("try again"),
+                "{status}: {error:#}"
+            );
+        }
+        let url = token_endpoint(401, Some(r#"{"error":"invalid_client"}"#));
+        let error = detect(&client, &url, Some(cli.clone()), &QUICK)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("no matching"), "{error:#}");
+        let url = token_endpoint(400, Some(r#"{"error":"invalid_grant"}"#));
+        let detected = detect(&client, &url, Some(cli), &QUICK).await.unwrap();
+        assert_eq!(
+            detected.client_secret,
+            secret("bbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
     }
 }

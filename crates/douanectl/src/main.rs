@@ -82,10 +82,14 @@ enum OauthClientCommand {
     /// this machine and send it to the configured douane server, so a douane
     /// without the CLI can be set up from a laptop that has it.
     DetectAntigravity {
-        /// Path to the Antigravity CLI binary; its default install location is
-        /// used when omitted.
+        /// Path to the Antigravity CLI binary; its known install locations and
+        /// `PATH` are searched when omitted.
         #[arg(long)]
         path: Option<PathBuf>,
+        /// Replace another Antigravity client set by hand on the server;
+        /// accounts signed in with it must reconnect.
+        #[arg(long)]
+        force: bool,
     },
 }
 #[derive(Subcommand)]
@@ -520,19 +524,22 @@ fn import_request(
         .json(&json!({"files":[{"name":name,"content":content}]}))
 }
 
-/// The PUT that configures a detected Antigravity client on the server. The
-/// body carries the secret to douane; the server never returns it.
-fn antigravity_put_request(
+/// The request that hands a detected Antigravity client to the server's
+/// detect route: douane checks the secret with Google again, keeps its Cloud
+/// project, records the client as detected, and refuses to replace a client
+/// set by hand unless `force`. The body carries the secret to douane; the
+/// server never returns it.
+fn antigravity_detect_request(
     client: &reqwest::Client,
     root: &str,
     detected: &detect::Detected,
+    force: bool,
 ) -> reqwest::RequestBuilder {
     client
-        .put(format!("{root}/admin/api/oauth-clients/antigravity"))
+        .post(format!("{root}/admin/api/oauth-clients/antigravity/detect"))
         .json(&json!({
-            "client_id": detected.client_id,
             "client_secret": detected.client_secret,
-            "origin": "antigravity-cli",
+            "force": force,
         }))
 }
 
@@ -542,10 +549,11 @@ async fn oauth_client_command(
     command: OauthClientCommand,
 ) -> Result<Value> {
     match command {
-        OauthClientCommand::DetectAntigravity { path } => {
-            let detected = detect::detect(client, detect::GOOGLE_TOKEN_URL, path).await?;
+        OauthClientCommand::DetectAntigravity { path, force } => {
+            let detected =
+                detect::detect(client, detect::GOOGLE_TOKEN_URL, path, &detect::LIMITS).await?;
             // The server returns the client view (never the secret).
-            send(antigravity_put_request(client, root, &detected)).await
+            send(antigravity_detect_request(client, root, &detected, force)).await
         }
     }
 }
@@ -646,7 +654,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detect_antigravity_parses_its_path_and_builds_the_put() {
+    fn detect_antigravity_parses_its_options_and_builds_the_request() {
         let cli = Cli::parse_from([
             "douanectl",
             "--url",
@@ -655,29 +663,48 @@ mod tests {
             "detect-antigravity",
             "--path",
             "/opt/agy",
+            "--force",
         ]);
-        let Command::OauthClient(OauthClientCommand::DetectAntigravity { path }) = cli.command
+        let Command::OauthClient(OauthClientCommand::DetectAntigravity { path, force }) =
+            cli.command
         else {
             panic!("expected detect-antigravity");
         };
         assert_eq!(path.as_deref(), Some(std::path::Path::new("/opt/agy")));
-        // The path is optional.
+        assert!(force);
+        // The path and force are optional.
         let cli = Cli::parse_from(["douanectl", "oauth-client", "detect-antigravity"]);
         assert!(matches!(
             cli.command,
-            Command::OauthClient(OauthClientCommand::DetectAntigravity { path: None })
+            Command::OauthClient(OauthClientCommand::DetectAntigravity {
+                path: None,
+                force: false
+            })
         ));
-        // The PUT carries the detected client to the server's existing route.
+        // The detected client goes to the server's detect route, which checks
+        // it again and never takes an origin from the caller.
         let detected = detect::Detected {
-            client_id: detect::ANTIGRAVITY_CLIENT.to_owned(),
             client_secret: "placeholder-secret".to_owned(),
         };
-        let request =
-            antigravity_put_request(&reqwest::Client::new(), "http://127.0.0.1:8317", &detected)
-                .build()
-                .unwrap();
-        assert_eq!(request.method(), reqwest::Method::PUT);
-        assert_eq!(request.url().path(), "/admin/api/oauth-clients/antigravity");
+        let request = antigravity_detect_request(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:8317",
+            &detected,
+            false,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(
+            request.url().path(),
+            "/admin/api/oauth-clients/antigravity/detect"
+        );
+        let body: Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({"client_secret": "placeholder-secret", "force": false})
+        );
     }
 
     #[test]
