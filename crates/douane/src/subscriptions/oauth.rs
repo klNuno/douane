@@ -1,5 +1,5 @@
-use super::google::GoogleOAuth;
-use super::store::{apply_identity, text};
+use super::google::{GoogleOAuth, GoogleSignIn, OAuthClientError, OAuthClientView};
+use super::store::{apply_identity, prepare_import, text};
 use super::{
     AccountCredential, AccountStore, AccountSummary, SubscriptionError, SubscriptionProvider,
     parse_timestamp, random_id, timestamp,
@@ -44,6 +44,9 @@ struct Pending {
     verifier: String,
     device: Option<DeviceFlow>,
     verification_url: Option<String>,
+    /// The Google client and project a sign-in started with; its code
+    /// exchange uses them.
+    google_client: Option<GoogleSignIn>,
 }
 
 #[derive(Clone)]
@@ -103,6 +106,157 @@ impl OAuthManager {
             meta_token_url: "https://auth.meta.com/oidc/device/token/".into(),
             meta_mint_url: "https://api.meta.ai/muse-code/key".into(),
         }
+    }
+
+    /// The Google OAuth clients and where each comes from; never a secret.
+    /// `oauth-clients.json` is read again, so hand edits show and apply.
+    pub fn oauth_clients(&self) -> Vec<OAuthClientView> {
+        self.google.reload_views()
+    }
+
+    /// Sets a custom Google OAuth client, effective at once.
+    pub fn set_oauth_client(
+        &self,
+        provider: SubscriptionProvider,
+        body: &Value,
+    ) -> Result<OAuthClientView, OAuthClientError> {
+        self.google.set_client(provider, body)
+    }
+
+    /// Removes a custom Google OAuth client, effective at once.
+    pub fn remove_oauth_client(
+        &self,
+        provider: SubscriptionProvider,
+    ) -> Result<OAuthClientView, OAuthClientError> {
+        self.google.remove_client(provider)
+    }
+
+    /// Detects an installed Antigravity CLI and configures its client from the
+    /// validated secret. `path` overrides the default install location.
+    pub async fn detect_antigravity_client(
+        &self,
+        path: Option<String>,
+    ) -> Result<OAuthClientView, super::DetectError> {
+        self.google.detect_antigravity(path).await
+    }
+
+    /// Imports a credential file. A Google account without a Cloud project
+    /// gets one from Code Assist, as sign-in does; when none is found the
+    /// import fails and nothing is stored. Tokens no client can refresh are
+    /// handled as `discover_without_client` says.
+    pub async fn import(
+        &self,
+        value: Value,
+        name: Option<String>,
+    ) -> Result<AccountSummary, SubscriptionError> {
+        let (mut account, explicit_name) = prepare_import(value, name)?;
+        if matches!(
+            account.provider,
+            SubscriptionProvider::Gemini | SubscriptionProvider::Antigravity
+        ) && account.project_id.is_none()
+        {
+            self.discover_project(&mut account).await?;
+        }
+        self.store.import_account(account, explicit_name).await
+    }
+
+    async fn discover_project(
+        &self,
+        account: &mut AccountCredential,
+    ) -> Result<(), SubscriptionError> {
+        if let Some(project) = self.store.known_project(account).await {
+            account.project_id = Some(project);
+            return Ok(());
+        }
+        // A token without a known expiry may be long dead: refresh it first
+        // when possible. A token known to be dead without a way to refresh it
+        // fails here, before any Google call.
+        let stale = account.needs_refresh() || account.expires_at.is_none();
+        match account.refresh_token.clone() {
+            Some(refresh_token) if stale => {
+                let request = match self.google.refresh_request(
+                    account.provider,
+                    &refresh_token,
+                    account.client_id.as_deref(),
+                    account.client_secret.as_deref(),
+                ) {
+                    Ok(request) => request,
+                    Err(error) => return self.discover_without_client(account, error).await,
+                };
+                let response = send_refresh(request).await?;
+                account.access_token =
+                    text(&response, &["access_token"]).ok_or(SubscriptionError::InvalidResponse)?;
+                if let Some(rotated) = text(&response, &["refresh_token"]) {
+                    account.refresh_token = Some(rotated);
+                }
+                if let Some(token) = text(&response, &["id_token"]) {
+                    account.id_token = Some(token);
+                }
+                account.expires_at = expiry_from_response(&response);
+            }
+            None if account.needs_refresh() => {
+                return Err(SubscriptionError::InvalidImport(
+                    "the access token has expired and there is no refresh token; sign in again",
+                ));
+            }
+            _ => {}
+        }
+        self.onboard_import(account).await
+    }
+
+    /// Discovery when no client douane has can refresh the imported tokens.
+    /// With no client at all for them (none configured, or only the
+    /// provider's public id without its secret), the import goes on as it
+    /// did before discovery: a token that has not expired still looks its
+    /// project up, an expired one is stored without a project. A file that
+    /// names a custom client douane does not have is refused.
+    async fn discover_without_client(
+        &self,
+        account: &mut AccountCredential,
+        error: SubscriptionError,
+    ) -> Result<(), SubscriptionError> {
+        let custom = account
+            .client_id
+            .as_deref()
+            .is_some_and(|id| !super::google::is_public_client(account.provider, id));
+        match error {
+            SubscriptionError::OAuthClientUnavailable if custom => {
+                Err(SubscriptionError::InvalidImport(
+                    "the file names a Google OAuth client douane does not have; set that client in douane first, or add its client_secret to the file",
+                ))
+            }
+            SubscriptionError::OAuthNotConfigured
+            | SubscriptionError::OAuthClientUnavailable
+            | SubscriptionError::OAuthClientNotSetUp => {
+                if account.needs_refresh() {
+                    Ok(())
+                } else {
+                    self.onboard_import(account).await
+                }
+            }
+            error => Err(error),
+        }
+    }
+
+    /// Looks up and onboards the Cloud project of an imported account.
+    async fn onboard_import(
+        &self,
+        account: &mut AccountCredential,
+    ) -> Result<(), SubscriptionError> {
+        let configured = self.google.configured_project(account.provider);
+        let (project, tier) = self
+            .google
+            .onboard(
+                account.provider,
+                &account.access_token,
+                configured.as_deref(),
+            )
+            .await?;
+        account.project_id = Some(project);
+        if account.plan.is_none() {
+            account.plan = tier;
+        }
+        Ok(())
     }
 
     pub fn supports(&self, provider: SubscriptionProvider) -> bool {
@@ -204,6 +358,7 @@ impl OAuthManager {
             verifier,
             device: None,
             verification_url: None,
+            google_client: None,
         })
         .await;
         Ok(attempt)
@@ -228,7 +383,7 @@ impl OAuthManager {
         let state = random_id();
         let verifier = format!("{}{}", random_id(), random_id());
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-        let url = self
+        let (url, sign_in) = self
             .google
             .authorize(provider, &state, &redirect, &challenge)?;
         let attempt = OAuthAttempt {
@@ -252,6 +407,7 @@ impl OAuthManager {
             verifier,
             device: None,
             verification_url: None,
+            google_client: Some(sign_in),
         })
         .await;
         Ok(attempt)
@@ -317,7 +473,7 @@ impl OAuthManager {
         state: &str,
     ) -> Result<AccountSummary, SubscriptionError> {
         let (code, state) = callback_fields(code, state)?;
-        let (provider, redirect, verifier) = {
+        let (provider, redirect, verifier, google_client) = {
             let mut attempts = self.pending.lock().await;
             let pending = attempts.get_mut(id).ok_or(SubscriptionError::Expired)?;
             if pending.public.status != "pending"
@@ -335,10 +491,18 @@ impl OAuthManager {
                 pending.public.provider,
                 pending.public.redirect_uri.clone(),
                 std::mem::take(&mut pending.verifier),
+                pending.google_client.take(),
             )
         };
         let result = self
-            .exchange(provider, &code, &state, &redirect, &verifier)
+            .exchange(
+                provider,
+                google_client.as_ref(),
+                &code,
+                &state,
+                &redirect,
+                &verifier,
+            )
             .await;
         self.finish_attempt(id, &result).await;
         result
@@ -347,6 +511,7 @@ impl OAuthManager {
     async fn exchange(
         &self,
         provider: SubscriptionProvider,
+        google_client: Option<&GoogleSignIn>,
         code: &str,
         state: &str,
         redirect: &str,
@@ -356,9 +521,10 @@ impl OAuthManager {
             provider,
             SubscriptionProvider::Gemini | SubscriptionProvider::Antigravity
         ) {
+            let sign_in = google_client.ok_or(SubscriptionError::OAuthNotConfigured)?;
             let value = self
                 .google
-                .exchange(provider, code, redirect, verifier)
+                .exchange(provider, sign_in, code, redirect, verifier)
                 .await?;
             return self.store.import(value, None).await;
         }
@@ -507,7 +673,17 @@ impl OAuthManager {
                 self.client.post(endpoint).form(&[("grant_type", "refresh_token"), ("client_id", XAI_CLIENT), ("refresh_token", refresh_token)])
             }
             SubscriptionProvider::Gemini | SubscriptionProvider::Antigravity => {
-                self.google.refresh_request(account.provider, refresh_token, account.client_id.as_deref(), account.client_secret.as_deref())?
+                match self.google.refresh_request(account.provider, refresh_token, account.client_id.as_deref(), account.client_secret.as_deref()) {
+                    Ok(request) => request,
+                    // The account cannot refresh until its client is back or it
+                    // reconnects: store why on it. These errors are fixed texts
+                    // from douane, never provider data, so they are kept whole.
+                    Err(error) => {
+                        let reason = error.to_string();
+                        let _ = self.store.modify(id, |account| account.last_error = Some(reason)).await;
+                        return Err(error);
+                    }
+                }
             }
             SubscriptionProvider::Kimi => self.client.post("https://auth.kimi.com/api/oauth/token")
                 .form(&[("grant_type", "refresh_token"), ("client_id", "17e5f671-d194-4dfb-9706-5516cb48c098"), ("refresh_token", refresh_token)]),
@@ -591,6 +767,7 @@ impl OAuthManager {
                 interval,
             }),
             verification_url: None,
+            google_client: None,
         })
         .await;
         Ok(attempt)
@@ -699,6 +876,7 @@ impl OAuthManager {
                 interval,
             }),
             verification_url: None,
+            google_client: None,
         })
         .await;
         Ok(attempt)
@@ -763,6 +941,7 @@ impl OAuthManager {
                 interval,
             }),
             verification_url: None,
+            google_client: None,
         })
         .await;
         Ok(attempt)
@@ -1501,6 +1680,7 @@ mod tests {
                         interval: 1,
                     }),
                     verification_url: None,
+                    google_client: None,
                 })
                 .await;
             let status = manager.status(&attempt.id).await.unwrap();
@@ -1917,6 +2097,655 @@ mod tests {
             .unwrap();
         assert!(manager.credential(&summary.id).await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// A Google fixture. `/token` answers a code exchange (the access token
+    /// names the code) and a refresh (`fixture-revoked` gets invalid_grant);
+    /// `/userinfo` names the account after its access token; loadCodeAssist
+    /// has no project, then onboarding returns `project` (or none). Every
+    /// token call is recorded as "<grant> <client id> <client secret>", every
+    /// loadCodeAssist call as its bearer.
+    async fn google_fixture(
+        project: Option<&'static str>,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{
+            Json, Router,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::{get, post},
+        };
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (token_seen, load_seen) = (seen.clone(), seen.clone());
+        let router = Router::new()
+            .route(
+                "/token",
+                post(move |axum::Form(form): axum::Form<BTreeMap<String, String>>| {
+                    let seen = token_seen.clone();
+                    async move {
+                        let grant = match form["grant_type"].as_str() {
+                            "authorization_code" => "code",
+                            "refresh_token" => "refresh",
+                            other => panic!("unexpected grant {other}"),
+                        };
+                        seen.lock().unwrap().push(format!(
+                            "{grant} {} {}",
+                            form["client_id"], form["client_secret"]
+                        ));
+                        if grant == "code" {
+                            let code = &form["code"];
+                            return Json(json!({"access_token":format!("access-{code}"),"refresh_token":format!("refresh-{code}"),"expires_in":3600})).into_response();
+                        }
+                        if form["refresh_token"] == "fixture-revoked" {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({"error":"invalid_grant"})),
+                            )
+                                .into_response();
+                        }
+                        Json(json!({"access_token":"fixture-rotated","refresh_token":"fixture-rotated-refresh","expires_in":3600})).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/userinfo",
+                get(|headers: HeaderMap| async move {
+                    let bearer = headers["authorization"].to_str().unwrap();
+                    let name = bearer.trim_start_matches("Bearer access-");
+                    Json(json!({"email":format!("{name}@example.test"),"id":name}))
+                }),
+            )
+            .route(
+                "/v1internal:loadCodeAssist",
+                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let seen = load_seen.clone();
+                    async move {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(headers["authorization"].to_str().unwrap().to_owned());
+                        if let Some(project) = body["cloudaicompanionProject"].as_str() {
+                            seen.push(format!("project {project}"));
+                        }
+                        Json(json!({"allowedTiers":[{"id":"free-tier","isDefault":true}]}))
+                    }
+                }),
+            )
+            .route(
+                "/daily:onboardUser",
+                post(move || async move { Json(onboarded(project)) }),
+            )
+            .route(
+                "/v1internal:onboardUser",
+                post(move || async move { Json(onboarded(project)) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (endpoint, seen, task)
+    }
+
+    /// A finished onboarding with `project`, or without any.
+    fn onboarded(project: Option<&str>) -> Value {
+        match project {
+            Some(project) => {
+                json!({"done":true,"response":{"cloudaicompanionProject":{"id":project}}})
+            }
+            None => json!({"done":true,"response":{"private":"fixture-private"}}),
+        }
+    }
+
+    /// The token call the fixture records for a grant and client.
+    fn token_call(grant: &str, id: &str, secret: &str) -> String {
+        format!("{grant} {id} {secret}")
+    }
+
+    /// The Antigravity client douane is configured with in these tests, as a
+    /// detected or pasted client would set it: the public id with a secret.
+    const ANTIGRAVITY_TEST_SECRET: &str = "antigravity-secret";
+    fn antigravity_client() -> Value {
+        json!({
+            "client_id": super::super::google::ANTIGRAVITY_CLIENT,
+            "client_secret": ANTIGRAVITY_TEST_SECRET,
+        })
+    }
+    fn antigravity_call(grant: &str) -> String {
+        token_call(
+            grant,
+            super::super::google::ANTIGRAVITY_CLIENT,
+            ANTIGRAVITY_TEST_SECRET,
+        )
+    }
+
+    async fn google_manager(
+        endpoint: &str,
+        directory: &std::path::Path,
+    ) -> (OAuthManager, Arc<AccountStore>) {
+        let store = Arc::new(AccountStore::open(directory.join("auth")).unwrap());
+        let mut manager = OAuthManager::new(reqwest::Client::new(), store.clone());
+        // The developer's own `DOUANE_*` client variables never reach these tests.
+        manager.google.use_test_env(|_| None);
+        manager.google.use_test_endpoint(endpoint);
+        (manager, store)
+    }
+
+    /// Signs in to Antigravity through the fixture; `code` names the account.
+    async fn sign_in(manager: &OAuthManager, code: &str) -> Result<String, SubscriptionError> {
+        let attempt = manager
+            .start(SubscriptionProvider::Antigravity, None)
+            .await?;
+        manager
+            .complete(&attempt.id, code, &attempt.state)
+            .await
+            .map(|summary| summary.id)
+    }
+
+    #[tokio::test]
+    async fn google_sign_in_and_refresh_keep_the_client_they_started_with() {
+        let (endpoint, seen, task) = google_fixture(Some("fixture-project")).await;
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, store) = google_manager(&endpoint, directory.path()).await;
+        let custom = || json!({"client_id":"custom-id","client_secret":"custom-secret"});
+        let custom_call = |grant: &str| token_call(grant, "custom-id", "custom-secret");
+        let token_calls = || {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|call| !call.starts_with("Bearer"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        // Sign in with a configured client: the exchange records it, and the
+        // account refreshes with it.
+        manager
+            .set_oauth_client(SubscriptionProvider::Antigravity, &custom())
+            .unwrap();
+        let attempt = manager
+            .start(SubscriptionProvider::Antigravity, None)
+            .await
+            .unwrap();
+        assert!(attempt.url.contains("client_id=custom-id"));
+        let custom_account = manager
+            .complete(&attempt.id, "custom", &attempt.state)
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(
+            store
+                .get(&custom_account)
+                .await
+                .unwrap()
+                .client_id
+                .as_deref(),
+            Some("custom-id")
+        );
+        manager.force_refresh(&custom_account).await.unwrap();
+
+        // Replacing the client makes that account reconnect; its last_error
+        // records why.
+        manager
+            .set_oauth_client(
+                SubscriptionProvider::Antigravity,
+                &json!({"client_id":"other-id","client_secret":"other-secret"}),
+            )
+            .unwrap();
+        let error = manager.force_refresh(&custom_account).await.err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "this account was signed in with a Google client douane no longer has; reconnect it"
+        );
+        assert_eq!(
+            store
+                .get(&custom_account)
+                .await
+                .unwrap()
+                .last_error
+                .as_deref(),
+            Some(
+                "this account was signed in with a Google client douane no longer has; reconnect it"
+            )
+        );
+        assert_eq!(token_calls(), [custom_call("code"), custom_call("refresh")]);
+
+        // A sign-in whose client is removed before the callback fails without
+        // sending the code with another client.
+        let attempt = manager
+            .start(SubscriptionProvider::Antigravity, None)
+            .await
+            .unwrap();
+        assert!(attempt.url.contains("client_id=other-id"));
+        manager
+            .remove_oauth_client(SubscriptionProvider::Antigravity)
+            .unwrap();
+        let error = manager
+            .complete(&attempt.id, "orphan", &attempt.state)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SubscriptionError::OAuthClientUnavailable));
+        assert_eq!(token_calls(), [custom_call("code"), custom_call("refresh")]);
+        assert_eq!(store.list().await.len(), 1);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_google_sign_in_onboards_with_the_project_it_started_with() {
+        let (endpoint, seen, task) = google_fixture(Some("fixture-project")).await;
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, store) = google_manager(&endpoint, directory.path()).await;
+        let client = |project: &str| json!({"client_id":"custom-id","client_secret":"custom-secret","project_id":project});
+        manager
+            .set_oauth_client(SubscriptionProvider::Antigravity, &client("first-project"))
+            .unwrap();
+        let attempt = manager
+            .start(SubscriptionProvider::Antigravity, None)
+            .await
+            .unwrap();
+        // The project changes before the callback: the sign-in keeps its own.
+        manager
+            .set_oauth_client(SubscriptionProvider::Antigravity, &client("second-project"))
+            .unwrap();
+        let summary = manager
+            .complete(&attempt.id, "project", &attempt.state)
+            .await
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                token_call("code", "custom-id", "custom-secret"),
+                "Bearer access-project".into(),
+                "project first-project".into(),
+            ]
+        );
+        assert_eq!(
+            store.get(&summary.id).await.unwrap().project_id.as_deref(),
+            Some("fixture-project")
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_hand_edited_client_without_secret_is_a_clear_error() {
+        let (endpoint, seen, task) = google_fixture(Some("fixture-project")).await;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("oauth-clients.json"),
+            json!({"antigravity":{"client_id":"hand-id"}}).to_string(),
+        )
+        .unwrap();
+        let (manager, store) = google_manager(&endpoint, directory.path()).await;
+        let view = &manager.oauth_clients()[0];
+        assert_eq!(view.client_id.as_deref(), Some("hand-id"));
+        assert!(!view.has_secret);
+        assert!(!manager.supports(SubscriptionProvider::Antigravity));
+        assert!(matches!(
+            sign_in(&manager, "hand").await,
+            Err(SubscriptionError::OAuthNotConfigured)
+        ));
+
+        // An account that names that client cannot borrow another secret.
+        let hand = manager
+            .import(
+                json!({"type":"antigravity","email":"hand@example.test","access_token":"fixture",
+                    "refresh_token":"fixture-refresh","client_id":"hand-id","project_id":"fixture-project",
+                    "expired":"2099-01-01T00:00:00Z"}),
+                None,
+            )
+            .await
+            .unwrap();
+        let error = manager.force_refresh(&hand.id).await.err().unwrap();
+        assert!(matches!(error, SubscriptionError::OAuthClientUnavailable));
+        // A CLI import pinned to the public id cannot refresh until the
+        // Antigravity client is set up: no secret is borrowed, no call made.
+        let mut record = antigravity_cli_record("cli@example.test");
+        record["project_id"] = json!("fixture-project");
+        let cli = manager.import(record, None).await.unwrap();
+        let error = manager.force_refresh(&cli.id).await.err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "set up the Antigravity sign-in client in Settings"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(store.list().await.len(), 2);
+        task.abort();
+        let _ = task.await;
+    }
+
+    fn antigravity_cli_record(email: &str) -> Value {
+        json!({
+            "token": {
+                "access_token": "fixture-expired",
+                "token_type": "Bearer",
+                "refresh_token": "fixture-refresh",
+                "expiry": "2020-01-01T00:00:00Z",
+                "expires_in": 3599
+            },
+            "auth_method": "consumer",
+            "id_token_email": email
+        })
+    }
+
+    #[tokio::test]
+    async fn importing_a_google_account_without_project_refreshes_and_discovers_it() {
+        let (endpoint, seen, task) = google_fixture(Some("discovered-project")).await;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut manager, store) = google_manager(&endpoint, directory.path()).await;
+        // Detection or a paste has configured the Antigravity client.
+        manager
+            .set_oauth_client(SubscriptionProvider::Antigravity, &antigravity_client())
+            .unwrap();
+        let summary = manager
+            .import(antigravity_cli_record("fixture@example.test"), None)
+            .await
+            .unwrap();
+        assert_eq!(summary.provider, SubscriptionProvider::Antigravity);
+        assert_eq!(summary.email.as_deref(), Some("fixture@example.test"));
+        let account = store.get(&summary.id).await.unwrap();
+        assert_eq!(account.project_id.as_deref(), Some("discovered-project"));
+        assert_eq!(account.plan.as_deref(), Some("free-tier"));
+        assert_eq!(account.access_token, "fixture-rotated");
+        assert_eq!(
+            account.refresh_token.as_deref(),
+            Some("fixture-rotated-refresh")
+        );
+        assert!(!account.needs_refresh());
+        // The expired token is refreshed before Code Assist sees it.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [antigravity_call("refresh"), "Bearer fixture-rotated".into()]
+        );
+
+        // A reimport of the same sign-in reuses the stored project offline.
+        task.abort();
+        let _ = task.await;
+        manager.google.use_test_endpoint("http://127.0.0.1:9");
+        let mut record = antigravity_cli_record("fixture@example.test");
+        record["token"]["expiry"] = json!("2099-01-01T00:00:00Z");
+        let again = manager.import(record, None).await.unwrap();
+        assert_eq!(again.id, summary.id);
+        assert_eq!(store.list().await.len(), 1);
+        let account = store.get(&summary.id).await.unwrap();
+        assert_eq!(account.project_id.as_deref(), Some("discovered-project"));
+
+        // An explicit project skips discovery for Gemini too.
+        let gemini = manager
+            .import(
+                json!({"type":"gemini","access_token":"fixture","project_id":"given"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&gemini.id).await.unwrap().project_id.as_deref(),
+            Some("given")
+        );
+    }
+
+    /// Credential files stored in `auth`.
+    fn stored_files(directory: &std::path::Path) -> usize {
+        std::fs::read_dir(directory.join("auth"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn importing_a_google_account_without_a_discoverable_project_stores_nothing() {
+        let (endpoint, _, task) = google_fixture(None).await;
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, store) = google_manager(&endpoint, directory.path()).await;
+        manager
+            .set_oauth_client(SubscriptionProvider::Antigravity, &antigravity_client())
+            .unwrap();
+        let error = manager
+            .import(antigravity_cli_record("fixture@example.test"), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SubscriptionError::GoogleProjectUnavailable));
+        assert!(!format!("{error:?} {error}").contains("fixture-private"));
+        assert!(store.list().await.is_empty());
+        assert_eq!(stored_files(directory.path()), 0);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn an_imported_cli_record_refreshes_with_the_configured_antigravity_client() {
+        let (endpoint, seen, task) = google_fixture(Some("discovered-project")).await;
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, store) = google_manager(&endpoint, directory.path()).await;
+        // Detection or a paste has configured the Antigravity client.
+        manager
+            .set_oauth_client(SubscriptionProvider::Antigravity, &antigravity_client())
+            .unwrap();
+        // Without an expiry the access token may be dead: it is refreshed
+        // before discovery, with the Antigravity client the CLI signed in with.
+        let mut record = antigravity_cli_record("fixture@example.test");
+        record["token"].as_object_mut().unwrap().remove("expiry");
+        let summary = manager.import(record, None).await.unwrap();
+        let account = store.get(&summary.id).await.unwrap();
+        assert_eq!(
+            account.client_id.as_deref(),
+            Some(super::super::google::ANTIGRAVITY_CLIENT)
+        );
+        assert_eq!(account.project_id.as_deref(), Some("discovered-project"));
+        assert_eq!(account.access_token, "fixture-rotated");
+        manager.force_refresh(&summary.id).await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                antigravity_call("refresh"),
+                "Bearer fixture-rotated".into(),
+                antigravity_call("refresh")
+            ]
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_typed_antigravity_import_refreshes_with_the_configured_antigravity_client() {
+        let (endpoint, seen, task) = google_fixture(Some("discovered-project")).await;
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, store) = google_manager(&endpoint, directory.path()).await;
+        manager
+            .set_oauth_client(SubscriptionProvider::Antigravity, &antigravity_client())
+            .unwrap();
+        // CLIProxyAPI's format: typed, no client named.
+        let summary = manager
+            .import(
+                json!({"type":"antigravity","email":"typed@example.test","access_token":"fixture",
+                    "refresh_token":"fixture-refresh","project_id":"fixture-project",
+                    "expired":"2099-01-01T00:00:00Z"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&summary.id).await.unwrap().client_id.as_deref(),
+            Some(super::super::google::ANTIGRAVITY_CLIENT)
+        );
+        manager.force_refresh(&summary.id).await.unwrap();
+        // An account stored before imports were pinned has no client: it uses
+        // the configured Antigravity client too.
+        store
+            .modify(&summary.id, |account| account.client_id = None)
+            .await
+            .unwrap();
+        manager.force_refresh(&summary.id).await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [antigravity_call("refresh"), antigravity_call("refresh")]
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_gemini_import_without_a_client_is_kept_as_before_discovery() {
+        let (endpoint, seen, task) = google_fixture(Some("discovered-project")).await;
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, store) = google_manager(&endpoint, directory.path()).await;
+        assert!(!manager.supports(SubscriptionProvider::Gemini));
+        // An expired token no client can refresh is stored as it is,
+        // without a project and without any Google call.
+        let expired = manager
+            .import(
+                json!({"type":"gemini","email":"expired@example.test","access_token":"fixture-expired",
+                    "refresh_token":"fixture-refresh","expired":"2020-01-01T00:00:00Z"}),
+                None,
+            )
+            .await
+            .unwrap();
+        let account = store.get(&expired.id).await.unwrap();
+        assert_eq!(account.project_id, None);
+        assert_eq!(account.access_token, "fixture-expired");
+        assert!(seen.lock().unwrap().is_empty());
+        // A token without a known expiry still looks its project up as it
+        // is, also when the file names Gemini CLI's public client.
+        for (email, client) in [
+            ("unknown@example.test", None),
+            (
+                "public@example.test",
+                Some(super::super::google::GEMINI_CLIENT),
+            ),
+        ] {
+            let mut record = json!({"type":"gemini","email":email,"access_token":"fixture-live",
+                "refresh_token":"fixture-refresh"});
+            if let Some(client) = client {
+                record["client_id"] = json!(client);
+            }
+            let summary = manager.import(record, None).await.unwrap();
+            let account = store.get(&summary.id).await.unwrap();
+            assert_eq!(account.project_id.as_deref(), Some("discovered-project"));
+            assert_eq!(account.access_token, "fixture-live");
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["Bearer fixture-live", "Bearer fixture-live"]
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn an_import_naming_an_unknown_custom_client_is_refused() {
+        let (endpoint, seen, task) = google_fixture(Some("discovered-project")).await;
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, store) = google_manager(&endpoint, directory.path()).await;
+        for provider in ["antigravity", "gemini"] {
+            let error = manager
+                .import(
+                    json!({"type":provider,"email":"custom@example.test","access_token":"fixture-expired",
+                        "refresh_token":"fixture-refresh","client_id":"unknown-custom-id",
+                        "expired":"2020-01-01T00:00:00Z"}),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "invalid authentication file: the file names a Google OAuth client douane does not have; set that client in douane first, or add its client_secret to the file"
+            );
+        }
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(store.list().await.is_empty());
+        assert_eq!(stored_files(directory.path()), 0);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn an_import_whose_refresh_is_refused_stores_nothing() {
+        let (endpoint, seen, task) = google_fixture(Some("discovered-project")).await;
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, store) = google_manager(&endpoint, directory.path()).await;
+        manager
+            .set_oauth_client(SubscriptionProvider::Antigravity, &antigravity_client())
+            .unwrap();
+        let mut record = antigravity_cli_record("fixture@example.test");
+        record["token"]["refresh_token"] = json!("fixture-revoked");
+        let error = manager.import(record, None).await.unwrap_err();
+        assert!(matches!(error, SubscriptionError::SessionRevoked));
+        // The refresh was asked once, and Code Assist never.
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(store.list().await.is_empty());
+        assert_eq!(stored_files(directory.path()), 0);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn an_expired_import_without_refresh_token_fails_before_any_call() {
+        let (endpoint, seen, task) = google_fixture(Some("discovered-project")).await;
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, store) = google_manager(&endpoint, directory.path()).await;
+        let mut record = antigravity_cli_record("fixture@example.test");
+        record["token"]
+            .as_object_mut()
+            .unwrap()
+            .remove("refresh_token");
+        let error = manager.import(record, None).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid authentication file: the access token has expired and there is no refresh token; sign in again"
+        );
+        assert!(!error.to_string().contains("fixture-expired"));
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(store.list().await.is_empty());
+        assert_eq!(stored_files(directory.path()), 0);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn the_import_route_reports_a_missing_google_project_with_its_code() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let (endpoint, _, task) = google_fixture(None).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::settings::Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("calls.sqlite");
+        let mut state = crate::state::AppState::new(config, None).unwrap();
+        let mut manager = OAuthManager::new(reqwest::Client::new(), state.accounts.clone());
+        manager.google.use_test_env(|_| None);
+        manager.google.use_test_endpoint(&endpoint);
+        manager
+            .set_oauth_client(SubscriptionProvider::Antigravity, &antigravity_client())
+            .unwrap();
+        Arc::get_mut(&mut state).unwrap().oauth = Arc::new(manager);
+        let body = json!({"files":[{"name":"antigravity.json","content":antigravity_cli_record("fixture@example.test").to_string()}]});
+        let response = crate::router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/accounts/import")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["imported"], 0);
+        assert_eq!(
+            body["errors"],
+            json!([{
+                "name": "antigravity.json",
+                "error": "Google did not return a Cloud project for this account; check account setup in Antigravity",
+                "error_code": "google_project_unavailable"
+            }])
+        );
+        assert_eq!(stored_files(directory.path()), 0);
         task.abort();
         let _ = task.await;
     }

@@ -1,4 +1,8 @@
-use crate::{relay::error, state::AppState, subscriptions::SubscriptionProvider};
+use crate::{
+    relay::error,
+    state::AppState,
+    subscriptions::{DetectError, OAuthClientError, SubscriptionError, SubscriptionProvider},
+};
 use axum::{
     Json,
     extract::{Path, Query, Request, State},
@@ -211,12 +215,18 @@ pub async fn import(State(state): State<Arc<AppState>>, Json(body): Json<Value>)
             file["content"].clone()
         };
         match state
-            .accounts
+            .oauth
             .import(value, file["name"].as_str().map(str::to_owned))
             .await
         {
             Ok(a) => accounts.push(a),
-            Err(e) => errors.push(json!({"name":file["name"],"error":e.to_string()})),
+            Err(e) => {
+                let mut entry = json!({"name":file["name"],"error":e.to_string()});
+                if matches!(e, SubscriptionError::GoogleProjectUnavailable) {
+                    entry["error_code"] = json!("google_project_unavailable");
+                }
+                errors.push(entry);
+            }
         }
     }
     state.refresh_models().await;
@@ -1135,6 +1145,119 @@ pub async fn providers(State(state): State<Arc<AppState>>) -> Json<Value> {
         provider["oauth"] = json!(state.oauth.supports(id));
     }
     Json(result)
+}
+/// The Google OAuth clients (Antigravity, Gemini) and their source. The
+/// client secret never leaves the broker: only `has_secret` says it is set.
+pub async fn oauth_clients(State(state): State<Arc<AppState>>) -> Response {
+    let oauth = state.oauth.clone();
+    // Reading the file is blocking IO: keep it off the async workers.
+    match tokio::task::spawn_blocking(move || oauth.oauth_clients()).await {
+        Ok(clients) => Json(json!({"clients": clients})).into_response(),
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cannot read the OAuth client configuration",
+        ),
+    }
+}
+/// Runs a change of `oauth-clients.json` (file IO and, on Windows, icacls)
+/// on the blocking pool; no lock is held across an await.
+async fn change_oauth_client(
+    state: &Arc<AppState>,
+    change: impl FnOnce(
+        &crate::subscriptions::OAuthManager,
+    ) -> Result<crate::subscriptions::OAuthClientView, OAuthClientError>
+    + Send
+    + 'static,
+) -> Response {
+    let oauth = state.oauth.clone();
+    oauth_client_response(
+        tokio::task::spawn_blocking(move || change(&oauth))
+            .await
+            .unwrap_or(Err(OAuthClientError::Storage)),
+    )
+}
+fn oauth_client_response(
+    result: Result<crate::subscriptions::OAuthClientView, OAuthClientError>,
+) -> Response {
+    match result {
+        Ok(view) => Json(json!(view)).into_response(),
+        Err(e) => error(
+            match e {
+                OAuthClientError::Unsupported => StatusCode::NOT_FOUND,
+                OAuthClientError::Environment(_) => StatusCode::CONFLICT,
+                OAuthClientError::Invalid(_) => StatusCode::BAD_REQUEST,
+                OAuthClientError::Unreadable | OAuthClientError::Storage => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            },
+            &e.to_string(),
+        ),
+    }
+}
+pub async fn put_oauth_client(
+    State(state): State<Arc<AppState>>,
+    Path(provider): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(provider) = SubscriptionProvider::parse(&provider) else {
+        return oauth_client_response(Err(OAuthClientError::Unsupported));
+    };
+    change_oauth_client(&state, move |oauth| oauth.set_oauth_client(provider, &body)).await
+}
+pub async fn delete_oauth_client(
+    State(state): State<Arc<AppState>>,
+    Path(provider): Path<String>,
+) -> Response {
+    let Some(provider) = SubscriptionProvider::parse(&provider) else {
+        return oauth_client_response(Err(OAuthClientError::Unsupported));
+    };
+    change_oauth_client(&state, move |oauth| oauth.remove_oauth_client(provider)).await
+}
+/// Detects an installed Antigravity CLI and configures its OAuth client from
+/// the validated secret. Only Antigravity is detectable. The optional body
+/// `{"path": "..."}` overrides the default install location. The secret is
+/// never returned.
+pub async fn detect_oauth_client(
+    State(state): State<Arc<AppState>>,
+    Path(provider): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    if SubscriptionProvider::parse(&provider) != Some(SubscriptionProvider::Antigravity) {
+        return error(
+            StatusCode::NOT_FOUND,
+            "client detection is only available for antigravity",
+        );
+    }
+    // The body is optional: an empty body means detect at the default path.
+    let path = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|body| text_field(&body, "path"));
+    detect_response(state.oauth.detect_antigravity_client(path).await)
+}
+/// A trimmed, non-empty string field, or `None`.
+fn text_field(body: &Value, key: &str) -> Option<String> {
+    body.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+fn detect_response(result: Result<crate::subscriptions::OAuthClientView, DetectError>) -> Response {
+    match result {
+        Ok(view) => Json(json!(view)).into_response(),
+        Err(e) => error(
+            match e {
+                DetectError::NotFound => StatusCode::NOT_FOUND,
+                DetectError::NoMatchingClient | DetectError::Unreadable => {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                }
+                DetectError::GoogleUnreachable => StatusCode::BAD_GATEWAY,
+                DetectError::EnvManaged => StatusCode::CONFLICT,
+                DetectError::Storage => StatusCode::INTERNAL_SERVER_ERROR,
+            },
+            &e.to_string(),
+        ),
+    }
 }
 pub async fn oauth_start(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
     let Some(provider) = body["provider"]

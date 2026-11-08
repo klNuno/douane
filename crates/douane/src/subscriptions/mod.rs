@@ -3,6 +3,7 @@
 //! Credentials are persisted locally, while public account responses use an
 //! explicit allowlist. Provider failures never copy response bodies into errors.
 
+mod antigravity_detect;
 mod google;
 pub(crate) mod meta;
 mod oauth;
@@ -10,7 +11,9 @@ mod quota;
 mod reset;
 mod store;
 
+pub use antigravity_detect::DetectError;
 pub(crate) use google::antigravity_user_agent;
+pub use google::{OAuthClientError, OAuthClientSource, OAuthClientView};
 pub use oauth::{OAuthAttempt, OAuthManager};
 pub use quota::{
     QuotaCredits, QuotaService, QuotaSnapshot, QuotaWindow, RESERVE_WINDOWS, reserve_kind,
@@ -69,6 +72,10 @@ pub enum SubscriptionError {
     SessionRevoked,
     #[error("provider OAuth client is not configured")]
     OAuthNotConfigured,
+    #[error("this account was signed in with a Google client douane no longer has; reconnect it")]
+    OAuthClientUnavailable,
+    #[error("set up the Antigravity sign-in client in Settings")]
+    OAuthClientNotSetUp,
     #[error("reserve_percent must be greater than 0 and less than 100, or null/0 to clear")]
     InvalidReserve,
     #[error(

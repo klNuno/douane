@@ -23,7 +23,7 @@ pub mod wire;
 
 use axum::{
     Router, middleware,
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
 };
 use state::AppState;
 use std::sync::Arc;
@@ -78,6 +78,15 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .put(management::update_settings),
         )
         .route("/providers", get(management::providers))
+        .route("/oauth-clients", get(management::oauth_clients))
+        .route(
+            "/oauth-clients/{provider}",
+            put(management::put_oauth_client).delete(management::delete_oauth_client),
+        )
+        .route(
+            "/oauth-clients/{provider}/detect",
+            post(management::detect_oauth_client),
+        )
         .route("/oauth/start", post(management::oauth_start))
         .route("/oauth/callback", post(management::oauth_callback))
         .route("/oauth/{id}", get(management::oauth_status))

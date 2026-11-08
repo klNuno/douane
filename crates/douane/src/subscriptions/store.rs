@@ -535,9 +535,26 @@ impl AccountStore {
         value: Value,
         name: Option<String>,
     ) -> Result<AccountSummary, SubscriptionError> {
-        let explicit_name = name.as_deref().is_some_and(|name| !name.trim().is_empty())
-            || text(&value, &["name", "label"]).is_some();
-        let mut account = parse_import(value, name)?;
+        let (account, explicit_name) = prepare_import(value, name)?;
+        self.import_account(account, explicit_name).await
+    }
+
+    /// The Cloud project already stored for the sign-in this account names.
+    pub(crate) async fn known_project(&self, account: &AccountCredential) -> Option<String> {
+        self.accounts
+            .read()
+            .await
+            .values()
+            .filter(|existing| same_identity(existing, account))
+            .find_map(|existing| existing.project_id.clone())
+    }
+
+    /// Stores a parsed import; `explicit_name` keeps its name on reimport.
+    pub(crate) async fn import_account(
+        &self,
+        mut account: AccountCredential,
+        explicit_name: bool,
+    ) -> Result<AccountSummary, SubscriptionError> {
         let mut accounts = self.accounts.write().await;
         // Reimporting the same identity rotates its tokens without duplicating it
         // or silently re-enabling a credential the user disabled.
@@ -1071,27 +1088,76 @@ fn private_directory(path: &Path) -> Result<(), SubscriptionError> {
             .map_err(|_| SubscriptionError::Storage)?;
     }
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let user = std::env::var("USERNAME").map_err(|_| SubscriptionError::Storage)?;
-        let domain = std::env::var("USERDOMAIN").unwrap_or_default();
-        let principal = if domain.is_empty() {
-            user
-        } else {
-            format!("{domain}\\{user}")
-        };
-        let output = std::process::Command::new("icacls")
-            .arg(path)
-            .args(["/inheritance:r", "/grant:r"])
-            .arg(format!("{principal}:(OI)(CI)F"))
-            .creation_flags(0x08000000)
-            .output()
-            .map_err(|_| SubscriptionError::Storage)?;
-        if !output.status.success() {
-            return Err(SubscriptionError::Storage);
-        }
+    owner_only_acl(path, "(OI)(CI)F")?;
+    Ok(())
+}
+
+/// Replaces the ACL of `path` with full control for the current user only,
+/// dropping inherited entries. `rights` is an icacls permission string.
+#[cfg(windows)]
+fn owner_only_acl(path: &Path, rights: &str) -> Result<(), SubscriptionError> {
+    use std::os::windows::process::CommandExt;
+    let user = std::env::var("USERNAME").map_err(|_| SubscriptionError::Storage)?;
+    let domain = std::env::var("USERDOMAIN").unwrap_or_default();
+    let principal = if domain.is_empty() {
+        user
+    } else {
+        format!("{domain}\\{user}")
+    };
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{principal}:{rights}"))
+        .creation_flags(0x08000000)
+        .output()
+        .map_err(|_| SubscriptionError::Storage)?;
+    if !output.status.success() {
+        return Err(SubscriptionError::Storage);
     }
     Ok(())
+}
+
+/// Atomically writes a private file that may live outside `auth_dir`, such
+/// as `oauth-clients.json` beside it. The parent directory is not private, so
+/// the file gets the same owner-only access as `auth_dir` itself: 0600 on
+/// Unix, an owner-only ACL without inheritance on Windows. The temporary file
+/// is hardened before any byte is written and renamed over the target.
+pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), SubscriptionError> {
+    let parent = path.parent().ok_or(SubscriptionError::Storage)?;
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(SubscriptionError::Storage);
+    }
+    fs::create_dir_all(parent).map_err(|_| SubscriptionError::Storage)?;
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(SubscriptionError::Storage)?;
+    let temporary = parent.join(format!(".{stem}.{}.tmp", random_id()));
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|_| SubscriptionError::Storage)?;
+        private_file(&temporary)?;
+        #[cfg(windows)]
+        owner_only_acl(&temporary, "F")?;
+        file.write_all(bytes)
+            .map_err(|_| SubscriptionError::Storage)?;
+        file.sync_all().map_err(|_| SubscriptionError::Storage)?;
+        drop(file);
+        fs::rename(&temporary, path).map_err(|_| SubscriptionError::Storage)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn private_file(path: &Path) -> Result<(), SubscriptionError> {
@@ -1163,6 +1229,26 @@ pub(crate) fn apply_identity(account: &mut AccountCredential) {
     }
 }
 
+/// The Antigravity CLI's credential file: an OAuth `token` object with an
+/// access or refresh token, and `id_token_email` or `auth_method` beside it.
+fn antigravity_cli_record(value: &Value) -> bool {
+    value
+        .get("token")
+        .filter(|token| token.is_object())
+        .is_some_and(|token| text(token, &["access_token"]).is_some())
+        && (text(value, &["id_token_email"]).is_some() || text(value, &["auth_method"]).is_some())
+}
+
+/// Parses an import and tells whether it names the account explicitly.
+pub(crate) fn prepare_import(
+    value: Value,
+    name: Option<String>,
+) -> Result<(AccountCredential, bool), SubscriptionError> {
+    let explicit_name = name.as_deref().is_some_and(|name| !name.trim().is_empty())
+        || text(&value, &["name", "label"]).is_some();
+    Ok((parse_import(value, name)?, explicit_name))
+}
+
 fn parse_import(
     mut value: Value,
     name: Option<String>,
@@ -1206,12 +1292,19 @@ fn parse_import(
         }
         value = record;
     }
+    // The Antigravity CLI stores its sign-in without a type: a `token`
+    // object beside `id_token_email` or `auth_method`.
+    let antigravity_cli = value.get("claudeAiOauth").is_none()
+        && value.get("tokens").is_none()
+        && text(&value, &["type", "provider"]).is_none()
+        && antigravity_cli_record(&value);
     let (provider, token) = if let Some(oauth) = value.get("claudeAiOauth") {
         (SubscriptionProvider::Claude, oauth)
     } else if let Some(tokens) = value.get("tokens") {
         (SubscriptionProvider::Codex, tokens)
     } else {
         let kind = text(&value, &["type", "provider"])
+            .or_else(|| antigravity_cli.then(|| "antigravity".into()))
             .ok_or(SubscriptionError::InvalidImport("missing provider type"))?;
         let provider = SubscriptionProvider::parse(&kind).ok_or(
             SubscriptionError::InvalidImport("unsupported provider type"),
@@ -1318,6 +1411,17 @@ fn parse_import(
             ));
         }
     }
+    let client_secret =
+        text(&value, &["client_secret"]).or_else(|| text(token, &["client_secret"]));
+    // Antigravity tokens from a file that names no client (the Antigravity
+    // CLI's, CLIProxyAPI's) belong to Antigravity's own client: pin it, so a
+    // custom client configured in douane is never used to refresh them.
+    let client_id = text(&value, &["client_id"])
+        .or_else(|| text(token, &["client_id"]))
+        .or_else(|| {
+            (provider == SubscriptionProvider::Antigravity && client_secret.is_none())
+                .then(|| super::google::ANTIGRAVITY_CLIENT.into())
+        });
     let created = now();
     let subscription = subscription_from_value(provider, token, "credential")
         .or_else(|| subscription_from_value(provider, &value, "credential"));
@@ -1365,7 +1469,8 @@ fn parse_import(
             })
             .unwrap_or_default(),
         project_id: text(&value, &["project_id", "projectId"]),
-        email: text(&value, &["email", "user_email"]).or_else(|| text(token, &["email"])),
+        email: text(&value, &["email", "user_email", "id_token_email"])
+            .or_else(|| text(token, &["email"])),
         plan: text(
             &value,
             &["plan_type", "subscription_type", "plan", "subs_tier_name"],
@@ -1387,8 +1492,8 @@ fn parse_import(
         cooldown_until: None,
         exhausted_until: None,
         exhausted_without_reset: false,
-        client_id: text(&value, &["client_id"]).or_else(|| text(token, &["client_id"])),
-        client_secret: text(&value, &["client_secret"]).or_else(|| text(token, &["client_secret"])),
+        client_id,
+        client_secret,
         token_endpoint: text(&value, &["token_endpoint"]),
         model_exhaustion: BTreeMap::new(),
         reserve_percent: None,
@@ -1702,6 +1807,83 @@ mod tests {
         assert_eq!(
             grok.base_url.as_deref(),
             Some("https://cli-chat-proxy.grok.com/v1")
+        );
+    }
+
+    #[test]
+    fn imports_the_antigravity_cli_credential_file() {
+        let record = json!({
+            "token": {
+                "access_token": "fixture-access",
+                "token_type": "Bearer",
+                "refresh_token": "fixture-refresh",
+                "expiry": "2030-01-01T12:00:00.123456789+01:00",
+                "expires_in": 3599
+            },
+            "auth_method": "consumer",
+            "id_token_email": "fixture@example.test"
+        });
+        let account = parse_import(record.clone(), None).unwrap();
+        assert_eq!(account.provider, SubscriptionProvider::Antigravity);
+        assert_eq!(account.access_token, "fixture-access");
+        assert_eq!(account.refresh_token.as_deref(), Some("fixture-refresh"));
+        assert_eq!(account.email.as_deref(), Some("fixture@example.test"));
+        assert_eq!(account.name, "fixture@example.test");
+        assert_eq!(account.project_id, None);
+        // Refreshes use the client the CLI signed in with.
+        assert_eq!(
+            account.client_id.as_deref(),
+            Some(super::super::google::ANTIGRAVITY_CLIENT)
+        );
+        assert_eq!(
+            account.expires_at.as_deref().and_then(parse_timestamp),
+            parse_timestamp("2030-01-01T11:00:00.123456789Z")
+        );
+        // Either marker is enough.
+        for marker in ["auth_method", "id_token_email"] {
+            let mut record = record.clone();
+            record.as_object_mut().unwrap().remove(marker);
+            let account = parse_import(record, None).unwrap();
+            assert_eq!(account.provider, SubscriptionProvider::Antigravity);
+        }
+        // An explicit type still wins; Gemini has no client to pin.
+        let mut typed = record.clone();
+        typed["type"] = json!("gemini");
+        let account = parse_import(typed, None).unwrap();
+        assert_eq!(account.provider, SubscriptionProvider::Gemini);
+        assert_eq!(account.client_id, None);
+        // A typed Antigravity record without a client (CLIProxyAPI's format)
+        // is pinned to the built-in client too.
+        let account = parse_import(
+            json!({"type":"antigravity","access_token":"fixture","refresh_token":"fixture-refresh"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            account.client_id.as_deref(),
+            Some(super::super::google::ANTIGRAVITY_CLIENT)
+        );
+        // A secret without its id is kept as it is: refreshing it is an error,
+        // never the built-in id with another client's secret.
+        let mut secret_only = record.clone();
+        secret_only["client_secret"] = json!("fixture-secret");
+        let account = parse_import(secret_only, None).unwrap();
+        assert_eq!(account.client_id, None);
+        assert_eq!(account.client_secret.as_deref(), Some("fixture-secret"));
+        // A client the record names is kept.
+        let mut named = record.clone();
+        named["client_id"] = json!("fixture-client");
+        assert_eq!(
+            parse_import(named, None).unwrap().client_id.as_deref(),
+            Some("fixture-client")
+        );
+        // A bare token without either marker is still untyped.
+        let error = parse_import(json!({"token":{"access_token":"fixture"}}), None)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "invalid authentication file: missing provider type"
         );
     }
 
