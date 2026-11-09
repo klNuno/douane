@@ -1814,6 +1814,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_fable_5_2_goes_to_a_claude_account() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let claude = state
+            .accounts
+            .import(json!({"type":"claude","access_token":"fixture"}), None)
+            .await
+            .unwrap();
+        state.refresh_models().await;
+        for model in ["claude-fable-5-2", "claude/claude-fable-5-2"] {
+            let (upstream, accounts) = state.candidates(model, None, None).await.unwrap();
+            assert_eq!(upstream, "claude-fable-5-2");
+            assert_eq!(accounts[0].id, claude.id);
+        }
+        // Like Claude Fable 5.1, thinking cannot be turned off.
+        let fable = catalog()
+            .iter()
+            .find(|m| m.id == "claude-fable-5-2")
+            .unwrap();
+        assert_eq!(fable.thinking.as_ref().unwrap()["zero_allowed"], false);
+    }
+
+    #[tokio::test]
     async fn claude_haiku_5_5_goes_to_a_claude_account() {
         let directory = tempfile::TempDir::new().unwrap();
         let mut config = Config::default();
