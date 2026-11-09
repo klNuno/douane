@@ -1282,11 +1282,24 @@ fn parse_claude(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindo
     }
     if let Some(limits) = value.get("limits").and_then(Value::as_array) {
         for (index, window) in limits.iter().enumerate() {
-            if window.get("is_active").and_then(Value::as_bool) == Some(false) {
-                continue;
-            }
+            // `is_active` marks the limit that binds right now, not the only
+            // one that applies: the Fable weekly limit stays false until it binds.
             let used = number(window.get("percent"));
-            let model = window.pointer("/scope/model/id").and_then(Value::as_str);
+            // A scoped limit names its model by id, or only by display name
+            // ("Fable"): both become the same `seven-day-<model>` window.
+            let model = window
+                .pointer("/scope/model/id")
+                .and_then(Value::as_str)
+                .filter(|m| !m.trim().is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    window
+                        .pointer("/scope/model/display_name")
+                        .and_then(Value::as_str)
+                        .map(|name| name.trim().to_lowercase().replace(char::is_whitespace, "-"))
+                        .filter(|m| !m.is_empty())
+                });
+            let model = model.as_deref();
             let kind = text(window, &["kind", "group"]).unwrap_or_else(|| format!("limit-{index}"));
             // Claude names its five-hour window "session" in this list.
             let id = if kind.contains("5") || kind.contains("five") || kind.contains("session") {
@@ -1301,9 +1314,20 @@ fn parse_claude(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindo
             if windows.iter().any(|existing| existing.id == id) {
                 continue;
             }
+            let label = match (model, id.starts_with("seven-day-")) {
+                (Some(m), true) => {
+                    let mut name = m.to_owned();
+                    if let Some(first) = name.get_mut(0..1) {
+                        first.make_ascii_uppercase();
+                    }
+                    format!("{name} weekly")
+                }
+                (Some(m), false) => format!("{m} {kind}"),
+                (None, _) => kind,
+            };
             windows.push(QuotaWindow {
                 id,
-                label: model.map(|m| format!("{m} {kind}")).unwrap_or(kind),
+                label,
                 remaining_percent: remaining(used),
                 reset_at: reset(window.get("resets_at"), None, observed),
                 used,
@@ -1850,6 +1874,42 @@ mod tests {
             reset.reserve_window_remaining(&pick(&["weekly"]), observed()),
             None
         );
+    }
+
+    #[test]
+    fn claude_fable_weekly_limit_reads_from_the_scoped_limit_even_when_not_binding() {
+        // The usage reply of 2026-11-09: the Fable weekly limit lives only in
+        // `limits`, scoped by display name, with `is_active` false.
+        let windows = parse_claude(
+            &json!({
+                "five_hour": {"utilization": 92.0, "resets_at": "2026-11-10T02:10:00+00:00"},
+                "seven_day": {"utilization": 12.0, "resets_at": "2026-11-11T09:00:00+00:00"},
+                "iguana_necktie": null,
+                "limits": [
+                    {"kind": "session", "group": "session", "percent": 92, "resets_at": "2026-11-10T02:10:00+00:00", "scope": null, "is_active": true},
+                    {"kind": "weekly_all", "group": "weekly", "percent": 12, "resets_at": "2026-11-11T09:00:00+00:00", "scope": null, "is_active": false},
+                    {"kind": "weekly_scoped", "group": "weekly", "percent": 21, "resets_at": "2026-11-11T09:00:00+00:00",
+                     "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}, "is_active": false}
+                ]
+            }),
+            observed(),
+        );
+        let ids: Vec<_> = windows.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["five-hour", "seven-day", "seven-day-fable"]);
+        let fable = &windows[2];
+        assert_eq!(fable.label, "Fable weekly");
+        assert_eq!(fable.remaining_percent, Some(79.0));
+        assert!(fable.reset_at.as_deref().is_some_and(|r| r.starts_with("2026-11-11T09:00:00")));
+        // The legacy field and the scoped limit name the same window once.
+        let both = parse_claude(
+            &json!({
+                "iguana_necktie": {"utilization": 30, "resets_at": "2026-11-11T09:00:00Z"},
+                "limits": [{"kind": "weekly_scoped", "percent": 30, "resets_at": "2026-11-11T09:00:00Z",
+                            "scope": {"model": {"display_name": "Fable"}}, "is_active": false}]
+            }),
+            observed(),
+        );
+        assert_eq!(both.iter().filter(|w| w.id == "seven-day-fable").count(), 1);
     }
 
     #[test]
