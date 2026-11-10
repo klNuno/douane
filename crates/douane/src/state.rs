@@ -891,12 +891,13 @@ impl AppState {
                     if self.reserve_excludes_with(&a, quota.as_ref(), now, free_before) {
                         continue;
                     }
-                    if let Some(reset) = self.clients.share_blocks(
+                    if let Some(reset) = self.clients.share_blocks_for(
                         client,
                         &a,
                         quota.as_ref(),
                         now.unix_timestamp(),
                         config.settings.release(),
+                        model,
                     ) {
                         if held_back.as_ref().is_none_or(|(_, r)| reset < *r) {
                             held_back = Some((pool.to_owned(), reset));
@@ -1050,6 +1051,7 @@ impl AppState {
         &self,
         client: Option<&crate::clients::Client>,
         account: &AccountCredential,
+        model: &str,
     ) -> bool {
         if client.is_some_and(|c| !c.access.allows(account)) {
             return true;
@@ -1057,12 +1059,13 @@ impl AppState {
         let release = self.config.read().await.settings.release();
         let snapshot = self.quotas.get(&account.id).await;
         self.clients
-            .share_blocks(
+            .share_blocks_for(
                 client,
                 account,
                 snapshot.as_ref(),
                 time::OffsetDateTime::now_utc().unix_timestamp(),
                 release,
+                model,
             )
             .is_some()
     }

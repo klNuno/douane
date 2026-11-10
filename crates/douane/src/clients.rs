@@ -8,6 +8,8 @@
 //! of longer windows, when anyone may use them (`share_release = "before-reset"`
 //! keeps them reserved until `free_before_reset_hours`); what no share covers is common.
 //! Five-hour shares are always hard caps and keep their reservations until reset.
+//! A model family's own weekly window (Claude's Fable, Opus or Sonnet week) is
+//! split by the same shares, counting only calls to that family.
 //! Account shares override pool shares. When authorized holders promise more
 //! than 100%, unused quota is common and each holder has its own usage cap.
 //! In the hours before an account's weekly reset (`free_before_reset_hours`),
@@ -150,10 +152,44 @@ struct Usage {
     pending: BTreeMap<(String, &'static str), BTreeMap<String, f64>>,
     /// Calls running, by account then client.
     running: BTreeMap<String, BTreeMap<String, u32>>,
+    /// Calls running on a model family with its own weekly window, by
+    /// (account, family kind) then client.
+    running_family: BTreeMap<(String, &'static str), BTreeMap<String, u32>>,
     dirty: bool,
 }
 
-/// One account-wide window of a snapshot with known usage and reset.
+/// Model families with a weekly window of their own, and its share kind.
+const FAMILY_KINDS: [(&str, &str); 3] = [
+    ("fable", "weekly-fable"),
+    ("opus", "weekly-opus"),
+    ("sonnet", "weekly-sonnet"),
+];
+
+/// The share kind of a window id: an account-wide window, or a model
+/// family's weekly window (`seven-day-fable`), which shares split too.
+fn share_kind(id: &str) -> Option<&'static str> {
+    reserve_kind(id).or_else(|| {
+        FAMILY_KINDS
+            .iter()
+            .find(|(family, _)| id.strip_prefix("seven-day-") == Some(*family))
+            .map(|(_, kind)| *kind)
+    })
+}
+
+/// The model family a kind is limited to; `None` for account-wide kinds.
+fn kind_family(kind: &str) -> Option<&'static str> {
+    FAMILY_KINDS
+        .iter()
+        .find(|(_, k)| *k == kind)
+        .map(|(family, _)| *family)
+}
+
+/// Whether a window of this kind counts calls to `model`.
+fn kind_counts(kind: &str, model: &str) -> bool {
+    kind_family(kind).is_none_or(|family| model.contains(family))
+}
+
+/// One shared window of a snapshot with known usage and reset.
 struct Reading {
     kind: &'static str,
     used: f64,
@@ -163,7 +199,7 @@ struct Reading {
 fn readings(snapshot: &QuotaSnapshot) -> Vec<Reading> {
     let mut out: Vec<Reading> = vec![];
     for window in &snapshot.windows {
-        let Some(kind) = reserve_kind(&window.id) else {
+        let Some(kind) = share_kind(&window.id) else {
             continue;
         };
         let (Some(remaining), Some(reset)) = (
@@ -527,6 +563,11 @@ impl Clients {
     }
 
     pub fn call_started(&self, account: &str, client: Option<&str>) {
+        self.call_started_on(account, client, "");
+    }
+
+    /// A call to `model` starts: it also counts for its family's weekly window.
+    pub fn call_started_on(&self, account: &str, client: Option<&str>, model: &str) {
         let mut usage = self.usage();
         *usage
             .running
@@ -534,11 +575,44 @@ impl Clients {
             .or_default()
             .entry(client.unwrap_or("").to_owned())
             .or_default() += 1;
+        for (family, kind) in FAMILY_KINDS {
+            if model.contains(family) {
+                *usage
+                    .running_family
+                    .entry((account.to_owned(), kind))
+                    .or_default()
+                    .entry(client.unwrap_or("").to_owned())
+                    .or_default() += 1;
+            }
+        }
     }
 
     pub fn call_ended(&self, account: &str, client: Option<&str>, weight: f64) {
+        self.call_ended_on(account, client, weight, "");
+    }
+
+    /// A call to `model` ends: its weight goes to the account-wide windows
+    /// and to its family's weekly window, never to another family's.
+    pub fn call_ended_on(&self, account: &str, client: Option<&str>, weight: f64, model: &str) {
         let client = client.unwrap_or("");
         let mut usage = self.usage();
+        for (family, kind) in FAMILY_KINDS {
+            if !model.contains(family) {
+                continue;
+            }
+            let key = (account.to_owned(), kind);
+            if let Some(running) = usage.running_family.get_mut(&key) {
+                if let Some(count) = running.get_mut(client) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        running.remove(client);
+                    }
+                }
+                if running.is_empty() {
+                    usage.running_family.remove(&key);
+                }
+            }
+        }
         if let Some(running) = usage.running.get_mut(account) {
             if let Some(count) = running.get_mut(client) {
                 *count = count.saturating_sub(1);
@@ -551,7 +625,14 @@ impl Clients {
             }
         }
         if weight > 0.0 && weight.is_finite() {
-            for kind in ["five-hour", "daily", "weekly", "monthly"] {
+            let families = FAMILY_KINDS
+                .iter()
+                .filter(|(family, _)| model.contains(family))
+                .map(|(_, kind)| *kind);
+            for kind in ["five-hour", "daily", "weekly", "monthly"]
+                .into_iter()
+                .chain(families)
+            {
                 *usage
                     .pending
                     .entry((account.to_owned(), kind))
@@ -621,6 +702,12 @@ impl Clients {
             }
             let weights: Vec<(String, f64)> = match usage.pending.remove(&key) {
                 Some(pending) if !pending.is_empty() => pending.into_iter().collect(),
+                // A family's window only rises with calls to that family.
+                _ if kind_family(reading.kind).is_some() => usage
+                    .running_family
+                    .get(&key)
+                    .map(|r| r.iter().map(|(c, n)| (c.clone(), *n as f64)).collect())
+                    .unwrap_or_default(),
                 _ => running.clone(),
             };
             let total: f64 = weights.iter().map(|(_, w)| w).sum();
@@ -718,7 +805,11 @@ impl Clients {
         } else {
             None
         };
-        let length = window_seconds(reading.kind).unwrap_or(0.0);
+        let length = if kind_family(reading.kind).is_some() {
+            604_800.0
+        } else {
+            window_seconds(reading.kind).unwrap_or(0.0)
+        };
         let free = if overbooked
             || (last_seventh
                 && reading.kind != "five-hour"
@@ -752,6 +843,21 @@ impl Clients {
         now: i64,
         release: impl Into<Release>,
     ) -> Option<i64> {
+        self.share_blocks_for(client, account, snapshot, now, release, "")
+    }
+
+    /// [`Self::share_blocks`] for a call to `model`: the weekly window of the
+    /// model's family (Fable, Opus, Sonnet) is split by the same shares, and
+    /// holds back only calls to that family.
+    pub fn share_blocks_for(
+        &self,
+        client: Option<&Client>,
+        account: &AccountCredential,
+        snapshot: Option<&QuotaSnapshot>,
+        now: i64,
+        release: impl Into<Release>,
+        model: &str,
+    ) -> Option<i64> {
         let snapshot = snapshot?;
         let holders = self.holders(account.pool(), &account.id);
         if holders.is_empty() {
@@ -764,6 +870,7 @@ impl Clients {
             .into_iter()
             .filter(|r| r.reset > now)
             .filter(|r| !weekly_free || r.kind == "five-hour")
+            .filter(|r| kind_family(r.kind).is_none() || kind_counts(r.kind, model))
             .find(|reading| {
                 self.budget(&holders, me, &account.id, reading, now, release.last_seventh)
                     .2
@@ -794,7 +901,7 @@ impl Clients {
         let account = snapshot.account_id.clone();
         let readings = readings(&snapshot);
         for window in &mut snapshot.windows {
-            let Some(kind) = reserve_kind(&window.id) else {
+            let Some(kind) = share_kind(&window.id) else {
                 continue;
             };
             let Some(reading) = readings.iter().find(|r| r.kind == kind) else {
@@ -1346,6 +1453,71 @@ mod tests {
         let window = &clients.usage_report(NOW)[0];
         assert!(window.clients.is_empty());
         assert_eq!(window.outside, 2.0);
+    }
+
+    #[test]
+    fn a_family_weekly_window_is_split_by_shares_and_holds_back_only_that_family() {
+        let (_dir, clients) = clients();
+        let share = |name: &str| ClientPatch {
+            name: Some(name.into()),
+            shares: Some([("claude".to_owned(), 50.0)].into()),
+            ..ClientPatch::default()
+        };
+        let (moi, _) = clients.create(share("moi")).unwrap();
+        let (pote, _) = clients.create(share("pote")).unwrap();
+        let a = account("a");
+        let reset = NOW + 3 * 86_400;
+        // The account week at `week`, the Fable week at `fable`.
+        let both = |week: f64, fable: f64| {
+            let mut s = snapshot("a", week, reset);
+            let mut w = s.windows[0].clone();
+            w.id = "seven-day-fable".into();
+            w.label = "Fable weekly".into();
+            w.remaining_percent = Some(100.0 - fable);
+            s.windows.push(w);
+            s
+        };
+        let reserved = Release {
+            before_reset: 6 * 3600,
+            last_seventh: false,
+        };
+        clients.observe(&both(0.0, 0.0), NOW);
+        // Moi spends Opus: the week rises, the Fable week does not.
+        clients.call_ended_on("a", Some(&moi.id), 1.0, "claude-opus-5-5");
+        clients.observe(&both(10.0, 0.0), NOW);
+        // Moi then spends its half of the Fable week; pote a little.
+        clients.call_ended_on("a", Some(&moi.id), 1.0, "claude-fable-5-2");
+        clients.observe(&both(20.0, 50.0), NOW);
+        clients.call_ended_on("a", Some(&pote.id), 1.0, "claude-fable-5-2");
+        clients.observe(&both(22.0, 60.0), NOW);
+        let full = both(22.0, 60.0);
+        let blocks = |c: &Client, model: &str| {
+            clients.share_blocks_for(Some(c), &a, Some(&full), NOW, reserved, model)
+        };
+        // Pote's unused 40 points of Fable stay pote's: moi is held back on Fable only.
+        assert_eq!(blocks(&moi, "claude-fable-5-2"), Some(reset));
+        assert_eq!(blocks(&moi, "claude/claude-fable-5-2"), Some(reset));
+        assert_eq!(blocks(&moi, "claude-opus-5-5"), None);
+        assert_eq!(blocks(&pote, "claude-fable-5-2"), None);
+        // The Opus call was never charged to the Fable week.
+        let report = clients.usage_report(NOW);
+        let fable = report.iter().find(|w| w.kind == "weekly-fable").unwrap();
+        assert_eq!(fable.clients[&moi.id], 50.0);
+        assert_eq!(fable.clients[&pote.id], 10.0);
+        // Each client's Fable bar shows its own half.
+        let bar = |c: &Client| {
+            clients
+                .client_view(c, full.clone(), "claude", NOW, reserved)
+                .windows[1]
+                .remaining_percent
+        };
+        assert_eq!(bar(&moi), Some(0.0));
+        assert_eq!(bar(&pote), Some(80.0));
+        // Before the weekly reset, shares let go of the Fable week too.
+        assert_eq!(
+            clients.share_blocks_for(Some(&moi), &a, Some(&full), reset - 3600, reserved, "claude-fable-5-2"),
+            None
+        );
     }
 
     #[test]
