@@ -473,7 +473,6 @@ export const en = {
 	'clients.noShare': 'Common part only',
 	'clients.createdAt': 'Created {date}',
 	'clients.familyWeek': '{family} week: only calls to {family} models count',
-	'clients.ofShare': '{used} / {share}%',
 	'clients.highest': 'Highest account: {name}',
 	'clients.notMeasured': 'Not measured yet',
 	'clients.rotate': 'New key',
