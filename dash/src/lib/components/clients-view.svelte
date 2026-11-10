@@ -13,7 +13,7 @@
 	import ClientEditor from './client-editor.svelte';
 	import ClientKey from './client-key.svelte';
 	import ClientStats from './client-stats.svelte';
-	import { management, pools as poolsOf, privateLabel, providerName, formatDecimal, resetLabel, formatDate, reserveWindows, reserveWindowLabel, type Account, type Client, type ClientSaved, type ClientsReport, type ClientUsage, type Pool, type ReserveWindow } from '$lib/management';
+	import { management, pools as poolsOf, privateLabel, providerName, formatDecimal, resetLabel, formatDate, usageKinds, usageKindLabel, usageFamily, type Account, type Client, type ClientSaved, type ClientsReport, type ClientUsage, type Pool, type UsageKind } from '$lib/management';
 	import { t } from '$lib/i18n.svelte';
 	let { report, accounts, busy, updated }: { report: ClientsReport | null; accounts: Account[]; busy: string; updated: (message: string) => Promise<void> } = $props();
 	const noKeyColor = '#d6def0';
@@ -34,7 +34,8 @@
 	function percent(value: number) { return t('common.percent', { value: formatDecimal(value) }); }
 	function pool(id: string): Pool { return pools.find(item => item.id === id) ?? { id, provider: id, name: id, accounts: [] }; }
 	function accountName(id: string) { const account = accounts.find(item => item.id === id); return account ? privateLabel(account.name) : t('activity.unknownAccount'); }
-	function byKind(a: { kind: ReserveWindow }, b: { kind: ReserveWindow }) { return reserveWindows.indexOf(a.kind) - reserveWindows.indexOf(b.kind); }
+	function byKind(a: { kind: UsageKind }, b: { kind: UsageKind }) { return usageKinds.indexOf(a.kind) - usageKinds.indexOf(b.kind); }
+	function kindTitle(kind: UsageKind) { const family = usageFamily(kind); return family ? t('clients.familyWeek', { family }) : undefined; }
 	/** Keep each account's usage beside its effective share, including pool defaults. */
 	function clientUsage(client: Client) {
 		return accounts.filter(account => client.access.all || client.access.pools.includes(account.route || account.provider) || client.access.accounts.includes(account.id)).map(account => {
@@ -121,6 +122,7 @@
 			{@const access = accessSummary(client)}
 			{@const shares = Object.entries(client.shares)}
 			{@const accountShares = Object.entries(client.account_shares ?? {})}
+			{@const usedBy = clientUsage(client)}
 			<article class="client-card" style:--client={colors.get(client.id)}>
 				<header>
 					<div class="client-title"><span class="client-dot"></span><h2>{client.name}</h2><code title={t('clients.createdAt', { date: formatDate(client.created_at) })}>{client.key_hint}</code></div>
@@ -130,7 +132,7 @@
 						<button class="icon-button danger" title={t('clients.delete')} aria-label={t('clients.deleteNamed', { name: client.name })} disabled={!!busy} onclick={() => { failure = ''; confirmation = { kind: 'delete', client }; }}><Trash2 size={18}/></button>
 					</div>
 				</header>
-				<div class="access">
+				<div class="grants">
 					{#if client.access.all}<span class="tag strong">{t('clients.allAccounts')}</span>
 					{:else}
 						{#each access.whole as item (item.id)}<span class="tag"><ProviderMark provider={item.provider} size={17}/>{item.name}</span>{/each}
@@ -138,24 +140,26 @@
 						{#each access.missing as id (id)}<span class="tag muted">{t('activity.unknownAccount')}</span>{/each}
 						{#if !access.whole.length && !access.single.length && !access.missing.length}<span class="tag muted">{t('clients.noAccess')}</span>{/if}
 					{/if}
-				</div>
-				<div class="shares">
 					{#each shares as [id, share] (id)}{@const item = pool(id)}<span class="share-chip" title={t('clients.shareOf', { pool: item.name })}><ChartPie size={15}/>{item.name}<strong>{percent(share)}</strong></span>{/each}
 					{#each accountShares as [id, share] (id)}<span class="share-chip" title={t('clients.accountShareOf', { name: accountName(id) })}><ChartPie size={15}/>{accountName(id)}<strong>{percent(share)}</strong></span>{/each}
 					{#if !shares.length && !accountShares.length}<span class="muted small">{t('clients.noShare')}</span>{/if}
 				</div>
-				{#each clientUsage(client) as entry (entry.account.id)}
-					<div class="pool-usage">
-						<p class="pool-name"><ProviderMark provider={entry.pool.provider} size={18}/>{accountName(entry.account.id)}</p>
-						{#each entry.kinds as kind (kind.kind)}
-							<div class="usage-line">
-								<span class="kind">{reserveWindowLabel(kind.kind)}</span>
-								<span class="usage-track"><span class="usage-fill" style:width="{Math.min(100, kind.points)}%"></span>{#if entry.share != null}<span class="share-mark" style:left="{Math.min(100, entry.share)}%"></span>{/if}</span>
-								<span class="usage-value tabular" class:over={entry.share != null && kind.points >= entry.share}>{entry.share == null ? percent(kind.points) : t('clients.ofShare', { used: formatDecimal(kind.points), share: formatDecimal(entry.share) })}</span>
+				{#if usedBy.length}
+					<div class="account-grid">
+						{#each usedBy as entry (entry.account.id)}
+							<div class="account-tile">
+								<p class="pool-name"><ProviderMark provider={entry.pool.provider} size={18}/><span>{accountName(entry.account.id)}</span></p>
+								{#each entry.kinds as kind (kind.kind)}
+									<div class="usage-line">
+										<span class="kind" title={kindTitle(kind.kind)}>{usageKindLabel(kind.kind)}</span>
+										<span class={['usage-track', entry.share != null && 'shared']} style:--share="{Math.min(100, entry.share ?? 100)}%"><span class={['usage-fill', entry.share != null && kind.points >= entry.share && 'over']} style:width="{Math.min(100, kind.points)}%"></span></span>
+										<span class="usage-value tabular" class:over={entry.share != null && kind.points >= entry.share}>{#if entry.share == null}{percent(kind.points)}{:else}{formatDecimal(kind.points)}<span class="of">&nbsp;/ {percent(entry.share)}</span>{/if}</span>
+									</div>
+								{:else}<p class="muted small no-usage">{t('clients.notMeasured')}</p>{/each}
 							</div>
-						{:else}<p class="muted small no-usage">{t('clients.notMeasured')}</p>{/each}
+						{/each}
 					</div>
-				{/each}
+				{/if}
 			</article>
 		{/each}
 	</div>
@@ -181,7 +185,7 @@
 							<div class="windows">
 								{#each account.rows as row (row.kind)}
 									<div class="window-row">
-										<span class="kind">{reserveWindowLabel(row.kind)}</span>
+										<span class="kind" title={kindTitle(row.kind)}>{usageKindLabel(row.kind)}</span>
 										<span class="stack" role="img" aria-label={segments(row).map(segment => `${segment.label} ${percent(segment.points)}`).join(', ')}>
 											{#each segments(row) as segment (segment.id)}<span class={['segment', segment.kind]} style:width="{Math.min(100, segment.points)}%" style:background={segment.color || undefined} title="{segment.label}: {percent(segment.points)}"></span>{/each}
 										</span>
@@ -212,31 +216,37 @@
 
 <style>
 	.page-description .state-badge { gap: 7px; }
-	.client-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
-	.client-card { display: flex; flex-direction: column; gap: 14px; padding: 20px 20px 22px; border: 1px solid var(--border); border-top: 3px solid var(--client); border-radius: 14px; background: var(--surface); }
-	.client-card header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
-	.client-title { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-width: 0; padding-top: 6px; }
-	.client-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--client); }
+	.client-grid { display: grid; gap: 14px; }
+	.client-card { display: flex; flex-direction: column; gap: 12px; padding: 16px 18px 18px 22px; border: 1px solid var(--border); border-left: 3px solid var(--client); border-radius: 14px; background: linear-gradient(90deg, color-mix(in srgb, var(--client) 7%, var(--surface)), var(--surface) 240px); }
+	.client-card header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+	.client-title { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-width: 0; }
+	.client-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--client); box-shadow: 0 0 0 4px color-mix(in srgb, var(--client) 18%, transparent); }
 	.client-title h2 { font-family: var(--font-display); font-size: 22px; font-weight: 650; letter-spacing: -.03em; overflow-wrap: anywhere; }
 	.client-title code { padding: 2px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--background); color: var(--muted); font-size: 13px; }
-	.card-actions { display: flex; margin: -4px -8px 0 0; }
+	.card-actions { display: flex; margin: -6px -8px -6px 0; }
 	.icon-button.danger:hover { color: var(--red); }
-	.access, .shares { display: flex; flex-wrap: wrap; gap: 7px; }
-	.tag, .share-chip { display: inline-flex; align-items: center; gap: 7px; padding: 4px 10px 4px 7px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px; }
+	.grants { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+	.tag, .share-chip { display: inline-flex; align-items: center; gap: 7px; padding: 3px 10px 3px 7px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px; }
 	.tag.strong { padding-left: 10px; border-color: #7899ff40; background: #5478f61c; color: #c4d3ff; }
 	.tag.muted { padding-left: 10px; }
 	.share-chip { padding-left: 9px; border-color: color-mix(in srgb, var(--client) 45%, transparent); border-radius: 999px; background: color-mix(in srgb, var(--client) 12%, transparent); color: var(--text); }
 	.share-chip :global(svg) { color: var(--client); }
 	.share-chip strong { color: var(--text); font-weight: 600; }
-	.pool-usage { padding-top: 12px; border-top: 1px solid var(--border); }
-	.pool-name { display: flex; align-items: center; gap: 8px; margin: 0 0 9px; font-size: 15px; font-weight: 550; }
-	.usage-line { display: grid; grid-template-columns: 54px 1fr 74px; align-items: center; gap: 12px; min-height: 26px; }
+	.account-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }
+	.account-tile { padding: 12px 14px 11px; border: 1px solid var(--border); border-radius: 11px; background: color-mix(in srgb, var(--background) 62%, var(--surface)); }
+	.pool-name { display: flex; align-items: center; gap: 8px; margin: 0 0 7px; font-size: 15px; font-weight: 600; }
+	.pool-name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.usage-line { display: grid; grid-template-columns: 54px 1fr 68px; align-items: center; gap: 10px; min-height: 24px; }
 	.kind { color: var(--muted); font-size: 14px; }
-	.usage-track { position: relative; height: 7px; border-radius: 4px; background: #2a3a55; }
-	.usage-fill { position: absolute; inset: 0 auto 0 0; border-radius: inherit; background: var(--client); }
-	.share-mark { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; border-radius: 1px; background: var(--text); }
-	.usage-value { text-align: right; font-size: 14px; }
-	.usage-value.over { color: var(--yellow); }
+	.usage-track { position: relative; height: 8px; overflow: hidden; border-radius: 999px; background: #2a3a55; }
+	/* The client's share is tinted; what lies past it belongs to others and is hatched. */
+	.usage-track.shared { background: linear-gradient(90deg, color-mix(in srgb, var(--client) 26%, #2a3a55) calc(var(--share) - 1px), var(--surface) calc(var(--share) - 1px) calc(var(--share) + 1px), transparent calc(var(--share) + 1px)), repeating-linear-gradient(135deg, #2a3a55 0 2px, #18243a 2px 5px); }
+	.usage-fill { position: absolute; inset: 0 auto 0 0; min-width: 0; border-radius: inherit; background: var(--client); }
+	.usage-fill.over { background: var(--yellow); }
+	[title].kind { cursor: help; }
+	.usage-value { text-align: right; font-size: 14px; font-weight: 550; }
+	.usage-value .of { color: var(--muted); font-weight: 400; }
+	.usage-value.over, .usage-value.over .of { color: var(--yellow); }
 	.no-usage { margin: 0; }
 	.section-toolbar { flex-wrap: wrap; margin-top: 38px; }
 	.section-title, .info { display: inline-flex; align-items: center; gap: 8px; }
@@ -265,5 +275,5 @@
 	.empty-breakdown { margin: 0; padding: 22px 20px; color: var(--muted); font-size: 15px; }
 	.open-warning { color: var(--yellow); }
 	@media(max-width:900px) { .account-usage { grid-template-columns: 1fr; gap: 10px; } }
-	@media(max-width:650px) { .client-grid { grid-template-columns: 1fr; } .window-row { grid-template-columns: 48px 1fr 80px; } .reset { grid-column: 2/-1; margin-top: -4px; } .account-usage, .group-heading { padding-inline: 16px; } }
+	@media(max-width:650px) { .client-card { padding-left: 16px; } .window-row { grid-template-columns: 48px 1fr 80px; } .reset { grid-column: 2/-1; margin-top: -4px; } .account-usage, .group-heading { padding-inline: 16px; } }
 </style>

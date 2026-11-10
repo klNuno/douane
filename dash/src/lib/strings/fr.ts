@@ -474,7 +474,7 @@ export const fr: Record<StringKey, string> = {
 	'clients.noAccess': 'Aucun compte',
 	'clients.noShare': 'Part commune seulement',
 	'clients.createdAt': 'Créé le {date}',
-	'clients.ofShare': '{used} / {share} %',
+	'clients.familyWeek': 'Semaine {family} : seuls les appels aux modèles {family} comptent',
 	'clients.highest': 'Compte le plus utilisé : {name}',
 	'clients.notMeasured': 'Pas encore mesuré',
 	'clients.rotate': 'Nouvelle clé',
