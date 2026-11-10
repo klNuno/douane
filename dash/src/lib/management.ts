@@ -15,6 +15,12 @@ export type EndpointPatch = { route?: string; base_url?: string; dialect?: Diale
 export type ReserveWindow = 'five-hour' | 'daily' | 'weekly' | 'monthly';
 export const reserveWindows: ReserveWindow[] = ['five-hour', 'daily', 'weekly', 'monthly'];
 export function reserveWindowLabel(id: ReserveWindow) { return t(`reserveWindow.${id}`); }
+/** A row of client usage: an account-wide window, or the weekly window of one model family. */
+export type UsageKind = ReserveWindow | 'weekly-fable' | 'weekly-opus' | 'weekly-sonnet';
+export const usageKinds: UsageKind[] = ['five-hour', 'daily', 'weekly', 'weekly-fable', 'weekly-opus', 'weekly-sonnet', 'monthly'];
+/** The model family of a family week (`Fable`), or nothing for an account-wide window. */
+export function usageFamily(kind: UsageKind) { const family = kind.startsWith('weekly-') ? kind.slice(7) : ''; return family ? family[0].toUpperCase() + family.slice(1) : ''; }
+export function usageKindLabel(kind: UsageKind) { return usageFamily(kind) || reserveWindowLabel(kind as ReserveWindow); }
 export function reserveWindow(id: string): ReserveWindow | null { return ({ 'five-hour': 'five-hour', daily: 'daily', weekly: 'weekly', 'seven-day': 'weekly', seven_day: 'weekly', monthly: 'monthly' } as Record<string, ReserveWindow>)[id] ?? null; }
 export type QuotaWindow = { id: string; label: string; remaining_percent: number | null; reset_at?: string | null };
 export type Subscription = { id: string; label: string; multiplier?: number | null; source: string };
@@ -36,7 +42,7 @@ export type Status = { version: string; uptime_seconds: number; in_flight: numbe
 export type ClientAccess = { all: boolean; pools: string[]; accounts: string[] };
 export type Client = { id: string; name: string; key_hint: string; created_at: string; access: ClientAccess; shares: Record<string, number>; account_shares: Record<string, number> };
 /** Percent points of one account-wide window attributed to each client id (`""` is a call without key). */
-export type ClientUsage = { account_id: string; kind: ReserveWindow; reset: number; used: number; clients: Record<string, number>; outside: number };
+export type ClientUsage = { account_id: string; kind: UsageKind; reset: number; used: number; clients: Record<string, number>; outside: number };
 export type ClientsReport = { clients: Client[]; usage: ClientUsage[] };
 /** What one client spent on one model; `client_id` is empty for calls made before keys were required. */
 export type ClientTotals = { client_id: string; provider: string; model: string; calls: number; errors: number; input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_write_tokens: number; latency_ms: number; last_at: string };

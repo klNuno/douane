@@ -162,6 +162,7 @@ const used = (account_id, kind, hours, total, points, outside = 0) => ({ account
 const usage = [
 	used('acc-claude-home', 'five-hour', 2.7, 36, { 'cl-desktop': 18, 'cl-family': 6, 'cl-laptop': 7 }, 2),
 	used('acc-claude-home', 'weekly', 61, 29, { 'cl-desktop': 14, 'cl-family': 9, 'cl-laptop': 4 }, 1),
+	used('acc-claude-home', 'weekly-fable', 61, 44, { 'cl-desktop': 19, 'cl-family': 25 }),
 	used('acc-claude-work', 'five-hour', 1.4, 66, { 'cl-desktop': 40, 'cl-family': 12, 'cl-laptop': 10 }),
 	used('acc-claude-work', 'weekly', 110, 78, { 'cl-desktop': 41, 'cl-family': 21, 'cl-laptop': 9, '': 3 }, 2),
 	used('acc-codex', 'five-hour', 3.9, 8, { 'cl-desktop': 3, 'cl-laptop': 5 }),
