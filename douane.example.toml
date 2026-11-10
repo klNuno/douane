@@ -25,6 +25,9 @@ share_release = "last-seventh"
 # keeps working without its hidden reasoning.
 antigravity_replay_mib = 64
 antigravity_replay_idle_minutes = 60
+# Claude models other than Fable go first to the accounts whose Fable week is
+# used up, so the accounts that still have Fable keep their week for it.
+keep_fable = false
 
 [settings.provider_strategies]
 # claude = "reset-first"
@@ -38,3 +41,6 @@ antigravity_replay_idle_minutes = 60
 [settings.quota_windows]
 # claude = { hidden = ["seven-day-opus"], primary = "five-hour" }
 
+# Account ids in the order the "manual" strategy spends them, per provider.
+[settings.account_order]
+# claude = ["first-account-id", "second-account-id"]

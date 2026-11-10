@@ -51,10 +51,10 @@ export type ClientHour = { client_id: string; hour: string; calls: number; token
 export type ClientStats = { since: string; totals: ClientTotals[]; hours: ClientHour[] };
 export type ClientPatch = { name?: string; access?: ClientAccess; shares?: Record<string, number>; account_shares?: Record<string, number>; rotate_key?: boolean };
 export type ClientSaved = { client: Client; key: string | null };
-export type Strategy = 'round-robin' | 'fill-first' | 'reset-first' | 'smart';
+export type Strategy = 'round-robin' | 'fill-first' | 'reset-first' | 'manual' | 'smart';
 export type QuotaDisplay = 'accounts' | 'average';
 export type QuotaWindowChoice = { hidden?: string[]; primary?: string | null };
-export type Settings = { strategy: Strategy; quota_refresh_seconds: number; request_timeout_seconds: number; default_provider: string | null; provider_strategies?: Record<string, Strategy>; quota_display?: Record<string, QuotaDisplay>; quota_windows?: Record<string, QuotaWindowChoice>; show_provider_pace?: boolean; free_before_reset_hours?: number; share_release?: ShareRelease; plan_weights?: PlanWeights };
+export type Settings = { strategy: Strategy; quota_refresh_seconds: number; request_timeout_seconds: number; default_provider: string | null; provider_strategies?: Record<string, Strategy>; account_order?: Record<string, string[]>; keep_fable?: boolean; quota_display?: Record<string, QuotaDisplay>; quota_windows?: Record<string, QuotaWindowChoice>; show_provider_pace?: boolean; free_before_reset_hours?: number; share_release?: ShareRelease; plan_weights?: PlanWeights };
 /** Pool weight per provider id, then per subscription id, in (0, 1000]; absent means the plan multiplier or 1. */
 export type PlanWeights = Record<string, Record<string, number>>;
 /** When unused client shares stop being reserved: the last seventh of a window, or only `free_before_reset_hours` before the weekly reset. */

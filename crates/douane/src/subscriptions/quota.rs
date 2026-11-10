@@ -98,6 +98,20 @@ impl QuotaSnapshot {
             .reduce(f64::min)
     }
 
+    /// Whether the weekly window of a model family (`seven-day-fable`) is
+    /// used up, with its reset still ahead.
+    pub fn family_week_spent(&self, family: &str, now: i64) -> bool {
+        self.windows.iter().any(|window| {
+            window.id.strip_prefix("seven-day-") == Some(family)
+                && window.remaining_percent.is_some_and(|left| left <= 0.0)
+                && window
+                    .reset_at
+                    .as_deref()
+                    .and_then(super::parse_timestamp)
+                    .is_some_and(|reset| reset.unix_timestamp() > now)
+        })
+    }
+
     pub fn weekly_remaining_percent(&self) -> Option<f64> {
         self.windows
             .iter()

@@ -35,6 +35,12 @@ pub struct Settings {
     pub quota_refresh_seconds: u64,
     pub request_timeout_seconds: u64,
     pub default_provider: Option<String>,
+    /// Account ids of a provider or route in the order the `manual` strategy
+    /// spends them. Accounts left out follow, by id.
+    pub account_order: BTreeMap<String, Vec<String>>,
+    /// Other Claude models go first to the accounts whose Fable week is used
+    /// up, so the accounts that still have Fable keep their week for it.
+    pub keep_fable: bool,
     /// How `/v1/quotas` presents each provider's accounts. Absent means per account.
     pub quota_display: BTreeMap<String, QuotaDisplay>,
     /// Which windows `/v1/quotas` shows for each provider, and the one shown first.
@@ -113,6 +119,8 @@ impl Default for Settings {
         Self {
             strategy: crate::scheduler::Strategy::Smart,
             provider_strategies: BTreeMap::new(),
+            account_order: BTreeMap::new(),
+            keep_fable: false,
             quota_refresh_seconds: 300,
             request_timeout_seconds: 180,
             default_provider: None,

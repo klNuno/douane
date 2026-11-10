@@ -211,7 +211,7 @@ const summary = {
 };
 const settings = {
 	strategy: 'smart', quota_refresh_seconds: 300, free_before_reset_hours: 6, request_timeout_seconds: 180, default_provider: null,
-	provider_strategies: { claude: 'reset-first' }, quota_display: {}, quota_windows: {}, show_provider_pace: process.env.MOCK_PACE === '1', plan_weights: {}
+	provider_strategies: { claude: 'reset-first' }, account_order: {}, keep_fable: false, quota_display: {}, quota_windows: {}, show_provider_pace: process.env.MOCK_PACE === '1', plan_weights: {}
 };
 const resetResults = new Map();
 const resets = (id) => {

@@ -871,6 +871,16 @@ impl AppState {
             let free_before = config.settings.free_before_reset_seconds();
             let mut eligible = vec![];
             let mut candidates = vec![];
+            let order = config
+                .settings
+                .account_order
+                .get(pool)
+                .or_else(|| config.settings.account_order.get(provider.as_str()));
+            // Fable calls spend the Fable week wherever they go; only the
+            // other models can spare the accounts that still have it.
+            let keep_fable = config.settings.keep_fable
+                && provider == SubscriptionProvider::Claude
+                && !model.contains("fable");
             let mut pool_accounts = self
                 .accounts
                 .eligible_in_for_replay(provider, route.as_deref(), Some(model), owner)
@@ -916,6 +926,22 @@ impl AppState {
                             .and_then(crate::subscriptions::parse_timestamp)
                             .map(|t| t.unix_timestamp()),
                         credits_only: quota.as_ref().is_some_and(|q| q.credits_only(now)),
+                        rank: order.and_then(|ids| ids.iter().position(|id| *id == a.id)),
+                        preferred: keep_fable
+                            && quota.as_ref().is_some_and(|q| {
+                                q.family_week_spent("fable", now.unix_timestamp())
+                                    || self
+                                        .clients
+                                        .share_blocks_for(
+                                            client,
+                                            &a,
+                                            Some(q),
+                                            now.unix_timestamp(),
+                                            config.settings.release(),
+                                            "fable",
+                                        )
+                                        .is_some()
+                            }),
                     });
                     eligible.push(a);
                 }
@@ -1718,6 +1744,64 @@ mod tests {
                 .unwrap_err()
                 .starts_with("no available subscription")
         );
+    }
+
+    #[tokio::test]
+    async fn the_chosen_order_and_keep_fable_decide_which_account_leads() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        config.settings.strategy = Strategy::Manual;
+        let state = AppState::new(config, None).unwrap();
+        let mut ids = vec![];
+        for name in ["one", "two", "three"] {
+            let account = state
+                .accounts
+                .import(
+                    json!({"type":"claude","access_token":"fixture","account_id":name,"name":name}),
+                    None,
+                )
+                .await
+                .unwrap();
+            ids.push(account.id);
+        }
+        for (id, fable_left) in ids.iter().zip([40.0, 0.0, 40.0]) {
+            let mut quota = weekly(id, "2099-01-01T00:00:00Z");
+            quota.windows[0].id = "seven-day".into();
+            quota.windows.push(QuotaWindow {
+                id: "seven-day-fable".into(),
+                label: "Fable".into(),
+                remaining_percent: Some(fable_left),
+                reset_at: Some("2099-01-01T00:00:00Z".into()),
+                used: None,
+                limit: None,
+            });
+            state.quotas.insert_for_test(quota).await;
+        }
+        async fn order(state: &AppState, model: &str) -> Vec<String> {
+            let (_, accounts) = state
+                .candidates(model, Some("claude"), None)
+                .await
+                .unwrap();
+            accounts.into_iter().map(|a| a.id).collect()
+        }
+        let chosen = vec![ids[2].clone(), ids[0].clone()];
+        state
+            .config
+            .write()
+            .await
+            .settings
+            .account_order
+            .insert("claude".into(), chosen);
+        let mut unlisted_last = vec![ids[2].clone(), ids[0].clone(), ids[1].clone()];
+        assert_eq!(order(&state, "claude-opus-5-5").await, unlisted_last);
+
+        // Opus now starts on the account whose Fable week is over; Fable does not.
+        state.config.write().await.settings.keep_fable = true;
+        assert_eq!(order(&state, "claude-fable-5-2").await, unlisted_last);
+        unlisted_last.rotate_right(1);
+        assert_eq!(order(&state, "claude-opus-5-5").await, unlisted_last);
     }
 
     #[tokio::test]
