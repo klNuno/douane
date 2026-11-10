@@ -517,7 +517,7 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                             };
                             let usable = match current.filter(|_| kept) {
                                 Some(current) => !state.reserve_excludes(&current).await
-                                    && !state.client_excludes(client.as_ref(), &current).await
+                                    && !state.client_excludes(client.as_ref(), &current, &requested).await
                                     && !state.credits_avoidable(&current, &requested).await,
                                 None => false,
                             };

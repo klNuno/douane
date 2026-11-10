@@ -495,7 +495,7 @@ export const fr: Record<StringKey, string> = {
 	'clients.access': 'Comptes',
 	'clients.wholePool': 'Tous les comptes {pool}, futurs compris',
 	'clients.shares': 'Parts de quota',
-	'clients.sharesInfo': "La part du fournisseur s'applique à tous ses comptes. Une part renseignée sur un compte la remplace. Jusqu'à 100 % attribués, les parts inutilisées restent réservées jusqu'au dernier septième de chaque fenêtre, ou jusqu'au reset hebdomadaire selon les Réglages. Au-delà, premier arrivé, premier servi, dans la limite de sa part et du quota restant. Les limites se lèvent avant le reset hebdomadaire selon les Réglages.",
+	'clients.sharesInfo': "La part du fournisseur s'applique à tous ses comptes. Une part renseignée sur un compte la remplace. Elle partage aussi la limite hebdomadaire propre à un modèle, comme la semaine Fable de Claude. Jusqu'à 100 % attribués, les parts inutilisées restent réservées jusqu'au dernier septième de chaque fenêtre, ou jusqu'au reset hebdomadaire selon les Réglages. Au-delà, premier arrivé, premier servi, dans la limite de sa part et du quota restant. Les limites se lèvent avant le reset hebdomadaire selon les Réglages.",
 	'clients.shareOf': 'Part de {pool}',
 	'clients.accountShareOf': 'Part du compte {name}',
 	'clients.providerDefault': 'Défaut fournisseur',

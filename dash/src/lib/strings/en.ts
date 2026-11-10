@@ -493,7 +493,7 @@ export const en = {
 	'clients.access': 'Accounts',
 	'clients.wholePool': 'Every {pool} account, later ones included',
 	'clients.shares': 'Quota shares',
-	'clients.sharesInfo': 'A provider share applies to every account. A filled account share replaces it. Up to 100% assigned, unused shares stay reserved until the last seventh of each window, or until the weekly reset as chosen in Settings. Above 100%, first come, first served, up to each client\'s share and the quota left. Limits lift before the weekly reset as configured in Settings.',
+	'clients.sharesInfo': 'A provider share applies to every account. A filled account share replaces it. It also splits a model's own weekly limit, such as Claude's Fable week. Up to 100% assigned, unused shares stay reserved until the last seventh of each window, or until the weekly reset as chosen in Settings. Above 100%, first come, first served, up to each client\'s share and the quota left. Limits lift before the weekly reset as configured in Settings.',
 	'clients.shareOf': 'Share of {pool}',
 	'clients.accountShareOf': 'Share of account {name}',
 	'clients.providerDefault': 'Provider default',

@@ -1902,7 +1902,11 @@ impl CallGuard {
         client: Option<&crate::clients::Client>,
     ) -> Self {
         self.call.client_id = client.map(|c| c.id.clone());
-        clients.call_started(&self.call.account_id, self.call.client_id.as_deref());
+        clients.call_started_on(
+            &self.call.account_id,
+            self.call.client_id.as_deref(),
+            &self.call.model,
+        );
         self.clients = Some(clients.clone());
         self
     }
@@ -1995,10 +1999,11 @@ impl Drop for CallGuard {
         }
         self.call.latency_ms = self.start.elapsed().as_millis() as u64;
         if let Some(clients) = &self.clients {
-            clients.call_ended(
+            clients.call_ended_on(
                 &self.call.account_id,
                 self.call.client_id.as_deref(),
                 crate::clients::call_weight(&self.call),
+                &self.call.model,
             );
         }
         self.ledger.record(std::mem::take(&mut self.call));
