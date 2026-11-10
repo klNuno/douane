@@ -21,7 +21,8 @@
 //! call through douane can explain it.
 
 use crate::subscriptions::{
-    AccountCredential, QuotaSnapshot, parse_timestamp, reserve_kind, window_seconds, write_private,
+    AccountCredential, AccountSummary, QuotaSnapshot, parse_timestamp, reserve_kind,
+    window_seconds, write_private,
 };
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -111,6 +112,28 @@ impl Client {
             .get(account_id)
             .or_else(|| self.shares.get(pool))
             .copied()
+    }
+
+    /// Drops the shares its access no longer reaches: an account share on an
+    /// account it may not use, a pool share on a pool none of its accounts is
+    /// in. `pools` maps each connected account to its pool. True when one went.
+    fn drop_unreachable_shares(&mut self, pools: &BTreeMap<String, String>) -> bool {
+        let access = &self.access;
+        if access.all {
+            return false;
+        }
+        let before = self.shares.len() + self.account_shares.len();
+        self.account_shares.retain(|id, _| {
+            access.accounts.contains(id)
+                || pools
+                    .get(id)
+                    .is_some_and(|pool| access.pools.contains(pool))
+        });
+        self.shares.retain(|pool, _| {
+            access.pools.contains(pool)
+                || access.accounts.iter().any(|id| pools.get(id) == Some(pool))
+        });
+        before != self.shares.len() + self.account_shares.len()
     }
 
     /// The listing shown to the dashboard: everything but the key hash.
@@ -501,6 +524,36 @@ impl Clients {
         Ok((client, key))
     }
 
+    /// Drops every share a client's access no longer reaches, so a share never
+    /// outlives the access it came with. Writes only when one went.
+    pub fn drop_unreachable_shares(&self, accounts: &[AccountSummary]) -> Result<(), String> {
+        let pools: BTreeMap<String, String> = accounts
+            .iter()
+            .map(|a| {
+                let pool = a
+                    .route
+                    .clone()
+                    .unwrap_or_else(|| a.provider.as_str().to_owned());
+                (a.id.clone(), pool)
+            })
+            .collect();
+        if !self
+            .read()
+            .iter()
+            .any(|c| c.clone().drop_unreachable_shares(&pools))
+        {
+            return Ok(());
+        }
+        self.change(|list| {
+            for client in list.iter_mut() {
+                if client.drop_unreachable_shares(&pools) {
+                    tracing::info!(client = %client.name, "dropped shares its access no longer reaches");
+                }
+            }
+            Ok(())
+        })
+    }
+
     pub fn delete(&self, id: &str) -> Result<(), String> {
         self.change(|list| {
             let before = list.len();
@@ -872,8 +925,15 @@ impl Clients {
             .filter(|r| !weekly_free || r.kind == "five-hour")
             .filter(|r| kind_family(r.kind).is_none() || kind_counts(r.kind, model))
             .find(|reading| {
-                self.budget(&holders, me, &account.id, reading, now, release.last_seventh)
-                    .2
+                self.budget(
+                    &holders,
+                    me,
+                    &account.id,
+                    reading,
+                    now,
+                    release.last_seventh,
+                )
+                .2
             })
             .map(|r| r.reset)
     }
@@ -910,8 +970,14 @@ impl Clients {
             if reading.reset <= now || (weekly_free && reading.kind != "five-hour") {
                 continue;
             }
-            let (mine, remaining, _) =
-                self.budget(&holders, &client.id, &account, reading, now, release.last_seventh);
+            let (mine, remaining, _) = self.budget(
+                &holders,
+                &client.id,
+                &account,
+                reading,
+                now,
+                release.last_seventh,
+            );
             let budget = mine + remaining;
             let used = if budget <= 1e-9 {
                 100.0
@@ -1064,6 +1130,57 @@ mod tests {
         .unwrap();
         let (client, _) = clients.create(patch).unwrap();
         assert_eq!(client.public()["account_shares"]["a"], 10.0);
+    }
+
+    #[test]
+    fn removing_access_drops_the_shares_it_reached() {
+        let (dir, clients) = clients();
+        let (diogo, _) = clients
+            .create(ClientPatch {
+                access: Some(Access {
+                    all: false,
+                    pools: BTreeSet::new(),
+                    accounts: ["a".to_owned(), "b".to_owned()].into(),
+                }),
+                shares: Some([("claude".into(), 20.0), ("codex".into(), 30.0)].into()),
+                account_shares: Some([("a".into(), 50.0), ("b".into(), 10.0)].into()),
+                ..named("diogo")
+            })
+            .unwrap();
+        let (owner, _) = clients
+            .create(ClientPatch {
+                account_shares: Some([("a".into(), 50.0)].into()),
+                ..named("owner")
+            })
+            .unwrap();
+        let mut codex = account("c");
+        codex.provider = SubscriptionProvider::Codex;
+        let accounts = [
+            account("a").summary(),
+            account("b").summary(),
+            codex.summary(),
+        ];
+        clients
+            .update(
+                &diogo.id,
+                ClientPatch {
+                    access: Some(Access {
+                        all: false,
+                        pools: BTreeSet::new(),
+                        accounts: ["b".to_owned()].into(),
+                    }),
+                    ..ClientPatch::default()
+                },
+            )
+            .unwrap();
+        clients.drop_unreachable_shares(&accounts).unwrap();
+        for list in [clients.list(), Clients::open(dir.path()).unwrap().list()] {
+            let kept = list.iter().find(|c| c.id == diogo.id).unwrap();
+            assert_eq!(kept.account_shares, [("b".to_owned(), 10.0)].into());
+            assert_eq!(kept.shares, [("claude".to_owned(), 20.0)].into());
+            let all = list.iter().find(|c| c.id == owner.id).unwrap();
+            assert_eq!(all.account_shares, [("a".to_owned(), 50.0)].into());
+        }
     }
 
     #[test]
@@ -1515,7 +1632,14 @@ mod tests {
         assert_eq!(bar(&pote), Some(80.0));
         // Before the weekly reset, shares let go of the Fable week too.
         assert_eq!(
-            clients.share_blocks_for(Some(&moi), &a, Some(&full), reset - 3600, reserved, "claude-fable-5-2"),
+            clients.share_blocks_for(
+                Some(&moi),
+                &a,
+                Some(&full),
+                reset - 3600,
+                reserved,
+                "claude-fable-5-2"
+            ),
             None
         );
     }

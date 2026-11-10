@@ -1183,17 +1183,15 @@ impl AppState {
                 }
             })
             .await;
-        let existing = self
-            .accounts
-            .list()
-            .await
-            .into_iter()
-            .map(|a| a.id)
-            .collect();
+        let accounts = self.accounts.list().await;
+        let existing = accounts.iter().map(|a| a.id.clone()).collect();
         let clients = self.clients.clone();
         let _ = tokio::task::spawn_blocking(move || {
             clients.forget_accounts(&existing);
             clients.save_usage();
+            if let Err(error) = clients.drop_unreachable_shares(&accounts) {
+                tracing::warn!(%error, "unreachable client shares were not dropped");
+            }
         })
         .await;
     }
