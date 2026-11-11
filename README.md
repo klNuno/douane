@@ -239,7 +239,10 @@ Pick a strategy in **Settings**, globally or per provider. It applies to new con
 | `smart` (default) | Sends 90 % of new conversations to the account whose weekly reset comes within 48 hours, until it is exhausted; otherwise weighs remaining quota against time left, with 20 % plain rotation |
 | `reset-first` | Uses the account with the nearest weekly reset, and moves running conversations back to it as soon as it is eligible again |
 | `fill-first` | Uses the first eligible account until it becomes unavailable |
+| `manual` | Uses the accounts in the order set in **Settings > Consumption order** (`account_order`, account ids per provider; accounts left out follow), and moves running conversations back to the first one as soon as it is eligible again |
 | `round-robin` | Rotates through eligible accounts |
+
+**Keep Fable** (`keep_fable`, off by default) works with every strategy: Claude models other than Fable go first to the accounts whose Fable week is used up, for the whole account or for the calling client's share, so the accounts that still have Fable keep their week for it. A running conversation moves to such an account when one becomes eligible.
 
 A conversation stays on its account while that account is eligible. douane recognises Codex, Claude and OpenCode session ids, `session_id` headers and `prompt_cache_key`, and keeps Claude cache controls untouched. A custom client should send one stable id per conversation. The affinity table holds 10,000 conversations for 24 hours of inactivity, in memory.
 

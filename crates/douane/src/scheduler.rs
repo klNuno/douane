@@ -9,6 +9,9 @@ pub enum Strategy {
     RoundRobin,
     FillFirst,
     ResetFirst,
+    /// The order chosen in `account_order`; the next account serves only
+    /// when the one before is unavailable.
+    Manual,
     #[default]
     Smart,
 }
@@ -20,6 +23,11 @@ pub struct Candidate {
     pub weekly_reset: Option<i64>,
     /// Subscription windows are empty but the provider bills usage credits.
     pub credits_only: bool,
+    /// Place in the pool's chosen order (`Strategy::Manual`); unlisted accounts follow.
+    pub rank: Option<usize>,
+    /// Goes before the others whatever the strategy: `keep_fable` sends other
+    /// models to the accounts whose Fable week is used up.
+    pub preferred: bool,
 }
 
 #[derive(Default)]
@@ -39,12 +47,11 @@ impl Scheduler {
     /// Reset-first spends the nearest weekly reset before any other account: a
     /// conversation pinned elsewhere, by an earlier strategy or a failover,
     /// returns to it as soon as it is eligible, and only an equal reset keeps
-    /// the pin. Every other strategy keeps a pin while its account is eligible.
+    /// the pin. The chosen order does the same for its first account. Every
+    /// other strategy keeps a pin while its account is eligible, unless a
+    /// preferred account is waiting and the pinned one is not preferred.
     pub fn pin_holds(strategy: Strategy, candidates: &[Candidate], pinned: &str, now: i64) -> bool {
-        if strategy != Strategy::ResetFirst {
-            return true;
-        }
-        // Reset-first orders without touching scheduler state.
+        // Which accounts lead never depends on scheduler state.
         let order = Self::default().order("", strategy, candidates, now);
         let Some(top) = order.first() else {
             return true;
@@ -53,10 +60,19 @@ impl Scheduler {
             return true;
         }
         let find = |id: &str| candidates.iter().find(|c| c.id == id);
+        if find(top).is_some_and(|c| c.preferred && !c.credits_only)
+            && find(pinned).is_some_and(|c| !c.preferred)
+        {
+            return false;
+        }
+        if !matches!(strategy, Strategy::ResetFirst | Strategy::Manual) {
+            return true;
+        }
         order.iter().any(|id| id == pinned)
             && match (find(top), find(pinned)) {
                 (Some(top), Some(pinned)) => {
-                    !top.credits_only
+                    strategy == Strategy::ResetFirst
+                        && !top.credits_only
                         && !pinned.credits_only
                         && reset_rank(top, now) == reset_rank(pinned, now)
                 }
@@ -97,6 +113,7 @@ impl Scheduler {
                 *cursor = cursor.wrapping_add(1);
             }
             Strategy::ResetFirst => available.sort_by_key(|a| reset_rank(a, now)),
+            Strategy::Manual => available.sort_by_key(|a| a.rank.unwrap_or(usize::MAX)),
             Strategy::Smart => {
                 // The nearest reset owns 90% of new assignments during its last
                 // 48 hours, including its final allowance. Outside that window,
@@ -144,12 +161,15 @@ impl Scheduler {
                         .total_cmp(&scores[&a.id])
                         .then_with(|| a.id.cmp(&b.id))
                 });
-                if let Some(credit) = self
-                    .credits
-                    .get_mut(&(provider.to_owned(), available[0].id.clone()))
-                {
-                    *credit -= 1.0;
-                }
+            }
+        }
+        available.sort_by_key(|a| !a.preferred);
+        if strategy == Strategy::Smart {
+            if let Some(credit) = self
+                .credits
+                .get_mut(&(provider.to_owned(), available[0].id.clone()))
+            {
+                *credit -= 1.0;
             }
         }
         available
@@ -169,6 +189,8 @@ mod tests {
             remaining_percent: remaining,
             weekly_reset: reset,
             credits_only: false,
+            rank: None,
+            preferred: false,
         }
     }
     fn paid(id: &str, reset: Option<i64>) -> Candidate {
@@ -176,6 +198,60 @@ mod tests {
             credits_only: true,
             ..account(id, Some(0.0), reset)
         }
+    }
+    #[test]
+    fn the_chosen_order_leads_and_takes_conversations_back() {
+        let ranked = |id: &str, rank| Candidate {
+            rank,
+            ..account(id, Some(50.0), Some(900))
+        };
+        let a = vec![
+            ranked("a", None),
+            ranked("b", Some(1)),
+            ranked("c", Some(0)),
+            Candidate {
+                rank: Some(0),
+                ..account("empty", Some(0.0), Some(900))
+            },
+        ];
+        assert_eq!(
+            Scheduler::default().order("claude", Strategy::Manual, &a, 0),
+            vec!["c", "b", "a"]
+        );
+        assert!(Scheduler::pin_holds(Strategy::Manual, &a, "c", 0));
+        assert!(!Scheduler::pin_holds(Strategy::Manual, &a, "b", 0));
+    }
+    #[test]
+    fn preferred_accounts_lead_every_strategy_and_release_other_pins() {
+        let a = vec![
+            account("a", Some(90.0), Some(300)),
+            Candidate {
+                preferred: true,
+                ..account("b", Some(40.0), Some(900))
+            },
+            Candidate {
+                preferred: true,
+                ..account("c", Some(40.0), Some(600))
+            },
+        ];
+        for strategy in [
+            Strategy::RoundRobin,
+            Strategy::FillFirst,
+            Strategy::ResetFirst,
+            Strategy::Manual,
+            Strategy::Smart,
+        ] {
+            let order = Scheduler::default().order("claude", strategy, &a, 0);
+            assert_eq!(order[2], "a", "{strategy:?}");
+            assert!(!Scheduler::pin_holds(strategy, &a, "a", 0), "{strategy:?}");
+        }
+        assert_eq!(
+            Scheduler::default().order("claude", Strategy::ResetFirst, &a, 0),
+            vec!["c", "b", "a"]
+        );
+        // A pin between two preferred accounts follows the strategy's own rule.
+        assert!(Scheduler::pin_holds(Strategy::FillFirst, &a, "c", 0));
+        assert!(!Scheduler::pin_holds(Strategy::ResetFirst, &a, "b", 0));
     }
     #[test]
     fn rotation_and_fill_first_are_distinct() {
