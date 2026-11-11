@@ -526,7 +526,7 @@ export const en = {
 	'clients.overbooked': '{value}% assigned',
 	'clients.overbookedInfo': 'First come, first served. Each client can use up to its own share, while this account has quota left.',
 	'clients.noPool': 'Choose accounts first.',
-	'clients.shareInvalid': 'A share is a number above 0 and at most 100.',
+	'clients.shareInvalid': 'A share is a number from 0 to 100. At 0 or empty it is removed, and an account follows its provider default.',
 	'clients.pickAccess': 'Choose at least one account.',
 	'clients.create': 'Create',
 	'clients.keyTitle': 'Key for {name}',

@@ -528,7 +528,7 @@ export const fr: Record<StringKey, string> = {
 	'clients.overbooked': '{value} % attribués',
 	'clients.overbookedInfo': 'Premier arrivé, premier servi. Chaque client peut consommer sa part tant que ce compte a du quota.',
 	'clients.noPool': "Choisissez d'abord des comptes.",
-	'clients.shareInvalid': 'Une part est un nombre supérieur à 0 et au plus 100.',
+	'clients.shareInvalid': 'Une part est un nombre de 0 à 100. À 0 ou vide, elle est retirée et un compte reprend la part par défaut du fournisseur.',
 	'clients.pickAccess': 'Choisissez au moins un compte.',
 	'clients.create': 'Créer',
 	'clients.keyTitle': 'Clé de {name}',
