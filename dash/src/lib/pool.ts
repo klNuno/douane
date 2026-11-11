@@ -1,5 +1,5 @@
 import type { Account, HistorySeries, PlanWeights, Quota, Subscription } from './management';
-import { isMonthly, windowLength, windowRank } from './pace.ts';
+import { isMonthly, isScoped, windowLength, windowRank } from './pace.ts';
 
 export const HOUR = 3600_000;
 export const DAY = 24 * HOUR;
@@ -47,8 +47,8 @@ export function weightNotes(accounts: Account[], quotas: Quota[], weights: Map<s
 }
 
 /**
- * The pool's series: per enabled account, only its longest windows (monthly
- * over weekly over 5h); n buckets of that length share the account weight.
+ * The pool's series: per enabled account, only its longest classic windows
+ * (monthly over weekly over 5h; a model-family week like Fable never counts); n buckets of that length share the account weight.
  * Windows of no known length count only when the account has nothing
  * longer (Copilot premium requests, a Kimi limit). Recorded points come before
  * the snapshot, which stays at its own read time, so a stale snapshot adds no
@@ -60,7 +60,7 @@ export function poolSeries(accounts: Account[], quotas: Quota[], history: Histor
 		const weight = weights.get(account.id);
 		if (!account.enabled || weight == null) continue;
 		const quota = quotas.find(q => q.account_id === account.id);
-		const all = quota?.windows ?? [];
+		const all = (quota?.windows ?? []).filter(window => !isScoped(window));
 		const longest = Math.max(0, ...all.map(windowRank));
 		const chosen = all.filter(w => windowRank(w) === longest && w.remaining_percent != null);
 		const read = Math.min(now, Date.parse(quota?.updated_at ?? '') || now);

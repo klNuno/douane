@@ -163,6 +163,8 @@ pub struct AccountSummary {
     pub last_error: Option<String>,
     pub reserve_percent: Option<f64>,
     pub reserve_windows: Vec<String>,
+    /// Kept out of the Quotas page and the provider pool, still routed.
+    pub hidden: bool,
     /// A custom endpoint's model prefix, address, wire format and model
     /// filter. Absent for subscriptions; never a credential.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -245,6 +247,9 @@ pub struct AccountCredential {
     /// become a text placeholder. Absent uses [`crate::chat_images::DEFAULT_LIMIT`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) image_limit: Option<u32>,
+    /// The user hid it from the Quotas page; routing ignores this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) hidden: bool,
 }
 
 /// A reserve is a share strictly between 0 and 100.
@@ -427,6 +432,7 @@ impl AccountCredential {
             last_error: self.last_error.clone(),
             reserve_percent: self.reserve(),
             reserve_windows: self.reserve_windows(),
+            hidden: self.hidden,
             route: self.route.clone(),
             base_url: (self.provider == SubscriptionProvider::OpenaiCompatible)
                 .then(|| self.base_url.clone())
@@ -548,6 +554,7 @@ impl AccountStore {
             account.id = previous.id.clone();
             account.created_at = previous.created_at.clone();
             account.enabled = previous.enabled;
+            account.hidden = previous.hidden;
             account.reserve_percent = previous.reserve_percent;
             account.reserve_windows = previous.reserve_windows.clone();
             if !explicit_name {
@@ -624,6 +631,7 @@ impl AccountStore {
         id: &str,
         name: Option<String>,
         enabled: Option<bool>,
+        hidden: Option<bool>,
         reserve: Option<Option<f64>>,
         windows: Option<Vec<String>>,
     ) -> Result<AccountSummary, SubscriptionError> {
@@ -645,6 +653,9 @@ impl AccountStore {
             }
             if let Some(enabled) = enabled {
                 account.enabled = enabled;
+            }
+            if let Some(hidden) = hidden {
+                account.hidden = hidden;
             }
             if let Some(reserve) = reserve {
                 account.reserve_percent = reserve;
@@ -854,6 +865,7 @@ impl AccountStore {
             .get(&account.id)
             .ok_or(SubscriptionError::NotFound)?;
         account.enabled = previous.enabled;
+        account.hidden = previous.hidden;
         account.name = previous.name.clone();
         account.reserve_percent = previous.reserve_percent;
         account.reserve_windows = previous.reserve_windows.clone();
@@ -1396,6 +1408,7 @@ fn parse_import(
         route,
         dialect,
         image_limit,
+        hidden: false,
     };
     apply_identity(&mut account);
     account.name = name
@@ -1570,6 +1583,7 @@ mod tests {
                 &imported.id,
                 Some("New label".into()),
                 Some(false),
+                None,
                 Some(Some(5.0)),
                 Some(vec!["weekly".into(), "five-hour".into(), "weekly".into()]),
             )
@@ -1598,17 +1612,24 @@ mod tests {
         );
         assert!(matches!(
             reopened
-                .update(&imported.id, None, None, None, Some(vec!["hourly".into()]))
+                .update(
+                    &imported.id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(vec!["hourly".into()])
+                )
                 .await,
             Err(SubscriptionError::InvalidReserveWindows)
         ));
         let longest = reopened
-            .update(&imported.id, None, None, None, Some(vec![]))
+            .update(&imported.id, None, None, None, None, Some(vec![]))
             .await
             .unwrap();
         assert!(longest.reserve_windows.is_empty());
         let cleared = reopened
-            .update(&imported.id, None, None, Some(None), None)
+            .update(&imported.id, None, None, None, Some(None), None)
             .await
             .unwrap();
         assert_eq!(cleared.reserve_percent, None);
@@ -1616,7 +1637,7 @@ mod tests {
         for invalid in [-1.0, 0.0, 100.0, f64::NAN, f64::INFINITY] {
             assert!(matches!(
                 reopened
-                    .update(&imported.id, None, None, Some(Some(invalid)), None)
+                    .update(&imported.id, None, None, None, Some(Some(invalid)), None)
                     .await,
                 Err(SubscriptionError::InvalidReserve)
             ));
@@ -1649,6 +1670,41 @@ mod tests {
             .unwrap();
         let reimported = store.import(json!({"type":"codex","access_token":"rotated-fixture","account_id":"fixture-account"}), None).await.unwrap();
         assert_eq!(reimported.name, "Renamed");
+    }
+
+    #[tokio::test]
+    async fn a_hidden_account_stays_hidden_and_routable_through_reload_and_reimport() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AccountStore::open(directory.path()).unwrap();
+        let fixture =
+            json!({"type":"codex","access_token":"fixture","account_id":"fixture-account"});
+        let account = store.import(fixture, None).await.unwrap();
+        assert!(!account.hidden);
+        let hidden = store
+            .update(&account.id, None, None, Some(true), None, None)
+            .await
+            .unwrap();
+        assert!(hidden.hidden && hidden.enabled);
+        assert_eq!(
+            store
+                .eligible(SubscriptionProvider::Codex, None)
+                .await
+                .len(),
+            1
+        );
+        let reopened = AccountStore::open(directory.path()).unwrap();
+        assert!(reopened.list().await[0].hidden);
+        let rotated =
+            json!({"type":"codex","access_token":"rotated","account_id":"fixture-account"});
+        assert!(reopened.import(rotated, None).await.unwrap().hidden);
+        let shown = reopened
+            .update(&account.id, None, None, Some(false), None, None)
+            .await
+            .unwrap();
+        assert!(!shown.hidden);
+        let raw =
+            fs::read_to_string(directory.path().join(format!("{}.json", account.id))).unwrap();
+        assert!(!raw.contains("hidden"));
     }
 
     #[tokio::test]

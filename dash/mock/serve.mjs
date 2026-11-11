@@ -23,6 +23,9 @@ const accounts = [
 	account('acc-claude-work', 'claude', 'Work', { email: 'alex.work@example.com', subscription: tier('ultra', 'Claude Ultra', 20) }),
 	account('acc-claude-studio', 'claude', 'Studio', { email: 'studio@example.com', subscription: tier('ultra', 'Claude Ultra', 20) }),
 	account('acc-claude-side', 'claude', 'Side', { email: 'side@example.com', subscription: tier('pro', 'Claude Pro') }),
+	// Off the Quotas page: one the provider revoked, one the user hid.
+	account('acc-claude-old', 'claude', 'Old', { email: 'old@example.com', subscription: tier('pro', 'Claude Pro'), enabled: false, status: 'disabled', last_error: "the provider revoked this account's session; reconnect the account" }),
+	account('acc-claude-spare', 'claude', 'Spare', { email: 'spare@example.com', subscription: tier('ultra', 'Claude Ultra', 20), hidden: true }),
 	account('acc-codex', 'codex', 'ChatGPT', { email: 'alex@example.com', subscription: tier('pro', 'Codex Pro') }),
 	account('acc-grok', 'xai', 'SuperGrok', { subscription: tier('supergrok', 'SuperGrok') }),
 	account('acc-copilot', 'copilot', 'GitHub', { subscription: tier('pro', 'Copilot Pro') }),
@@ -36,13 +39,14 @@ const quota = (account_id, windows, extra = {}) => ({
 	updated_at: ago(3), error: null, verification_required: false, verification_available: false, ...extra
 });
 const quotas = [
-	quota('acc-claude-home', [window('five-hour', '5 hours', 64, 2.7), window('weekly', 'Weekly', 71, 61), window('seven-day-opus', 'Opus weekly', 83, 61)], {
+	quota('acc-claude-home', [window('five-hour', '5 hours', 64, 2.7), window('weekly', 'Weekly', 71, 61), window('seven-day-fable', 'Fable weekly', 12, 61)], {
 		// Claude reports extra usage even when it is off; the dashboard hides it.
 		credits: [{ id: 'extra-usage', label: 'Extra usage', used: null, limit: null, remaining: null, unit: 'USD', reset_at: null, unlimited: null, enabled: false }]
 	}),
 	quota('acc-claude-work', [window('five-hour', '5 hours', 34, 1.4), window('weekly', 'Weekly', 22, 110), window('seven-day-opus', 'Opus weekly', 74, 110)]),
 	quota('acc-claude-studio', [window('five-hour', '5 hours', 88, 4.2), window('weekly', 'Weekly', 48, 20)]),
 	quota('acc-claude-side', [window('five-hour', '5 hours', 60, 3.1), window('weekly', 'Weekly', 35, 90)]),
+	quota('acc-claude-spare', [window('five-hour', '5 hours', 100, 5), window('weekly', 'Weekly', 100, 150)]),
 	quota('acc-codex', [window('five-hour', '5 hours', 92, 3.9), window('weekly', 'Weekly', 77, 85)], {
 		credits: [{ id: 'credits', label: 'Codex credits', used: null, limit: null, remaining: 1250, unit: 'credits', reset_at: null, unlimited: false, enabled: true }]
 	}),
@@ -54,7 +58,7 @@ const quotas = [
 // each window drains during the day toward its current value and restarts at 100 on reset.
 // A point is kept on a 0.5% move, a reset change, or hourly as a heartbeat, like the server.
 const HOUR_MS = 3600_000;
-const lengths = { 'five-hour': 5, weekly: 168, 'seven-day-opus': 168, monthly: 24 * 30 };
+const lengths = { 'five-hour': 5, weekly: 168, 'seven-day-opus': 168, 'seven-day-fable': 168, monthly: 24 * 30 };
 const activity = (t, phase) => {
 	const hour = (new Date(t).getUTCHours() + 1) % 24;
 	return hour >= 8 && hour <= 23 ? 1 + 0.7 * Math.sin(t / (3 * HOUR_MS) + phase) : 0.08;
@@ -222,6 +226,13 @@ const resets = (id) => {
 
 function api(method, path, body, query = new URLSearchParams()) {
 	if (method === 'PATCH' && path === '/settings') return Object.assign(settings, body);
+	const owned = path.match(/^\/accounts\/([^/]+)$/);
+	const patched = owned && accounts.find((a) => a.id === decodeURIComponent(owned[1]));
+	if (method === 'PATCH' && patched) {
+		for (const key of ['name', 'enabled', 'hidden']) if (body?.[key] !== undefined) patched[key] = body[key];
+		patched.status = patched.enabled ? 'ready' : 'disabled';
+		return { account: patched };
+	}
 	const redeem = path.match(/^\/accounts\/([^/]+)\/resets\/redeem$/);
 	if (method === 'POST' && redeem) {
 		const id = decodeURIComponent(redeem[1]);

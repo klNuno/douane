@@ -20,8 +20,10 @@
 	const order = ['claude', 'codex', 'opencode_go', 'xai'];
 	// Providers that report no quota (custom endpoints, Qwen) have nothing to show here.
 	let unreported = $derived(new Set(providers.filter(p => !p.quota).map(p => p.id)));
-	let providerIds = $derived([...new Set(accounts.map(a => a.provider).filter(id => !unreported.has(id)))].sort((a, b) => (order.indexOf(a) < 0 ? 99 : order.indexOf(a)) - (order.indexOf(b) < 0 ? 99 : order.indexOf(b)) || providerName(a).localeCompare(providerName(b))));
-	let filtered = $derived(accounts.filter(a => (provider === 'all' || !providerIds.includes(provider) || a.provider === provider) && `${a.name} ${a.email ?? ''}`.toLowerCase().includes(search.toLowerCase())).sort((a,b) => sort === 'remaining' ? (remaining(a.id) ?? 101) - (remaining(b.id) ?? 101) : a.name.localeCompare(b.name)));
+	// Disabled accounts and those hidden in Accounts stay off this page, pool included.
+	let shown = $derived(accounts.filter(a => a.enabled && !a.hidden));
+	let providerIds = $derived([...new Set(shown.map(a => a.provider).filter(id => !unreported.has(id)))].sort((a, b) => (order.indexOf(a) < 0 ? 99 : order.indexOf(a)) - (order.indexOf(b) < 0 ? 99 : order.indexOf(b)) || providerName(a).localeCompare(providerName(b))));
+	let filtered = $derived(shown.filter(a => (provider === 'all' || !providerIds.includes(provider) || a.provider === provider) && `${a.name} ${a.email ?? ''}`.toLowerCase().includes(search.toLowerCase())).sort((a,b) => sort === 'remaining' ? (remaining(a.id) ?? 101) - (remaining(b.id) ?? 101) : a.name.localeCompare(b.name)));
 	let groups = $derived(providerIds.map(id => ({ id, accounts: filtered.filter(a => a.provider === id) })).filter(group => group.accounts.length));
 	// A disabled or empty paid balance (Claude extra usage off) is noise on a display-only page.
 	const shownCredits = (quota?: Quota) => quota?.credits?.filter(c => c.enabled !== false && (c.unlimited || c.remaining != null || !!c.used)) ?? [];
@@ -84,10 +86,11 @@
 			{#each providerIds as id (id)}<button class:active={provider === id} onclick={() => provider = id} aria-pressed={provider === id}><ProviderMark provider={id} size={20}/>{providerName(id)}</button>{/each}
 		</div>
 	{/if}
-	<div class="quota-filters" bind:clientWidth={filtersWidth} bind:this={filters}><label class="search-input" class:filled={!!search} bind:this={searchLabel} onfocusin={() => searchFocused = true} onfocusout={() => { if (!pressing) searchFocused = false; }}><Search size={17}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select><button class="button refresh-button" disabled={!!busy || !accounts.length} onclick={() => refresh()} title={t('quotas.refresh')} aria-label={t('quotas.refresh')}><RefreshCw size={17} class={busy === 'quotas' ? 'spinning' : ''}/></button></div>
+	<div class="quota-filters" bind:clientWidth={filtersWidth} bind:this={filters}><label class="search-input" class:filled={!!search} bind:this={searchLabel} onfocusin={() => searchFocused = true} onfocusout={() => { if (!pressing) searchFocused = false; }}><Search size={17}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select><button class="button refresh-button" disabled={!!busy || !shown.length} onclick={() => refresh()} title={t('quotas.refresh')} aria-label={t('quotas.refresh')}><RefreshCw size={17} class={busy === 'quotas' ? 'spinning' : ''}/></button></div>
 </header>
 
 {#if !accounts.length}<section class="ledger"><EmptyState title={t('common.noAccountConnected')} description={t('quotas.emptyDescription')} action={t('nav.accounts')} onclick={manageAccounts}/></section>
+{:else if !shown.length}<section class="ledger"><EmptyState title={t('quotas.allHidden')} description={t('quotas.allHiddenDescription')} action={t('nav.accounts')} onclick={manageAccounts}/></section>
 {:else if !filtered.length}<section class="ledger"><EmptyState title={t('common.noMatchingAccount')} description={t('common.tryOtherName')}/></section>
 {:else}
 	{#if showPool}<PoolControls bind:mode bind:burnHours bind:future bind:showAccounts range={t('pool.range', { from: day(rangeStart), to: day(rangeEnd - 1) })} today={offset === 0} shift={weeks => offset = weeks == null ? 0 : offset + weeks} error={historyError}/>{/if}
@@ -95,7 +98,7 @@
 		{#each groups as group (group.id)}
 			<section class="provider-group" aria-label={t('quotas.group', { provider: providerName(group.id) })}>
 				<header class="provider-heading"><ProviderMark provider={group.id} size={25}/><h2>{providerName(group.id)}</h2><span>{t(group.accounts.length === 1 ? 'common.accountCount.one' : 'common.accountCount.other', { count: group.accounts.length })}</span></header>
-				{#if showPool && accounts.some(a => a.provider === group.id && a.enabled)}<QuotaPool provider={group.id} accounts={accounts.filter(a => a.provider === group.id)} {quotas} {history} {now} start={rangeStart} end={rangeEnd} {mode} {burnHours} {future} {showAccounts} planWeights={settings?.plan_weights}/>{/if}
+				{#if showPool}<QuotaPool provider={group.id} accounts={shown.filter(a => a.provider === group.id)} {quotas} {history} {now} start={rangeStart} end={rangeEnd} {mode} {burnHours} {future} {showAccounts} planWeights={settings?.plan_weights}/>{/if}
 				<div class="ledger">
 					{#each group.accounts as account (account.id)}
 						{@const quota = quotas.find(q => q.account_id === account.id)}
