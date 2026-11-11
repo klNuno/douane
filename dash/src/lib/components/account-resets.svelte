@@ -2,7 +2,7 @@
 	import { untrack } from 'svelte';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import X from '@lucide/svelte/icons/x';
-	import { management, privateLabel, formatDate, newResetRequestId, type Account, type ResetAvailability, type ResetScope } from '$lib/management';
+	import { management, privateLabel, formatDate, newResetRequestId, type Account, type ResetAvailability, type ResetKind, type ResetScope } from '$lib/management';
 	import { t, type StringKey } from '$lib/i18n.svelte';
 	let { account, busy, updated }: { account: Account; busy: string; updated: () => Promise<void> } = $props();
 	let availability = $state.raw<ResetAvailability | null>(null);
@@ -16,8 +16,13 @@
 	let kinds = $derived(availability?.kinds ?? []);
 	// Resets that clear different things are never picked for the user.
 	let scope = $state<ResetScope | null>(null);
-	let chosen = $derived(kinds.length > 1 ? kinds.find(kind => kind.scope === scope) ?? null : kinds[0] ?? null);
-	let ready = $derived(confirmation === 'reset' && (pending || kinds.length < 2 || !!chosen));
+	let chosen = $derived(kinds.find(kind => kind.scope === scope) ?? null);
+	let ready = $derived(confirmation === 'reset' && (pending || !kinds.length || !!chosen));
+	/** A button's name: the week, or the model family the provider's label names. */
+	function kindName(kind: ResetKind) {
+		if (kind.scope === 'account') return account.provider === 'claude' ? t('resets.weekly') : t('resets.all');
+		return ['Fable', 'Opus', 'Sonnet', 'Haiku'].find(family => kind.label?.includes(family)) ?? t('resets.model');
+	}
 	let dialog = $state<HTMLDialogElement>();
 	let supported = $derived(account.enabled && ['claude', 'codex'].includes(account.provider));
 	let storageKey = $derived(`douane-reset-${account.id}`);
@@ -30,9 +35,9 @@
 		finally { checking = false; }
 	}
 	$effect(() => { if (supported) untrack(() => { pending = !!sessionStorage.getItem(storageKey); void check(); }); else availability = null; });
-	function open() {
+	function open(kind: ResetScope | null = null) {
 		requestId = availability?.pending_request_id ?? sessionStorage.getItem(storageKey) ?? newResetRequestId();
-		failure = ''; result = ''; confirmation = ''; scope = null; dialog?.showModal();
+		failure = ''; result = ''; confirmation = ''; scope = kind; dialog?.showModal();
 	}
 	async function redeem() {
 		if (saving || busy || !ready || !dialog?.open) return;
@@ -55,7 +60,9 @@
 
 {#if supported}
 	<div class="reset-control">
-		{#if canReset || pending}<button class="button reset-button" disabled={!!busy || checking} onclick={open}><RefreshCw size={17}/>{pending ? t('resets.resume') : t('resets.button', { count: availability?.available_count ?? 0 })}</button>{#if !pending && kinds.length > 1}<span class="reset-status">{kinds.map(kind => `${kind.count} ${t(`resets.scope.${kind.scope}`).toLowerCase()}`).join(' · ')}</span>{/if}
+		{#if pending}<button class="button reset-button" disabled={!!busy || checking} onclick={() => open()}><RefreshCw size={17}/>{t('resets.resume')}</button>
+		{:else if canReset && kinds.length}{#each kinds as kind (kind.scope)}<button class="button reset-button" disabled={!!busy || checking} title={kind.label ?? t(`resets.scope.${kind.scope}Info`)} aria-label={t('resets.useNamed', { count: kind.count, name: kindName(kind) })} onclick={() => open(kind.scope)}><RefreshCw size={17}/><strong class="tabular">{kind.count}</strong>{kindName(kind)}</button>{/each}
+		{:else if canReset}<button class="button reset-button" disabled={!!busy || checking} onclick={() => open()}><RefreshCw size={17}/>{t('resets.button', { count: availability?.available_count ?? 0 })}</button>
 		{:else if checking}<span class="reset-status">{t('resets.checking')}</span>
 		{:else if availability?.status === 'ready'}<span class="reset-status">{t('resets.none')}</span>
 		{:else if availability?.status !== 'unsupported'}<button class="reset-retry" disabled={!!busy} onclick={check}>{t('resets.check')}</button>{/if}
@@ -69,11 +76,8 @@
 			{#if result}<p class="reset-result" role="status">{result}</p><div class="dialog-actions"><button class="button primary" onclick={() => dialog?.close()}>{t('common.close')}</button></div>
 			{:else}
 				<p>{t('resets.warning')}</p>
-				{#if !pending && kinds.length > 1}
-					<fieldset class="reset-kinds"><legend>{t('resets.choose')}</legend>
-						{#each kinds as kind (kind.scope)}<label class="reset-kind" class:chosen={scope === kind.scope}><input type="radio" name="reset-scope" value={kind.scope} bind:group={scope} disabled={saving}/><span><strong>{t(`resets.scope.${kind.scope}`)}</strong><small>{t(`resets.scope.${kind.scope}Info`)}</small>{#if kind.label}<small class="provider-label">{kind.label}</small>{/if}<small>{t('resets.count', { count: kind.count })}{#if kind.next_expires_at}{` · ${t('resets.expires', { date: formatDate(kind.next_expires_at) })}`}{/if}</small></span></label>{/each}
-					</fieldset>
-				{:else if !pending && chosen}<p><strong>{t(`resets.scope.${chosen.scope}`)}</strong> : {t(`resets.scope.${chosen.scope}Info`)}</p>{#if chosen.next_expires_at}<p>{t('resets.expiresFirst', { date: formatDate(chosen.next_expires_at) })}</p>{/if}
+				{#if !pending && chosen}
+					<div class="reset-kind"><strong>{kindName(chosen)}</strong><small>{t(`resets.scope.${chosen.scope}Info`)}</small>{#if chosen.label}<small class="provider-label">{chosen.label}</small>{/if}<small>{t('resets.count', { count: chosen.count })}{#if chosen.next_expires_at}{` · ${t('resets.expiresFirst', { date: formatDate(chosen.next_expires_at) })}`}{/if}</small></div>
 				{:else if availability?.next_expires_at}<p>{t('resets.expiresFirst', { date: formatDate(availability.next_expires_at) })}</p>{/if}
 				{#if pending}<p>{t('resets.pending')}</p>{/if}
 				{#if failure}<p class="reset-error" role="alert">{failure}</p>{/if}
@@ -88,7 +92,7 @@
 
 <style>
 	.reset-confirmation { display: grid; gap: 10px; font-size: 15px; margin-top: 20px; }.reset-confirmation input { width: 100%; }
-	.reset-kinds { display: grid; gap: 10px; margin: 18px 0 0; padding: 0; border: 0; }.reset-kinds legend { padding: 0; margin-bottom: 10px; font-size: 15px; color: var(--muted); }.reset-kind { display: flex; align-items: flex-start; gap: 12px; padding: 14px; border: 1px solid var(--border); border-radius: 12px; cursor: pointer; }.reset-kind:hover { border-color: #3c5279; }.reset-kind.chosen { border-color: var(--blue); background: #5478f613; }.reset-kind input { flex-shrink: 0; width: auto; height: auto; margin: 4px 0 0; accent-color: var(--primary); }.reset-kind strong { display: block; font-size: 16px; font-weight: 600; }.reset-kind small { display: block; margin-top: 5px; color: var(--muted); font-size: 14px; line-height: 1.5; }.reset-kind .provider-label { color: var(--faint); font-style: italic; }
+	.reset-kind { margin-top: 16px; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--background); }.reset-kind strong { display: block; color: var(--text); font-size: 17px; font-weight: 600; }.reset-kind small { display: block; margin-top: 5px; color: var(--muted); font-size: 14px; line-height: 1.5; }.reset-kind .provider-label { color: var(--faint); font-style: italic; }.reset-button strong { font-weight: 700; }
 	.reset-control { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 15px; }
 	.reset-button { font-size: 15px; padding: 8px 11px; min-height: 42px; }
 	.reset-status { font-size: 15px; color: var(--muted); }
