@@ -252,7 +252,7 @@ A reserve, set per account on the Accounts page or with `PATCH /admin/api/accoun
 
 What is left of a week is lost at its reset, so the last hours before an account's weekly reset lift its limits: the reserve and client shares stop applying and the account serves until it runs out. The default is 6 hours; change it in Settings > End of the week or with `free_before_reset_hours` (0 to 168, 0 keeps the limits to the end). An account whose longest window is a month uses its monthly reset instead; accounts with only shorter windows are never lifted.
 
-Banked resets for Claude and Codex appear on each account card. Using one asks for confirmation, and a retried click reuses the same request id, so a double click cannot spend two.
+Banked resets for Claude and Codex appear on each account card. Claude grants two kinds: resets of the whole account, and resets of one model's week (Fable). When an account holds both, the dialog asks which one to use; `POST /admin/api/accounts/{id}/resets/redeem` takes `"scope": "account"` or `"model"`, and without it uses the one that expires first. Using one asks for confirmation, and a retried click reuses the same request id, so a double click cannot spend two.
 
 ![Overview page: active accounts, requests, tokens, cache reads and recent activity](docs/images/activity.png)
 

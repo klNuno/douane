@@ -30,7 +30,10 @@ export type Quota = { account_id: string; windows: QuotaWindow[]; subscription?:
 export type HistoryPoint = [number, number, number | null];
 export type HistorySeries = { account_id: string; window_id: string; points: HistoryPoint[] };
 export type QuotaHistory = { series: HistorySeries[] };
-export type ResetAvailability = { account_id: string; provider: string; status: 'ready' | 'unsupported' | 'unavailable' | 'ineligible' | 'disabled'; available_count: number | null; next_expires_at: string | null; pending_request_id?: string | null; error: string | null };
+export type ResetAvailability = { account_id: string; provider: string; status: 'ready' | 'unsupported' | 'unavailable' | 'ineligible' | 'disabled'; available_count: number | null; next_expires_at: string | null; kinds?: ResetKind[]; pending_request_id?: string | null; error: string | null };
+/** What a banked reset clears: every limit of the account, or one model family's week. */
+export type ResetScope = 'account' | 'model';
+export type ResetKind = { scope: ResetScope; count: number; next_expires_at: string | null; label: string | null };
 export type ResetResult = { request_id: string; outcome: 'reset' | 'nothing_to_reset' | 'no_credit' | 'already_redeemed' };
 export type Model = { id: string; provider: string; name?: string; context_length?: number | null; enabled?: boolean; route?: string | null };
 /** When a pool's catalog was last read; `stale` when its live listing failed and the previous catalog stays. */
@@ -108,7 +111,7 @@ export const management = {
 	renameAccount: (id: string, name: string) => request<{ account: Account }>(`/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
 	setAccountReserve: (id: string, reserve_percent: number | null, reserve_windows: ReserveWindow[]) => request<{ account: Account }>(`/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ reserve_percent, reserve_windows }) }),
 	accountResets: (id: string) => request<ResetAvailability>(`/accounts/${encodeURIComponent(id)}/resets`),
-	redeemReset: (id: string, request_id: string) => request<ResetResult>(`/accounts/${encodeURIComponent(id)}/resets/redeem`, { method: 'POST', body: JSON.stringify({ confirmation: true, request_id }) }),
+	redeemReset: (id: string, request_id: string, scope?: ResetScope) => request<ResetResult>(`/accounts/${encodeURIComponent(id)}/resets/redeem`, { method: 'POST', body: JSON.stringify({ confirmation: true, request_id, ...(scope ? { scope } : {}) }) }),
 	deleteAccount: (id: string) => request(`/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 	startOAuth: (provider: string) => request<OAuthSession>('/oauth/start', { method: 'POST', body: JSON.stringify({ provider }) }),
 	oauth: (id: string) => request<OAuthStatus>(`/oauth/${encodeURIComponent(id)}`),

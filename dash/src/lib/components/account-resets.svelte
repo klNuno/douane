@@ -2,7 +2,7 @@
 	import { untrack } from 'svelte';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import X from '@lucide/svelte/icons/x';
-	import { management, privateLabel, formatDate, newResetRequestId, type Account, type ResetAvailability } from '$lib/management';
+	import { management, privateLabel, formatDate, newResetRequestId, type Account, type ResetAvailability, type ResetScope } from '$lib/management';
 	import { t, type StringKey } from '$lib/i18n.svelte';
 	let { account, busy, updated }: { account: Account; busy: string; updated: () => Promise<void> } = $props();
 	let availability = $state.raw<ResetAvailability | null>(null);
@@ -13,6 +13,11 @@
 	let pending = $state(false);
 	let confirmation = $state('');
 	let requestId = '';
+	let kinds = $derived(availability?.kinds ?? []);
+	// Resets that clear different things are never picked for the user.
+	let scope = $state<ResetScope | null>(null);
+	let chosen = $derived(kinds.length > 1 ? kinds.find(kind => kind.scope === scope) ?? null : kinds[0] ?? null);
+	let ready = $derived(confirmation === 'reset' && (pending || kinds.length < 2 || !!chosen));
 	let dialog = $state<HTMLDialogElement>();
 	let supported = $derived(account.enabled && ['claude', 'codex'].includes(account.provider));
 	let storageKey = $derived(`douane-reset-${account.id}`);
@@ -27,14 +32,16 @@
 	$effect(() => { if (supported) untrack(() => { pending = !!sessionStorage.getItem(storageKey); void check(); }); else availability = null; });
 	function open() {
 		requestId = availability?.pending_request_id ?? sessionStorage.getItem(storageKey) ?? newResetRequestId();
-		failure = ''; result = ''; confirmation = ''; dialog?.showModal();
+		failure = ''; result = ''; confirmation = ''; scope = null; dialog?.showModal();
 	}
 	async function redeem() {
-		if (saving || busy || confirmation !== 'reset' || !dialog?.open) return;
+		if (saving || busy || !ready || !dialog?.open) return;
 		saving = true; failure = '';
 		try {
+			// A retry settles the reset already picked; only a new attempt chooses.
+			const wanted = pending ? undefined : chosen?.scope;
 			sessionStorage.setItem(storageKey, requestId); pending = true;
-			const response = await management.redeemReset(account.id, requestId);
+			const response = await management.redeemReset(account.id, requestId, wanted);
 			const messages: Record<string, StringKey> = { reset: 'resets.reset', already_redeemed: 'resets.alreadyRedeemed', nothing_to_reset: 'resets.nothingToReset', no_credit: 'resets.noCredit' };
 			const message = messages[response.outcome];
 			if (!message) throw new Error(t('resets.unconfirmed'));
@@ -48,7 +55,7 @@
 
 {#if supported}
 	<div class="reset-control">
-		{#if canReset || pending}<button class="button reset-button" disabled={!!busy || checking} onclick={open}><RefreshCw size={17}/>{pending ? t('resets.resume') : t('resets.button', { count: availability?.available_count ?? 0 })}</button>
+		{#if canReset || pending}<button class="button reset-button" disabled={!!busy || checking} onclick={open}><RefreshCw size={17}/>{pending ? t('resets.resume') : t('resets.button', { count: availability?.available_count ?? 0 })}</button>{#if !pending && kinds.length > 1}<span class="reset-status">{kinds.map(kind => `${kind.count} ${t(`resets.scope.${kind.scope}`).toLowerCase()}`).join(' · ')}</span>{/if}
 		{:else if checking}<span class="reset-status">{t('resets.checking')}</span>
 		{:else if availability?.status === 'ready'}<span class="reset-status">{t('resets.none')}</span>
 		{:else if availability?.status !== 'unsupported'}<button class="reset-retry" disabled={!!busy} onclick={check}>{t('resets.check')}</button>{/if}
@@ -62,12 +69,17 @@
 			{#if result}<p class="reset-result" role="status">{result}</p><div class="dialog-actions"><button class="button primary" onclick={() => dialog?.close()}>{t('common.close')}</button></div>
 			{:else}
 				<p>{t('resets.warning')}</p>
-				{#if availability?.next_expires_at}<p>{t('resets.expiresFirst', { date: formatDate(availability.next_expires_at) })}</p>{/if}
+				{#if !pending && kinds.length > 1}
+					<fieldset class="reset-kinds"><legend>{t('resets.choose')}</legend>
+						{#each kinds as kind (kind.scope)}<label class="reset-kind" class:chosen={scope === kind.scope}><input type="radio" name="reset-scope" value={kind.scope} bind:group={scope} disabled={saving}/><span><strong>{t(`resets.scope.${kind.scope}`)}</strong><small>{t(`resets.scope.${kind.scope}Info`)}</small>{#if kind.label}<small class="provider-label">{kind.label}</small>{/if}<small>{t('resets.count', { count: kind.count })}{#if kind.next_expires_at}{` · ${t('resets.expires', { date: formatDate(kind.next_expires_at) })}`}{/if}</small></span></label>{/each}
+					</fieldset>
+				{:else if !pending && chosen}<p><strong>{t(`resets.scope.${chosen.scope}`)}</strong> : {t(`resets.scope.${chosen.scope}Info`)}</p>{#if chosen.next_expires_at}<p>{t('resets.expiresFirst', { date: formatDate(chosen.next_expires_at) })}</p>{/if}
+				{:else if availability?.next_expires_at}<p>{t('resets.expiresFirst', { date: formatDate(availability.next_expires_at) })}</p>{/if}
 				{#if pending}<p>{t('resets.pending')}</p>{/if}
 				{#if failure}<p class="reset-error" role="alert">{failure}</p>{/if}
 				<form onsubmit={(event) => { event.preventDefault(); void redeem(); }}>
 					<label class="reset-confirmation">{t('resets.typeConfirmation')}<input bind:value={confirmation} required autocomplete="off" autocapitalize="none" spellcheck={false} disabled={saving}/></label>
-					<div class="dialog-actions"><button type="button" class="button" disabled={saving} onclick={() => dialog?.close()}>{t('common.cancel')}</button><button type="submit" class="button primary" disabled={saving || !!busy || confirmation !== 'reset'}>{saving ? t('resets.running') : pending ? t('resets.retrySame') : t('resets.use')}</button></div>
+					<div class="dialog-actions"><button type="button" class="button" disabled={saving} onclick={() => dialog?.close()}>{t('common.cancel')}</button><button type="submit" class="button primary" disabled={saving || !!busy || !ready}>{saving ? t('resets.running') : pending ? t('resets.retrySame') : t('resets.use')}</button></div>
 				</form>
 			{/if}
 		</div>
@@ -76,6 +88,7 @@
 
 <style>
 	.reset-confirmation { display: grid; gap: 10px; font-size: 15px; margin-top: 20px; }.reset-confirmation input { width: 100%; }
+	.reset-kinds { display: grid; gap: 10px; margin: 18px 0 0; padding: 0; border: 0; }.reset-kinds legend { padding: 0; margin-bottom: 10px; font-size: 15px; color: var(--muted); }.reset-kind { display: flex; align-items: flex-start; gap: 12px; padding: 14px; border: 1px solid var(--border); border-radius: 12px; cursor: pointer; }.reset-kind:hover { border-color: #3c5279; }.reset-kind.chosen { border-color: var(--blue); background: #5478f613; }.reset-kind input { flex-shrink: 0; width: auto; height: auto; margin: 4px 0 0; accent-color: var(--primary); }.reset-kind strong { display: block; font-size: 16px; font-weight: 600; }.reset-kind small { display: block; margin-top: 5px; color: var(--muted); font-size: 14px; line-height: 1.5; }.reset-kind .provider-label { color: var(--faint); font-style: italic; }
 	.reset-control { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 15px; }
 	.reset-button { font-size: 15px; padding: 8px 11px; min-height: 42px; }
 	.reset-status { font-size: 15px; color: var(--muted); }
