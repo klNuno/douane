@@ -606,6 +606,9 @@ pub struct ResetConfirmation {
     #[serde(default)]
     confirmation: bool,
     request_id: String,
+    /// Which resets to draw from; absent uses the one that expires first.
+    #[serde(default)]
+    scope: Option<crate::subscriptions::ResetScope>,
 }
 
 pub async fn redeem_reset(
@@ -619,7 +622,7 @@ pub async fn redeem_reset(
             "confirm before consuming a reset credit",
         );
     }
-    match state.resets.redeem(&id, &body.request_id).await {
+    match state.resets.redeem(&id, &body.request_id, body.scope).await {
         Ok(result) => {
             let _ = state.quotas.refresh(&id).await;
             Json(json!(result)).into_response()

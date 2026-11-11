@@ -217,7 +217,12 @@ const resetResults = new Map();
 const resets = (id) => {
 	const owner = accounts.find((a) => a.id === id);
 	const ready = owner && ['claude', 'codex'].includes(owner.provider);
-	return { account_id: id, provider: owner?.provider ?? '', status: ready ? 'ready' : 'unsupported', available_count: ready ? (id === 'acc-claude-home' && ![...resetResults.values()].some(r => r.outcome === 'reset') ? 1 : 0) : null, next_expires_at: ready ? at(24 * 9) : null, error: null };
+	const used = (scope) => [...resetResults.entries()].some(([key, r]) => key.startsWith(`${id}:`) && r.outcome === 'reset' && r.scope === scope);
+	const kinds = id === 'acc-claude-home' ? [
+		{ scope: 'account', count: 1, next_expires_at: at(24 * 30), label: 'One full limit reset' },
+		{ scope: 'model', count: 1, next_expires_at: at(24 * 120), label: 'New model launch: one Fable reset' }
+	].filter(kind => !used(kind.scope)) : [];
+	return { account_id: id, provider: owner?.provider ?? '', status: ready ? 'ready' : 'unsupported', available_count: ready ? kinds.length : null, next_expires_at: kinds[0]?.next_expires_at ?? null, kinds, error: null };
 };
 
 function api(method, path, body, query = new URLSearchParams()) {
@@ -227,8 +232,10 @@ function api(method, path, body, query = new URLSearchParams()) {
 		const id = decodeURIComponent(redeem[1]);
 		if (!body?.confirmation || !body.request_id) return [400, { error: { message: 'confirmation and request_id required' } }];
 		const key = `${id}:${body.request_id}`;
-		if (!resetResults.has(key)) resetResults.set(key, { request_id: body.request_id, outcome: resets(id).available_count ? 'reset' : 'no_credit' });
-		return resetResults.get(key);
+		const kind = resets(id).kinds.find(k => !body.scope || k.scope === body.scope);
+		if (!resetResults.has(key)) resetResults.set(key, { request_id: body.request_id, outcome: kind ? 'reset' : 'no_credit', scope: kind?.scope });
+		const { scope: _, ...result } = resetResults.get(key);
+		return result;
 	}
 	// A pending device login for the sample dashboard. No provider request or credential is created.
 	if (method === 'POST' && path === '/oauth/start' && body?.provider === 'meta') return {
