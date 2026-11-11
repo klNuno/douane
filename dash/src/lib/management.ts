@@ -4,7 +4,7 @@ export type Provider = { id: string; name: string; oauth: boolean; quota: boolea
 export type Account = {
 	id: string; name: string; provider: string; email?: string | null; plan?: string | null;
 	subscription?: Subscription | null;
-	enabled: boolean; status: string; last_error?: string | null; updated_at?: string | null;
+	enabled: boolean; hidden?: boolean; status: string; last_error?: string | null; updated_at?: string | null;
 	reserve_percent?: number | null; reserve_windows?: ReserveWindow[]; reserve_measured?: boolean | null; reserve_reached?: boolean;
 	route?: string | null; base_url?: string | null; dialect?: Dialect | null; models?: string[];
 };
@@ -107,6 +107,7 @@ export const management = {
 	importCredential: (credential: { type: string; name: string; access_token: string; base_url: string; route?: string; dialect?: Dialect }) => request<ImportResult>('/accounts/import', { method: 'POST', body: JSON.stringify(credential) }),
 	updateEndpoint: (id: string, patch: EndpointPatch) => request<{ account: Account }>(`/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
 	setAccountEnabled: (id: string, enabled: boolean) => request(`/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
+	setAccountHidden: (id: string, hidden: boolean) => request(`/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ hidden }) }),
 	renameAccount: (id: string, name: string) => request<{ account: Account }>(`/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
 	setAccountReserve: (id: string, reserve_percent: number | null, reserve_windows: ReserveWindow[]) => request<{ account: Account }>(`/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ reserve_percent, reserve_windows }) }),
 	accountResets: (id: string) => request<ResetAvailability>(`/accounts/${encodeURIComponent(id)}/resets`),

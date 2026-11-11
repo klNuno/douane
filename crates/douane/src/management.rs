@@ -430,6 +430,8 @@ pub async fn restore(State(state): State<Arc<AppState>>, Json(body): Json<Value>
 pub struct AccountPatch {
     name: Option<String>,
     enabled: Option<bool>,
+    /// Hides the account from the Quotas page and the pool; routing ignores it.
+    hidden: Option<bool>,
     /// Absent keeps the reserve; `null` or `0` removes it.
     #[serde(default, deserialize_with = "present")]
     reserve_percent: Option<Option<f64>>,
@@ -516,13 +518,14 @@ pub async fn update_account(
         || endpoint.api_key.is_some();
     if name.is_none()
         && body.enabled.is_none()
+        && body.hidden.is_none()
         && reserve.is_none()
         && body.reserve_windows.is_none()
         && !endpoint_change
     {
         return error(
             StatusCode::BAD_REQUEST,
-            "provide a name, enabled state, reserve or endpoint field",
+            "provide a name, enabled or hidden state, reserve or endpoint field",
         );
     }
     // The endpoint change is validated first, so a refused one leaves the
@@ -544,6 +547,7 @@ pub async fn update_account(
     }
     let result = if name.is_none()
         && body.enabled.is_none()
+        && body.hidden.is_none()
         && reserve.is_none()
         && body.reserve_windows.is_none()
     {
@@ -554,7 +558,14 @@ pub async fn update_account(
     } else {
         state
             .accounts
-            .update(&id, name, body.enabled, reserve, body.reserve_windows)
+            .update(
+                &id,
+                name,
+                body.enabled,
+                body.hidden,
+                reserve,
+                body.reserve_windows,
+            )
             .await
     };
     match result {
@@ -1376,7 +1387,7 @@ mod tests {
                 .unwrap();
             state
                 .accounts
-                .update(&account.id, None, None, Some(Some(5.0)), None)
+                .update(&account.id, None, None, None, Some(Some(5.0)), None)
                 .await
                 .unwrap();
             if let Some((windows, error)) = quota {
@@ -1415,6 +1426,33 @@ mod tests {
         assert_eq!(body["account"]["name"], "Renamed");
         assert_eq!(body["account"]["reserve_measured"], true);
         assert_eq!(body["account"]["reserve_reached"], true);
+        assert_eq!(body["account"]["hidden"], false);
+        // Hiding keeps the account enabled and survives a reload from disk.
+        let response = update_account(
+            State(state.clone()),
+            Path(ids[0].clone()),
+            Json(AccountPatch {
+                hidden: Some(true),
+                ..AccountPatch::default()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["account"]["hidden"], true);
+        assert_eq!(body["account"]["enabled"], true);
+        assert!(state.accounts.get(&ids[0]).await.unwrap().hidden);
+        let Json(listing) = accounts(State(state.clone())).await;
+        let hidden: Vec<_> = listing["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["hidden"] == true)
+            .map(|row| row["id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(hidden, [ids[0].clone()]);
     }
     #[tokio::test]
     async fn verification_redirect_exposes_challenge_only_as_no_store_location() {

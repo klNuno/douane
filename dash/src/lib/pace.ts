@@ -26,6 +26,13 @@ export function windowLength(window: QuotaWindow, reset: number) {
   return null;
 }
 
+/**
+ * A limit scoped to one model family (Claude `seven-day-fable`, `-opus`) or
+ * one feature (Codex code review), not the account's own quota: the pool and
+ * the pace count only the classic windows.
+ */
+export const isScoped = (window: QuotaWindow) => /^(seven-day-|code-review-)/.test(window.id);
+
 /** Nominal size used to pick the longest window: calendar months differ by days, yet stay one class. */
 export function windowRank(window: QuotaWindow) {
   if (isMonthly(window)) return 30 * 24 * HOUR;
@@ -35,7 +42,7 @@ export function windowRank(window: QuotaWindow) {
 /**
  * How fast a provider's subscriptions are used: quota used so far against the
  * share of each window already elapsed. 100% spends the quota exactly at reset.
- * Each account counts only its longest windows (monthly over weekly over 5h),
+ * Each account counts only its longest classic windows (monthly over weekly over 5h, never a model-family week),
  * every bucket of that length included, weighted by how far it has run, so a
  * window that just started weighs little. A longest window that says nothing
  * yet keeps the account out rather than falling back to a shorter one.
@@ -48,7 +55,7 @@ export function providerPace(accounts: Account[], quotas: Quota[], weights?: Map
   for (const account of enabled) {
     const quota = quotas.find(q => q.account_id === account.id);
     const at = Date.parse(quota?.updated_at ?? '') || Date.now();
-    const all = quota?.windows ?? [];
+    const all = (quota?.windows ?? []).filter(window => !isScoped(window));
     const longest = Math.max(0, ...all.map(windowRank));
     if (!longest) continue;
     const windows = all.filter(window => windowRank(window) === longest).flatMap(window => {

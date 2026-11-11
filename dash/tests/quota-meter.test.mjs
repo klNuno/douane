@@ -16,10 +16,10 @@ before(async () => {
 after(async () => { await server?.close(); });
 
 function page(options = {}) {
-  const { enabled = true, known = true, current = 50, credits = [] } = options;
+  const { enabled = true, hidden = false, known = true, current = 50, credits = [] } = options;
   const pace = 'pace' in options ? options.pace : true;
   return render(View, { props: {
-    accounts: [{ id: 'a', provider: 'claude', name: 'A', status: 'ready', enabled }, { id: 'b', provider: 'codex', name: 'B', status: 'ready', enabled }],
+    accounts: [{ id: 'a', provider: 'claude', name: 'A', status: 'ready', enabled, hidden }, { id: 'b', provider: 'codex', name: 'B', status: 'ready', enabled: true }],
     quotas: ['a', 'b'].map(account_id => ({ account_id, updated_at: '2026-10-30T12:00:00Z', credits, windows: [{ id: 'weekly', label: 'Weekly', remaining_percent: current, reset_at: known ? '2026-10-31T12:00:00Z' : null }] })),
     busy: '', settings: { show_provider_pace: pace }, resetUpdated() {}, manageAccounts() {}, refresh() {}
   } }).body;
@@ -94,10 +94,17 @@ test('extra usage is hidden when it is off or reports nothing', () => {
   assert.match(page({ credits: [credit({ enabled: true, remaining: 12 })] }), /Extra usage/);
 });
 
-test('unknown estimates are visibly partial; disabled accounts retain only their actual quota', () => {
+test('unknown estimates are visibly partial; disabled and hidden accounts leave the page', () => {
   const body = page({ known: false });
   assert.match(body, /No reset date yet/);
   assert.ok(tags(body, 'meter').filter(tag => tag.includes('pace')).every(tag => !tag.includes('aria-valuenow')));
-  assert.equal(tags(page({ enabled: false }), 'meter').length, 2);
+  // 2026-11-11: a disabled account or one hidden in Accounts shows neither its row nor its pool.
+  for (const body of [page({ enabled: false, pace: false }), page({ hidden: true, pace: false })]) {
+    assert.equal(tags(body, 'meter').length, 1);
+    assert.doesNotMatch(body, />A</);
+    assert.match(body, />B</);
+  }
+  const all = render(View, { props: { accounts: [{ id: 'a', provider: 'claude', name: 'A', status: 'disabled', enabled: false }, { id: 'b', provider: 'codex', name: 'B', status: 'ready', enabled: true, hidden: true }], quotas: [], busy: '', settings: {}, resetUpdated() {}, manageAccounts() {}, refresh() {} } }).body;
+  assert.match(all, /No account to show/);
   assert.ok(tags(page({ current: null }), 'meter').every(tag => !tag.includes('aria-valuenow')));
 });
