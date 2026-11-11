@@ -5,6 +5,7 @@
 	import ProviderMark from './provider-mark.svelte';
 	import { management, pools as poolsOf, privateLabel, formatDecimal, type Account, type Client, type ClientSaved } from '$lib/management';
 	import { t } from '$lib/i18n.svelte';
+	import { parseShares } from '$lib/shares';
 	let { client, clients, accounts, close, saved }: { client: Client | null; clients: Client[]; accounts: Account[]; close: () => void; saved: (result: ClientSaved, created: boolean) => void } = $props();
 	// The draft starts from the client as it was when the dialog opened; refreshes do not reset it.
 	const initial = untrack(() => $state.snapshot(client));
@@ -22,7 +23,8 @@
 	function draftShare(value: string | undefined) { const number = Number((value ?? '').trim().replace(',', '.')); return Number.isFinite(number) && number > 0 ? number : 0; }
 	function assigned(account: Account) {
 		const pool = account.route || account.provider;
-		const mine = draftShare(accountShares[account.id]?.trim() ? accountShares[account.id] : shares[pool]);
+		// 0 or empty removes the account's own share, so it follows the provider default.
+		const mine = draftShare(accountShares[account.id]) || draftShare(shares[pool]);
 		return clients.reduce((sum, other) => {
 			if (other.id === initial?.id || !(other.access.all || other.access.pools.includes(pool) || other.access.accounts.includes(account.id))) return sum;
 			return sum + (other.account_shares?.[account.id] ?? other.shares[pool] ?? 0);
@@ -37,18 +39,7 @@
 		const poolIds = all ? [] : pools.filter(pool => chosenPools.includes(pool.id)).map(pool => pool.id);
 		const accountIds = all ? [] : accounts.filter(account => chosenAccounts.includes(account.id) && !poolIds.includes(account.route || account.provider)).map(account => account.id);
 		if (!all && !poolIds.length && !accountIds.length) { failure = t('clients.pickAccess'); return; }
-		function parse(draft: Record<string, string>): Record<string, number> | null {
-			const next: Record<string, number> = {};
-			for (const [id, input] of Object.entries(draft)) {
-				const text = (input ?? '').trim().replace(',', '.');
-				if (!text) continue;
-				const value = Number(text);
-				if (!/^\d+(\.\d+)?$/.test(text) || value <= 0 || value > 100) return null;
-				next[id] = value;
-			}
-			return next;
-		}
-		const nextShares = parse(shares), nextAccountShares = parse(accountShares);
+		const nextShares = parseShares(shares), nextAccountShares = parseShares(accountShares);
 		if (!nextShares || !nextAccountShares) { failure = t('clients.shareInvalid'); return; }
 		const patch = { name: name.trim(), access: { all, pools: poolIds, accounts: accountIds }, shares: nextShares, account_shares: nextAccountShares };
 		saving = true;
