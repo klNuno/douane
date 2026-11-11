@@ -34,8 +34,30 @@ pub struct ResetStatus {
     pub status: String,
     pub available_count: Option<u64>,
     pub next_expires_at: Option<String>,
+    /// The available resets by what they clear, the widest first.
+    pub kinds: Vec<ResetKind>,
     pub pending_request_id: Option<String>,
     pub error: Option<String>,
+}
+
+/// What a banked reset clears: every limit of the account, or only the
+/// weekly window of one model family (Claude's Fable resets).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetScope {
+    Account,
+    Model,
+}
+
+/// The resets of one scope an account holds.
+#[derive(Clone, Debug, Serialize)]
+pub struct ResetKind {
+    pub scope: ResetScope,
+    pub count: u64,
+    /// When the one used first expires.
+    pub next_expires_at: Option<String>,
+    /// The provider's own name for the one used first.
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +95,8 @@ struct Credit {
     id: String,
     expires_at: Option<String>,
     count: u64,
+    scope: ResetScope,
+    label: Option<String>,
 }
 
 struct Reading {
@@ -128,6 +152,7 @@ impl ResetManager {
             status: "unsupported".into(),
             available_count: None,
             next_expires_at: None,
+            kinds: Vec::new(),
             pending_request_id: None,
             error: None,
         };
@@ -174,7 +199,24 @@ impl ResetManager {
                 }
                 .into();
                 status.next_expires_at =
-                    next_credit(&reading).and_then(|credit| credit.expires_at.clone());
+                    next_credit(&reading, None).and_then(|credit| credit.expires_at.clone());
+                status.kinds = [ResetScope::Account, ResetScope::Model]
+                    .into_iter()
+                    .filter_map(|scope| {
+                        let next = next_credit(&reading, Some(scope))?;
+                        Some(ResetKind {
+                            scope,
+                            count: reading
+                                .credits
+                                .iter()
+                                .filter(|credit| credit.scope == scope)
+                                .map(|credit| credit.count)
+                                .sum(),
+                            next_expires_at: next.expires_at.clone(),
+                            label: next.label.clone(),
+                        })
+                    })
+                    .collect();
             }
             Err(error) => {
                 status.status = "unavailable".into();
@@ -185,7 +227,14 @@ impl ResetManager {
     }
 
     /// Repeated confirmations with one request ID can never consume another credit.
-    pub async fn redeem(&self, id: &str, request_id: &str) -> Result<ResetRedemption, ResetError> {
+    /// `scope` picks among resets that clear different things; without it the
+    /// one that expires first is used, whatever it clears.
+    pub async fn redeem(
+        &self,
+        id: &str,
+        request_id: &str,
+        scope: Option<ResetScope>,
+    ) -> Result<ResetRedemption, ResetError> {
         if !valid_request_id(request_id) {
             return Err(ResetError::InvalidRequest);
         }
@@ -218,7 +267,7 @@ impl ResetManager {
             Previous::Pending(attempt) => self.consume_and_settle(&account, &key, attempt).await?,
             Previous::New => {
                 let reading = self.read(&account).await?;
-                match next_credit(&reading) {
+                match next_credit(&reading, scope) {
                     Some(credit) => {
                         // Selecting from incomplete details cannot prove earliest expiry.
                         if account.provider == SubscriptionProvider::Codex
@@ -239,7 +288,7 @@ impl ResetManager {
                             .await?;
                         self.consume_and_settle(&account, &key, attempt).await?
                     }
-                    None if reading.count == 0 => {
+                    None if reading.count == 0 || scope.is_some() => {
                         self.update(&key, |state| {
                             state
                                 .completed
@@ -509,11 +558,12 @@ fn expiration(value: Option<&Value>) -> Result<Option<String>, ResetError> {
     }
 }
 
-fn next_credit(reading: &Reading) -> Option<&Credit> {
+fn next_credit(reading: &Reading, scope: Option<ResetScope>) -> Option<&Credit> {
     reading
         .credits
         .iter()
         .filter(|credit| credit.count > 0)
+        .filter(|credit| scope.is_none_or(|scope| credit.scope == scope))
         .min_by_key(|credit| {
             credit
                 .expires_at
@@ -581,10 +631,22 @@ fn parse_claude(value: &Value) -> Result<Reading, ResetError> {
         {
             continue;
         }
+        // A grant that leaves the week alone clears one model family's week.
+        let scope = match row.get("clears").and_then(Value::as_array) {
+            Some(clears) if !clears.iter().any(|window| window == "seven_day") => ResetScope::Model,
+            _ => ResetScope::Account,
+        };
+        let label = row
+            .get("label")
+            .and_then(Value::as_str)
+            .map(|label| label.chars().filter(|c| !c.is_control()).take(120).collect::<String>())
+            .filter(|label| !label.is_empty());
         credits.push(Credit {
             id: id.into(),
             expires_at,
             count,
+            scope,
+            label,
         });
     }
     let count = credits
@@ -637,6 +699,8 @@ fn parse_codex(value: &Value) -> Result<Reading, ResetError> {
                 id: id.into(),
                 expires_at,
                 count: 1,
+                scope: ResetScope::Account,
+                label: None,
             });
         }
     }
@@ -841,13 +905,13 @@ mod tests {
         let (_directory, accounts, oauth, manager, id, task) =
             fixture(backend.clone(), SubscriptionProvider::Codex).await;
         let (first, repeated) =
-            tokio::join!(manager.redeem(&id, REQUEST), manager.redeem(&id, REQUEST));
+            tokio::join!(manager.redeem(&id, REQUEST, None), manager.redeem(&id, REQUEST, None));
         assert_eq!(first.unwrap().outcome, ResetOutcome::Reset);
         assert_eq!(repeated.unwrap().outcome, ResetOutcome::Reset);
         let mut restored = ResetManager::new(accounts.clone(), oauth).unwrap();
         restored.endpoints = manager.endpoints.clone();
         assert_eq!(
-            restored.redeem(&id, REQUEST).await.unwrap().outcome,
+            restored.redeem(&id, REQUEST, None).await.unwrap().outcome,
             ResetOutcome::Reset
         );
         let posts = backend.posts.lock().await;
@@ -880,10 +944,10 @@ mod tests {
         backend.fail_first.store(true, Ordering::SeqCst);
         let (_directory, accounts, oauth, manager, id, task) =
             fixture(backend.clone(), SubscriptionProvider::Codex).await;
-        let error = manager.redeem(&id, REQUEST).await.unwrap_err();
+        let error = manager.redeem(&id, REQUEST, None).await.unwrap_err();
         assert!(!error.to_string().contains("private-upstream-error"));
         assert!(matches!(
-            manager.redeem(&id, OTHER).await,
+            manager.redeem(&id, OTHER, None).await,
             Err(ResetError::Pending)
         ));
         let status = manager.status(&id).await.unwrap();
@@ -891,7 +955,7 @@ mod tests {
         let mut restored = ResetManager::new(accounts, oauth).unwrap();
         restored.endpoints = manager.endpoints.clone();
         assert_eq!(
-            restored.redeem(&id, REQUEST).await.unwrap().outcome,
+            restored.redeem(&id, REQUEST, None).await.unwrap().outcome,
             ResetOutcome::AlreadyRedeemed
         );
         let posts = backend.posts.lock().await;
@@ -937,7 +1001,7 @@ mod tests {
         assert_eq!(partial.available_count, Some(2));
         assert_eq!(partial.status, "unavailable");
         assert_eq!(partial.next_expires_at, None);
-        assert!(manager.redeem(&id, REQUEST).await.is_err());
+        assert!(manager.redeem(&id, REQUEST, None).await.is_err());
         assert!(backend.posts.lock().await.is_empty());
         task.abort();
     }
@@ -959,7 +1023,7 @@ mod tests {
                 .contains("claude_early")
         );
         assert_eq!(
-            manager.redeem(&id, REQUEST).await.unwrap().outcome,
+            manager.redeem(&id, REQUEST, None).await.unwrap().outcome,
             ResetOutcome::Reset
         );
         assert_eq!(
@@ -967,6 +1031,27 @@ mod tests {
             json!({"program":"cedar_ember", "grant_id":"claude_early", "request_id":REQUEST})
         );
         task.abort();
+    }
+
+    #[test]
+    fn claude_grants_are_told_apart_by_what_they_clear() {
+        let reading = parse_claude(&json!({"cedar_ember":{"eligible":true,"grants":[
+            {"id":"week","label":"One full limit reset","resets_left":1,"usable_now":true,"ends_at":"2098-01-01T00:00:00Z","clears":["seven_day","seven_day_overage_included"]},
+            {"id":"fable","label":"One Fable reset","resets_left":1,"usable_now":true,"ends_at":"2099-01-01T00:00:00Z","clears":["five_hour","seven_day_overage_included"]},
+            {"id":"fable_more","resets_left":2,"usable_now":true,"ends_at":null,"clears":["seven_day_overage_included"]},
+            {"id":"old","resets_left":1,"usable_now":true,"ends_at":null}
+        ]}}))
+        .unwrap();
+        assert_eq!(reading.count, 5);
+        assert_eq!(next_credit(&reading, None).unwrap().id, "week");
+        let account = next_credit(&reading, Some(ResetScope::Account)).unwrap();
+        assert_eq!((account.id.as_str(), account.label.as_deref()), ("week", Some("One full limit reset")));
+        let model = next_credit(&reading, Some(ResetScope::Model)).unwrap();
+        assert_eq!((model.id.as_str(), model.label.as_deref()), ("fable", Some("One Fable reset")));
+        let of = |scope| -> u64 {
+            reading.credits.iter().filter(|c| c.scope == scope).map(|c| c.count).sum()
+        };
+        assert_eq!((of(ResetScope::Account), of(ResetScope::Model)), (2, 3));
     }
 
     #[test]
@@ -980,7 +1065,7 @@ mod tests {
             {"id":"usable", "resets_left":2, "usable_now":true,"ends_at":null}
         ]}})).unwrap();
         assert_eq!(reading.count, 2);
-        assert_eq!(next_credit(&reading).unwrap().id, "usable");
+        assert_eq!(next_credit(&reading, None).unwrap().id, "usable");
         assert!(
             parse_outcome(
                 SubscriptionProvider::Claude,
@@ -1012,11 +1097,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            manager.redeem(&id, REQUEST).await.unwrap().outcome,
+            manager.redeem(&id, REQUEST, None).await.unwrap().outcome,
             ResetOutcome::NoCredit
         );
         assert!(matches!(
-            manager.redeem(&id, OTHER).await,
+            manager.redeem(&id, OTHER, None).await,
             Err(ResetError::HistoryFull)
         ));
         assert!(backend.posts.lock().await.is_empty());
