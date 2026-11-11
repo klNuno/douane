@@ -1988,7 +1988,7 @@ mod tests {
 
         state
             .accounts
-            .update(&kept, None, None, Some(Some(5.0)), None)
+            .update(&kept, None, None, None, Some(Some(5.0)), None)
             .await
             .unwrap();
         assert_eq!(order(&state).await.unwrap(), vec![spare.clone()]);
@@ -2002,7 +2002,7 @@ mod tests {
         // Above the reserve, the account serves again.
         state
             .accounts
-            .update(&kept, None, None, Some(Some(4.0)), None)
+            .update(&kept, None, None, None, Some(Some(4.0)), None)
             .await
             .unwrap();
         assert_eq!(order(&state).await.unwrap(), vec![kept]);
@@ -2025,7 +2025,7 @@ mod tests {
             .unwrap();
         state
             .accounts
-            .update(&account.id, None, None, Some(Some(5.0)), None)
+            .update(&account.id, None, None, None, Some(Some(5.0)), None)
             .await
             .unwrap();
         let reset_in = |hours: i64| {
@@ -2076,7 +2076,7 @@ mod tests {
             .unwrap();
         state
             .accounts
-            .update(&account.id, None, None, Some(Some(5.0)), None)
+            .update(&account.id, None, None, None, Some(Some(5.0)), None)
             .await
             .unwrap();
         let mut low = weekly(&account.id, "2099-01-01T00:00:00Z");
@@ -2128,7 +2128,7 @@ mod tests {
         state.quotas.insert_for_test(snapshot).await;
         state
             .accounts
-            .update(&owner.id, None, None, Some(Some(70.0)), None)
+            .update(&owner.id, None, None, None, Some(Some(70.0)), None)
             .await
             .unwrap();
         assert!(
@@ -2137,7 +2137,7 @@ mod tests {
         );
         state
             .accounts
-            .update(&owner.id, None, None, Some(None), None)
+            .update(&owner.id, None, None, None, Some(None), None)
             .await
             .unwrap();
         state

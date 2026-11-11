@@ -381,6 +381,7 @@ mod tests {
             last_error: (status == "error").then(|| "provider request failed".into()),
             reserve_percent: None,
             reserve_windows: vec![],
+            hidden: false,
             route: None,
             base_url: None,
             dialect: None,

@@ -107,3 +107,9 @@ test('a Pro account weighs a twentieth of an Ultra account in the pace', () => {
   // Weighted 1x and 0.05x: (50 + 5) / (50 + 2.5).
   assert.equal(providerPace(accounts, quotas, new Map([['ultra', 1], ['pro', 0.05]])).percent, Math.round(55 / 52.5 * 100));
 });
+
+test('a model-family week or a code review week stays out of the pace', () => {
+  // Weekly half used at mid-week is on pace; a spent Fable week must not push it to 150%.
+  const quotas = [quota('a', [window('seven-day', 50, 3.5 * day), window('seven-day-fable', 0, 3.5 * day), window('code-review-weekly', 0, 3.5 * day)])];
+  assert.equal(providerPace([account('a')], quotas).percent, 100);
+});

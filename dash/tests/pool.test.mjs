@@ -27,10 +27,24 @@ test('weights normalise by the most common plan, ties going to the larger', () =
 
 test('an account with two buckets of its longest length gives two half-weight series; shorter windows stay out', () => {
 	const accounts = [account('a', ultra)];
-	const quotas = [quota('a', [{ id: 'five-hour', label: '5 hours', remaining_percent: 10, reset_at: iso(now + HOUR) }, weekly(80, DAY), { id: 'opus', label: 'Opus weekly', remaining_percent: 40, reset_at: iso(now + DAY) }])];
+	const quotas = [quota('a', [{ id: 'five-hour', label: '5 hours', remaining_percent: 10, reset_at: iso(now + HOUR) }, { id: 'bucket-1', label: 'Claude Weekly', remaining_percent: 80, reset_at: iso(now + DAY) }, { id: 'bucket-2', label: 'Gemini Weekly', remaining_percent: 40, reset_at: iso(now + DAY) }])];
 	const series = poolSeries(accounts, quotas, [], new Map([['a', 1]]), now);
-	assert.deepEqual(series.map(x => [x.windowId, x.weight]), [['weekly', 0.5], ['opus', 0.5]]);
+	assert.deepEqual(series.map(x => [x.windowId, x.weight]), [['bucket-1', 0.5], ['bucket-2', 0.5]]);
 	assert.equal(poolValue(series, now), 60);
+});
+
+test('a model-family week (Fable, Opus) or a code review week never joins the pool', () => {
+	// The 2026-11-11 capture: Fable weeks at 90, 88 and 100% pushed a 410% pool for 5 accounts.
+	const scoped = (id, label, remaining) => ({ id, label, remaining_percent: remaining, reset_at: iso(now + 2 * DAY) });
+	const accounts = [account('a', ultra), account('b', ultra)];
+	const quotas = [
+		quota('a', [weekly(26, 2 * DAY), scoped('seven-day-fable', 'Fable weekly', 10), scoped('seven-day-opus', 'Opus weekly', 50)]),
+		quota('b', [weekly(100, 2 * DAY), scoped('code-review-weekly', 'Code review Weekly', 0)])
+	];
+	const series = poolSeries(accounts, quotas, [], new Map([['a', 1], ['b', 1]]), now);
+	assert.deepEqual(series.map(x => [x.accountId, x.windowId, x.weight]), [['a', 'weekly', 1], ['b', 'weekly', 1]]);
+	assert.equal(capacity(series), 200);
+	assert.equal(poolValue(series, now), 126);
 });
 
 test('a reading holds until the next one and returns to 100 once its reset passes', () => {
