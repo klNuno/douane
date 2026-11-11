@@ -5,6 +5,7 @@
 	import ProviderMark from './provider-mark.svelte';
 	import { management, pools as poolsOf, privateLabel, formatDecimal, type Account, type Client, type ClientSaved } from '$lib/management';
 	import { t } from '$lib/i18n.svelte';
+	import { parseShares } from '$lib/shares';
 	let { client, clients, accounts, close, saved }: { client: Client | null; clients: Client[]; accounts: Account[]; close: () => void; saved: (result: ClientSaved, created: boolean) => void } = $props();
 	// The draft starts from the client as it was when the dialog opened; refreshes do not reset it.
 	const initial = untrack(() => $state.snapshot(client));
@@ -37,18 +38,7 @@
 		const poolIds = all ? [] : pools.filter(pool => chosenPools.includes(pool.id)).map(pool => pool.id);
 		const accountIds = all ? [] : accounts.filter(account => chosenAccounts.includes(account.id) && !poolIds.includes(account.route || account.provider)).map(account => account.id);
 		if (!all && !poolIds.length && !accountIds.length) { failure = t('clients.pickAccess'); return; }
-		function parse(draft: Record<string, string>): Record<string, number> | null {
-			const next: Record<string, number> = {};
-			for (const [id, input] of Object.entries(draft)) {
-				const text = (input ?? '').trim().replace(',', '.');
-				if (!text) continue;
-				const value = Number(text);
-				if (!/^\d+(\.\d+)?$/.test(text) || value <= 0 || value > 100) return null;
-				next[id] = value;
-			}
-			return next;
-		}
-		const nextShares = parse(shares), nextAccountShares = parse(accountShares);
+		const nextShares = parseShares(shares), nextAccountShares = parseShares(accountShares);
 		if (!nextShares || !nextAccountShares) { failure = t('clients.shareInvalid'); return; }
 		const patch = { name: name.trim(), access: { all, pools: poolIds, accounts: accountIds }, shares: nextShares, account_shares: nextAccountShares };
 		saving = true;
