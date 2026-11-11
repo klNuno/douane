@@ -23,7 +23,8 @@
 	function draftShare(value: string | undefined) { const number = Number((value ?? '').trim().replace(',', '.')); return Number.isFinite(number) && number > 0 ? number : 0; }
 	function assigned(account: Account) {
 		const pool = account.route || account.provider;
-		const mine = draftShare(accountShares[account.id]?.trim() ? accountShares[account.id] : shares[pool]);
+		// 0 or empty removes the account's own share, so it follows the provider default.
+		const mine = draftShare(accountShares[account.id]) || draftShare(shares[pool]);
 		return clients.reduce((sum, other) => {
 			if (other.id === initial?.id || !(other.access.all || other.access.pools.includes(pool) || other.access.accounts.includes(account.id))) return sum;
 			return sum + (other.account_shares?.[account.id] ?? other.shares[pool] ?? 0);
