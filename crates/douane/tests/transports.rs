@@ -61,6 +61,8 @@ struct Mock {
     omit_content_type: AtomicBool,
     items_before_empty_completion: AtomicBool,
     refusal: Mutex<Option<(u16, Value)>>,
+    /// The refusal reports its Codex window at 100%, a used-up subscription.
+    refusal_exhausted: AtomicBool,
     limit_headers: AtomicBool,
     /// Milliseconds between the HTTP body's chunks; a few by default.
     chunk_pause_ms: AtomicU64,
@@ -282,10 +284,15 @@ async fn mock_http(
             .into_response();
     }
     if let Some((status, body)) = mock.refusal.lock().unwrap().clone() {
+        let used = if mock.refusal_exhausted.load(Ordering::Relaxed) {
+            "100"
+        } else {
+            "42"
+        };
         return (
             StatusCode::from_u16(status).unwrap(),
             [
-                ("x-codex-primary-used-percent", "42"),
+                ("x-codex-primary-used-percent", used),
                 ("request-id", "fixture-request"),
                 ("set-cookie", "upstream-session=fixture"),
             ],
@@ -1888,6 +1895,39 @@ async fn native_answers_keep_the_provider_limits_and_refusals_without_blaming_th
         account.last_error.is_none(),
         "a refused request leaves the account healthy"
     );
+}
+
+#[tokio::test]
+async fn a_refusal_names_a_used_up_window_apart_from_a_rate_limit() {
+    // A 429 on a used-up window used to read "upstream temporarily
+    // unavailable" until the window reset, in every quota view.
+    for (exhausted, reason) in [
+        (true, "upstream quota exceeded"),
+        (false, "upstream rate limit reached"),
+    ] {
+        let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+        fixture
+            .mock
+            .refusal_exhausted
+            .store(exhausted, Ordering::Relaxed);
+        *fixture.mock.refusal.lock().unwrap() = Some((
+            429,
+            json!({"error":{"type":"usage_limit_reached","message":"fixture limit"}}),
+        ));
+        let request = json!({"model":"gpt-test","input":"hello","stream":false});
+        let refused = fixture.post("/v1/responses", "limited", request).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        let account = fixture
+            .state
+            .accounts
+            .list()
+            .await
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(account.status, "cooldown");
+        assert_eq!(account.last_error.as_deref(), Some(reason));
+    }
 }
 
 #[tokio::test]

@@ -911,6 +911,7 @@ pub async fn forward(
         };
         if !last_status.is_success() {
             let advised = cooldown_seconds(response.headers(), unix_now());
+            let exhausted = window_exhausted(response.headers());
             // Copilot refuses a request it cannot serve with 400; the account
             // is fine, and a model its plan lacks leaves the list.
             if account.provider == SubscriptionProvider::Copilot
@@ -1016,10 +1017,12 @@ pub async fn forward(
                 let wait = advised
                     .or_else(|| refusal.as_ref().and_then(|r| r.retry_seconds))
                     .unwrap_or(30);
-                let _ = state
-                    .accounts
-                    .cooldown(&account.id, wait, "upstream temporarily unavailable")
-                    .await;
+                let reason = cooldown_reason(
+                    last_status,
+                    exhausted,
+                    refusal.as_ref().map(|r| r.reason.as_str()),
+                );
+                let _ = state.accounts.cooldown(&account.id, wait, reason).await;
                 if owner.is_some() && last_status == StatusCode::TOO_MANY_REQUESTS {
                     return replay_rate_limit(wait);
                 }
@@ -1358,6 +1361,32 @@ pub(crate) fn cooldown_seconds(headers: &HeaderMap, now: u64) -> Option<u64> {
             .flatten()
             .map(|seconds| seconds.ceil() as u64)
     })
+}
+
+/// Whether the provider's headers say a subscription window is used up:
+/// Claude's unified limit rejected, or a Codex window at 100%.
+fn window_exhausted(headers: &HeaderMap) -> bool {
+    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    text("anthropic-ratelimit-unified-status") == Some("rejected")
+        || ["primary", "secondary"].iter().any(|window| {
+            text(&format!("x-codex-{window}-used-percent"))
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .is_some_and(|used| used >= 100.0)
+        })
+}
+
+/// The reason a refusing account rests, shown in the ledger and every quota
+/// view. A used-up window reads `quota exceeded`, which also keeps the account
+/// out of the resting fallback until its reset; another 429 is a rate limit
+/// that may already be over, a server error a passing outage.
+fn cooldown_reason(status: StatusCode, exhausted: bool, refusal: Option<&str>) -> &'static str {
+    if status != StatusCode::TOO_MANY_REQUESTS {
+        "upstream temporarily unavailable"
+    } else if exhausted || refusal.is_some_and(|r| r.split('/').any(|p| p == "QUOTA_EXHAUSTED")) {
+        "upstream quota exceeded"
+    } else {
+        "upstream rate limit reached"
+    }
 }
 
 /// Response headers an agent reads from its own provider: rate-limit state
@@ -2060,6 +2089,30 @@ mod tests {
                 0
             ),
             None
+        );
+        // Its reason names the used-up window, not an outage.
+        let limited = StatusCode::TOO_MANY_REQUESTS;
+        assert!(window_exhausted(&claude) && window_exhausted(&codex));
+        assert!(!window_exhausted(&headers(&[("retry-after", "12")])));
+        assert_eq!(
+            cooldown_reason(limited, true, None),
+            "upstream quota exceeded"
+        );
+        assert_eq!(
+            cooldown_reason(limited, false, Some("RESOURCE_EXHAUSTED/QUOTA_EXHAUSTED")),
+            "upstream quota exceeded"
+        );
+        assert_eq!(
+            cooldown_reason(
+                limited,
+                false,
+                Some("RESOURCE_EXHAUSTED/MODEL_CAPACITY_EXHAUSTED")
+            ),
+            "upstream rate limit reached"
+        );
+        assert_eq!(
+            cooldown_reason(StatusCode::SERVICE_UNAVAILABLE, true, None),
+            "upstream temporarily unavailable"
         );
     }
 
