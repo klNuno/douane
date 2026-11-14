@@ -48,6 +48,7 @@ struct Mock {
     connections: AtomicUsize,
     closed: AtomicUsize,
     rejected_token: Mutex<Option<String>>,
+    retry_after: Mutex<Option<String>>,
     trailing_frame: Mutex<bool>,
     hold_http: AtomicBool,
     closed_http: AtomicUsize,
@@ -278,7 +279,14 @@ async fn mock_http(
         return (
             StatusCode::from_u16(mock.rejected_status.load(Ordering::Relaxed) as u16)
                 .unwrap_or(StatusCode::TOO_MANY_REQUESTS),
-            [("retry-after", "60")],
+            [(
+                "retry-after",
+                mock.retry_after
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "60".into()),
+            )],
             "fixture quota reached",
         )
             .into_response();
@@ -1232,6 +1240,32 @@ async fn native_websocket_rechecks_cooldown_before_each_continuation() {
         1,
         "cooldown must apply to persistent sockets too"
     );
+}
+
+#[tokio::test]
+async fn explicit_retry_after_prevents_an_immediate_retry_on_the_only_account() {
+    for delay in ["60", "Fri, 01 Jan 2100 00:00:00 GMT"] {
+        let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+        *fixture.mock.retry_after.lock().unwrap() = Some(delay.into());
+        *fixture.mock.rejected_token.lock().unwrap() = Some("Bearer fixture-alpha".into());
+        let request = json!({"model":"codex/gpt-test","input":"fixture","stream":true});
+        let refused = fixture
+            .post("/v1/responses", "limited", request.clone())
+            .await;
+        assert!(!refused.status().is_success());
+        assert_eq!(fixture.received().len(), 1);
+
+        // The upstream would now accept a call, but its explicit 60-second
+        // retry delay must also govern the last-account resting fallback.
+        *fixture.mock.rejected_token.lock().unwrap() = None;
+        let retry = fixture.post("/v1/responses", "other", request).await;
+        assert!(!retry.status().is_success());
+        assert_eq!(
+            fixture.received().len(),
+            1,
+            "Retry-After must reach account selection"
+        );
+    }
 }
 
 #[tokio::test]

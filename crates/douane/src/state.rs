@@ -1780,10 +1780,7 @@ mod tests {
             state.quotas.insert_for_test(quota).await;
         }
         async fn order(state: &AppState, model: &str) -> Vec<String> {
-            let (_, accounts) = state
-                .candidates(model, Some("claude"), None)
-                .await
-                .unwrap();
+            let (_, accounts) = state.candidates(model, Some("claude"), None).await.unwrap();
             accounts.into_iter().map(|a| a.id).collect()
         }
         let chosen = vec![ids[2].clone(), ids[0].clone()];

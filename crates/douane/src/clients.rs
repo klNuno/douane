@@ -40,6 +40,8 @@ pub const SHARE_USED_UP: &str = "this client's share of";
 const RESET_TOLERANCE: i64 = 600;
 /// A fall of usage this large within one window means it was reset early.
 const NEW_WINDOW_DROP: f64 = 10.0;
+/// Sources may disagree by two points; a full reset must exceed that jitter.
+const ZERO_RESET_TOLERANCE: f64 = 2.0;
 const MAX_CLIENTS: usize = 200;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -166,6 +168,9 @@ pub struct WindowUsage {
     /// Percent points no call through douane explains.
     #[serde(default)]
     pub outside: f64,
+    /// Snapshot timestamp, persisted so delayed readings cannot undo a reset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
 }
 
 #[derive(Default)]
@@ -702,6 +707,7 @@ impl Clients {
         if readings.is_empty() {
             return;
         }
+        let observed_at = parse_timestamp(&snapshot.updated_at);
         let account = snapshot.account_id.as_str();
         let mut usage = self.usage();
         let usage = &mut *usage;
@@ -727,16 +733,32 @@ impl Clients {
                         used: reading.used,
                         clients: BTreeMap::new(),
                         outside: 0.0,
+                        observed_at: observed_at.map(|_| snapshot.updated_at.clone()),
                     });
                     usage.dirty = true;
                     continue;
                 }
             };
-            // A later reset, or usage falling by more than sources disagree
-            // (usage reads and inference headers round differently), is a
-            // new window.
-            let new_window = reading.reset > window.reset + RESET_TOLERANCE
-                || reading.used + NEW_WINDOW_DROP < window.used;
+            if let Some(observed_at) = observed_at {
+                if window
+                    .observed_at
+                    .as_deref()
+                    .and_then(parse_timestamp)
+                    .is_some_and(|previous| observed_at < previous)
+                {
+                    continue;
+                }
+                if window.observed_at.as_deref() != Some(snapshot.updated_at.as_str()) {
+                    window.observed_at = Some(snapshot.updated_at.clone());
+                    usage.dirty = true;
+                }
+            }
+            // A provider can move a reset earlier as well as later. A manual
+            // reset can leave its deadline intact and clear less than ten
+            // points; keep small near-zero rounding disagreements protected.
+            let new_window = reading.reset.abs_diff(window.reset) > RESET_TOLERANCE as u64
+                || reading.used + NEW_WINDOW_DROP < window.used
+                || (reading.used <= 1e-9 && window.used > ZERO_RESET_TOLERANCE);
             if new_window {
                 // Old completions cannot charge a fresh budget. Other windows
                 // retain their weights until their own rise or reset.
@@ -2055,5 +2077,197 @@ mod tests {
         clients.save_usage();
         let reopened = Clients::open(dir.path()).unwrap();
         assert_eq!(reopened.usage_report(NOW), clients.usage_report(NOW));
+    }
+
+    fn observed_at(mut quota: QuotaSnapshot, at: i64) -> QuotaSnapshot {
+        quota.updated_at = time::OffsetDateTime::from_unix_timestamp(at)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        quota
+    }
+
+    #[test]
+    fn an_early_backward_reset_clears_attribution_and_pending_calls() {
+        for first_used in [2.0, 8.0] {
+            let (dir, clients) = clients();
+            let old_reset = NOW + 6 * 86_400;
+            let new_reset = NOW + 3 * 86_400;
+            clients.observe(&observed_at(snapshot("a", 0.0, old_reset), NOW), NOW);
+            clients.call_ended("a", Some("old"), 1.0);
+            clients.observe(
+                &observed_at(snapshot("a", 8.0, old_reset), NOW + 1),
+                NOW + 1,
+            );
+            clients.call_ended("a", Some("old"), 1.0);
+            clients.observe(
+                &observed_at(snapshot("a", first_used, new_reset), NOW + 2),
+                NOW + 2,
+            );
+            clients.save_usage();
+            let reopened = Clients::open(dir.path()).unwrap();
+            let report = reopened.usage_report(NOW + 2);
+            assert_eq!(report[0].reset, new_reset);
+            assert_eq!(report[0].used, first_used);
+            assert!(report[0].clients.is_empty());
+            assert_eq!(report[0].outside, first_used);
+            clients.call_ended("a", Some("next"), 1.0);
+            clients.observe(
+                &observed_at(snapshot("a", first_used + 2.0, new_reset), NOW + 3),
+                NOW + 3,
+            );
+            let report = clients.usage_report(NOW + 3);
+            assert_eq!(report[0].clients, [("next".to_owned(), 2.0)].into());
+        }
+    }
+
+    #[test]
+    fn small_manual_resets_restore_shares_and_survive_a_restart() {
+        for kind in ["five-hour", "weekly", "seven-day-fable"] {
+            for spent in [3.0, 8.0, 10.0] {
+                let (dir, clients) = clients();
+                let (holder, _) = clients
+                    .create(ClientPatch {
+                        shares: Some([("claude".into(), spent)].into()),
+                        ..named("holder")
+                    })
+                    .unwrap();
+                clients
+                    .create(ClientPatch {
+                        shares: Some([("claude".into(), 100.0)].into()),
+                        ..named("other")
+                    })
+                    .unwrap();
+                let reset = NOW + 3 * 86_400;
+                let quota = |used, at| {
+                    let mut q = observed_at(snapshot("a", used, reset), at);
+                    q.windows[0].id = kind.into();
+                    q
+                };
+                clients.observe(&quota(0.0, NOW), NOW);
+                clients.call_ended_on("a", Some(&holder.id), 1.0, "claude-fable");
+                clients.observe(&quota(spent, NOW + 1), NOW + 1);
+                assert_eq!(
+                    clients.share_blocks_for(
+                        Some(&holder),
+                        &account("a"),
+                        Some(&quota(spent, NOW + 1)),
+                        NOW + 1,
+                        0,
+                        "claude-fable"
+                    ),
+                    Some(reset)
+                );
+                clients.call_ended_on("a", Some(&holder.id), 1.0, "claude-fable");
+                let fresh = quota(0.0, NOW + 2);
+                clients.observe(&fresh, NOW + 2);
+                assert_eq!(
+                    clients.share_blocks_for(
+                        Some(&holder),
+                        &account("a"),
+                        Some(&fresh),
+                        NOW + 2,
+                        0,
+                        "claude-fable"
+                    ),
+                    None,
+                    "{kind}, previously spent {spent}"
+                );
+                clients.save_usage();
+                let reopened = Clients::open(dir.path()).unwrap();
+                let report = reopened.usage_report(NOW + 2);
+                assert_eq!(report[0].used, 0.0);
+                assert!(report[0].clients.is_empty());
+                assert_eq!(report[0].outside, 0.0);
+                assert_eq!(
+                    reopened
+                        .client_view(&holder, fresh, "claude", NOW + 2, 0)
+                        .windows[0]
+                        .remaining_percent,
+                    Some(100.0)
+                );
+                clients.observe(&quota(1.0, NOW + 3), NOW + 3);
+                assert!(clients.usage_report(NOW + 3)[0].clients.is_empty());
+                assert_eq!(clients.usage_report(NOW + 3)[0].outside, 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn reset_and_usage_jitter_keep_attribution_and_pending_calls() {
+        for (high, low) in [(24.0, 22.0), (2.0, 0.0), (0.5, 0.0)] {
+            let (_dir, clients) = clients();
+            let reset = NOW + 3 * 86_400;
+            clients.observe(&observed_at(snapshot("a", 0.0, reset), NOW), NOW);
+            clients.call_ended("a", Some("old"), 1.0);
+            clients.observe(&observed_at(snapshot("a", high, reset), NOW + 1), NOW + 1);
+            clients.call_ended("a", Some("next"), 1.0);
+            for (at, used, drift) in [(2, low, -600), (3, high, 600), (4, high + 1.0, 0)] {
+                clients.observe(
+                    &observed_at(snapshot("a", used, reset + drift), NOW + at),
+                    NOW + at,
+                );
+            }
+            let report = clients.usage_report(NOW + 4);
+            assert_eq!(report[0].reset, reset);
+            assert_eq!(report[0].clients["old"], high);
+            assert_eq!(report[0].clients["next"], 1.0);
+            assert_eq!(report[0].outside, 0.0);
+        }
+    }
+
+    #[test]
+    fn delayed_snapshots_cannot_undo_a_reset_even_after_restart() {
+        for new_reset in [NOW + 3 * 86_400, NOW + 9 * 86_400] {
+            let (dir, clients) = clients();
+            let old_reset = NOW + 6 * 86_400;
+            clients.observe(&observed_at(snapshot("a", 30.0, old_reset), NOW), NOW);
+            let fresh = observed_at(snapshot("a", 0.0, new_reset), NOW + 2);
+            clients.observe(&fresh, NOW + 2);
+            clients.call_ended("a", Some("next"), 1.0);
+            clients.observe(
+                &observed_at(snapshot("a", 4.0, new_reset), NOW + 3),
+                NOW + 3,
+            );
+            // Even a reading with no usage delta advances the persisted watermark.
+            clients.observe(
+                &observed_at(snapshot("a", 4.0, new_reset), NOW + 5),
+                NOW + 5,
+            );
+            clients.save_usage();
+            for target in [&clients, &Clients::open(dir.path()).unwrap()] {
+                let before = target.usage_report(NOW + 5);
+                for stale in [
+                    observed_at(snapshot("a", 30.0, old_reset), NOW + 1),
+                    fresh.clone(),
+                    observed_at(snapshot("a", 0.0, new_reset), NOW + 4),
+                ] {
+                    target.observe(&stale, NOW + 6);
+                    assert_eq!(target.usage_report(NOW + 6), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn usage_without_observation_timestamps_still_loads_and_resets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let reset = NOW + 3 * 86_400;
+        let legacy = serde_json::json!([{
+            "account_id": "a", "kind": "weekly", "reset": reset,
+            "used": 8.0, "clients": {"old": 8.0}, "outside": 0.0
+        }]);
+        std::fs::write(
+            dir.path().join(".client-usage"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let clients = Clients::open(dir.path()).unwrap();
+        assert_eq!(clients.usage_report(NOW)[0].clients["old"], 8.0);
+        clients.observe(&observed_at(snapshot("a", 0.0, reset), NOW), NOW);
+        clients.save_usage();
+        let reopened = Clients::open(dir.path()).unwrap();
+        assert!(reopened.usage_report(NOW)[0].clients.is_empty());
+        assert_eq!(reopened.usage_report(NOW)[0].used, 0.0);
     }
 }

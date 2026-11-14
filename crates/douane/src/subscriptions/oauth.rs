@@ -1853,6 +1853,11 @@ mod tests {
         assert_eq!(one.unwrap().access_token, "new-access-1");
         assert_eq!(two.unwrap().access_token, "new-access-1");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        store
+            .cooldown_with_retry_after(&summary.id, 3600, "upstream rate limit reached", true)
+            .await
+            .unwrap();
+        let cooling = store.get(&summary.id).await.unwrap();
         let (one, two) = tokio::join!(
             first.force_refresh(&summary.id),
             second.force_refresh(&summary.id)
@@ -1861,6 +1866,16 @@ mod tests {
         assert_eq!(two.unwrap().access_token, "new-access-2");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         let reopened = AccountStore::open(directory.path()).unwrap();
+        let refreshed = reopened.get(&summary.id).await.unwrap();
+        assert_eq!(refreshed.cooldown_until, cooling.cooldown_until);
+        assert_eq!(refreshed.last_error, cooling.last_error);
+        assert!(refreshed.cooldown_retry_after);
+        assert!(
+            reopened
+                .eligible(SubscriptionProvider::Codex, None)
+                .await
+                .is_empty()
+        );
         assert_eq!(
             reopened
                 .get(&summary.id)

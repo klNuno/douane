@@ -911,6 +911,7 @@ pub async fn forward(
         };
         if !last_status.is_success() {
             let advised = cooldown_seconds(response.headers(), unix_now());
+            let retry_after = retry_after_seconds(response.headers(), unix_now()).is_some();
             let exhausted = window_exhausted(response.headers());
             // Copilot refuses a request it cannot serve with 400; the account
             // is fine, and a model its plan lacks leaves the list.
@@ -1022,7 +1023,10 @@ pub async fn forward(
                     exhausted,
                     refusal.as_ref().map(|r| r.reason.as_str()),
                 );
-                let _ = state.accounts.cooldown(&account.id, wait, reason).await;
+                let _ = state
+                    .accounts
+                    .cooldown_with_retry_after(&account.id, wait, reason, retry_after)
+                    .await;
                 if owner.is_some() && last_status == StatusCode::TOO_MANY_REQUESTS {
                     return replay_rate_limit(wait);
                 }
@@ -1335,6 +1339,22 @@ pub(crate) fn unix_now() -> u64 {
 /// explicit `retry-after`, else the reset of the exhausted subscription
 /// window. Retrying an exhausted window every 30 seconds only adds refusals
 /// to the account's record.
+pub(crate) fn retry_after_seconds(headers: &HeaderMap, now: u64) -> Option<u64> {
+    let value = headers.get("retry-after")?.to_str().ok()?.trim();
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|seconds| seconds.ceil() as u64)
+        .or_else(|| {
+            httpdate::parse_http_date(value)
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|reset| reset.as_secs().saturating_sub(now))
+        })
+}
+
 pub(crate) fn cooldown_seconds(headers: &HeaderMap, now: u64) -> Option<u64> {
     let number = |name: &str| {
         headers
@@ -1343,8 +1363,8 @@ pub(crate) fn cooldown_seconds(headers: &HeaderMap, now: u64) -> Option<u64> {
             .and_then(|v| v.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
     };
-    if let Some(seconds) = number("retry-after") {
-        return Some(seconds.ceil() as u64);
+    if let Some(seconds) = retry_after_seconds(headers, now) {
+        return Some(seconds);
     }
     if headers
         .get("anthropic-ratelimit-unified-status")

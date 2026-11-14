@@ -267,7 +267,16 @@ async fn connect_pool(
                 }
                 let _ = state
                     .accounts
-                    .cooldown(&account.id, failure.seconds, failure.reason)
+                    .cooldown_with_retry_after(
+                        &account.id,
+                        failure.seconds,
+                        failure.reason,
+                        crate::relay::retry_after_seconds(
+                            response.headers(),
+                            crate::relay::unix_now(),
+                        )
+                        .is_some(),
+                    )
                     .await;
             }
             _ => {
