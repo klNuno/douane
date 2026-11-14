@@ -904,12 +904,25 @@ impl QuotaService {
                     .as_deref()
                     .and_then(parse_timestamp)
                     .is_some_and(|until| until > current);
-                // A successful authenticated quota read supersedes an older
-                // failure, the reason an expired cooldown left behind included,
-                // but cannot dismiss an error recorded while the request was in
-                // flight or an active inference cooldown.
-                if account.updated_at == account_version && !cooling {
+                let mut global = snapshot
+                    .windows
+                    .iter()
+                    .filter(|w| is_global(&w.id))
+                    .peekable();
+                // A fresh usage response may authorize another attempt after an
+                // inferred Claude quota refusal. Missing windows promise nothing;
+                // every reported global window must have known quota left. A
+                // real Retry-After, newer refusal, or exhausted window still wins.
+                let revalidated = account.provider == SubscriptionProvider::Claude
+                    && !account.cooldown_retry_after
+                    && account.last_error.as_deref() == Some("upstream quota exceeded")
+                    && snapshot.error.is_none()
+                    && global.peek().is_some()
+                    && global.all(|w| w.remaining_percent.is_some_and(|left| left > 0.0));
+                if account.updated_at == account_version && (!cooling || revalidated) {
                     account.last_error = None;
+                    account.cooldown_until = None;
+                    account.cooldown_retry_after = false;
                 }
                 if let Some(plan) = plan {
                     account.plan = Some(plan);
@@ -1913,7 +1926,12 @@ mod tests {
         let fable = &windows[2];
         assert_eq!(fable.label, "Fable weekly");
         assert_eq!(fable.remaining_percent, Some(79.0));
-        assert!(fable.reset_at.as_deref().is_some_and(|r| r.starts_with("2026-11-11T09:00:00")));
+        assert!(
+            fable
+                .reset_at
+                .as_deref()
+                .is_some_and(|r| r.starts_with("2026-11-11T09:00:00"))
+        );
         // The legacy field and the scoped limit name the same window once.
         let both = parse_claude(
             &json!({
@@ -2543,6 +2561,110 @@ mod tests {
         );
         assert_eq!(kimi[0].remaining_percent, Some(40.0));
         assert_eq!(kimi[0].reset_at.as_deref(), Some("2026-10-03T12:02:00Z"));
+    }
+
+    #[tokio::test]
+    async fn fresh_claude_quota_reopens_an_inferred_quota_cooldown() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let account = store
+            .import(
+                json!({"type":"claude","access_token":"fixture-access"}),
+                None,
+            )
+            .await
+            .unwrap();
+        let service = QuotaService::new(reqwest::Client::new(), store.clone());
+        let snapshot = QuotaSnapshot {
+            account_id: account.id.clone(),
+            provider: SubscriptionProvider::Claude,
+            windows: parse_claude(
+                &json!({"seven_day":{"utilization":1,"resets_at":"2030-10-05T18:34:26Z"},
+                    "limits":[{"kind":"weekly_scoped","percent":0,"resets_at":"2030-10-05T18:34:26Z",
+                        "scope":{"model":{"display_name":"Fable"}}}]}),
+                observed(),
+            ),
+            updated_at: now(),
+            error: None,
+            subscription: None,
+            credits: Vec::new(),
+            verification_required: false,
+            verification_available: false,
+        };
+        store
+            .mark_cooldown(&account.id, 86_400, "upstream quota exceeded")
+            .await
+            .unwrap();
+        let before = store.get(&account.id).await.unwrap();
+        service
+            .apply_observation(&account.id, &snapshot, None, &before.updated_at)
+            .await
+            .unwrap();
+        let recovered = store.get(&account.id).await.unwrap();
+        assert_eq!(recovered.summary().status, "ready");
+        assert!(recovered.cooldown_until.is_none());
+        assert!(recovered.last_error.is_none());
+        assert!(recovered.serves("claude-fable-5-2"));
+
+        // A family-specific limit stays scoped to that family when the
+        // account-wide cooldown is superseded by fresh global quota.
+        let mut scoped = snapshot.clone();
+        scoped.windows[1].remaining_percent = Some(0.0);
+        store
+            .mark_cooldown(&account.id, 86_400, "upstream quota exceeded")
+            .await
+            .unwrap();
+        let before = store.get(&account.id).await.unwrap();
+        service
+            .apply_observation(&account.id, &scoped, None, &before.updated_at)
+            .await
+            .unwrap();
+        let recovered = store.get(&account.id).await.unwrap();
+        assert_eq!(recovered.summary().status, "ready");
+        assert!(!recovered.serves("claude-fable-5-2"));
+        assert!(recovered.serves("claude-opus-5-5"));
+
+        for case in [
+            "empty",
+            "unknown",
+            "missing",
+            "retry-after",
+            "newer-refusal",
+        ] {
+            let mut control = snapshot.clone();
+            match case {
+                "empty" => control.windows[0].remaining_percent = Some(0.0),
+                "unknown" => control.windows[0].remaining_percent = None,
+                "missing" => {
+                    control.windows.remove(0);
+                }
+                _ => (),
+            };
+            let previous = store.get(&account.id).await.unwrap();
+            store
+                .cooldown_with_retry_after(
+                    &account.id,
+                    86_400,
+                    "upstream quota exceeded",
+                    case == "retry-after",
+                )
+                .await
+                .unwrap();
+            let cooling = store.get(&account.id).await.unwrap();
+            let version = if case == "newer-refusal" {
+                assert_ne!(previous.updated_at, cooling.updated_at);
+                &previous.updated_at
+            } else {
+                &cooling.updated_at
+            };
+            service
+                .apply_observation(&account.id, &control, None, version)
+                .await
+                .unwrap();
+            let after = store.get(&account.id).await.unwrap();
+            assert_eq!(after.cooldown_until, cooling.cooldown_until, "{case}");
+            assert_eq!(after.last_error, cooling.last_error, "{case}");
+        }
     }
 
     #[tokio::test]

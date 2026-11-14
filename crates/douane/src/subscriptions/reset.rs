@@ -639,7 +639,13 @@ fn parse_claude(value: &Value) -> Result<Reading, ResetError> {
         let label = row
             .get("label")
             .and_then(Value::as_str)
-            .map(|label| label.chars().filter(|c| !c.is_control()).take(120).collect::<String>())
+            .map(|label| {
+                label
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(120)
+                    .collect::<String>()
+            })
             .filter(|label| !label.is_empty());
         credits.push(Credit {
             id: id.into(),
@@ -904,8 +910,10 @@ mod tests {
         let backend = Arc::new(Backend::default());
         let (_directory, accounts, oauth, manager, id, task) =
             fixture(backend.clone(), SubscriptionProvider::Codex).await;
-        let (first, repeated) =
-            tokio::join!(manager.redeem(&id, REQUEST, None), manager.redeem(&id, REQUEST, None));
+        let (first, repeated) = tokio::join!(
+            manager.redeem(&id, REQUEST, None),
+            manager.redeem(&id, REQUEST, None)
+        );
         assert_eq!(first.unwrap().outcome, ResetOutcome::Reset);
         assert_eq!(repeated.unwrap().outcome, ResetOutcome::Reset);
         let mut restored = ResetManager::new(accounts.clone(), oauth).unwrap();
@@ -1045,11 +1053,22 @@ mod tests {
         assert_eq!(reading.count, 5);
         assert_eq!(next_credit(&reading, None).unwrap().id, "week");
         let account = next_credit(&reading, Some(ResetScope::Account)).unwrap();
-        assert_eq!((account.id.as_str(), account.label.as_deref()), ("week", Some("One full limit reset")));
+        assert_eq!(
+            (account.id.as_str(), account.label.as_deref()),
+            ("week", Some("One full limit reset"))
+        );
         let model = next_credit(&reading, Some(ResetScope::Model)).unwrap();
-        assert_eq!((model.id.as_str(), model.label.as_deref()), ("fable", Some("One Fable reset")));
+        assert_eq!(
+            (model.id.as_str(), model.label.as_deref()),
+            ("fable", Some("One Fable reset"))
+        );
         let of = |scope| -> u64 {
-            reading.credits.iter().filter(|c| c.scope == scope).map(|c| c.count).sum()
+            reading
+                .credits
+                .iter()
+                .filter(|c| c.scope == scope)
+                .map(|c| c.count)
+                .sum()
         };
         assert_eq!((of(ResetScope::Account), of(ResetScope::Model)), (2, 3));
     }

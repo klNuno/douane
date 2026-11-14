@@ -156,10 +156,15 @@ async fn reserve_patch_sets_validates_and_clears_the_floor() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(body["account"]["reserve_windows"], json!(["five-hour", "weekly"]));
+    assert_eq!(
+        body["account"]["reserve_windows"],
+        json!(["five-hour", "weekly"])
+    );
     let response = app
         .clone()
-        .oneshot(patch(json!({"reserve_windows":["hourly"],"reserve_percent":7})))
+        .oneshot(patch(
+            json!({"reserve_windows":["hourly"],"reserve_percent":7}),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);

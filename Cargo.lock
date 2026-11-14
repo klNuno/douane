@@ -324,6 +324,7 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
+ "httpdate",
  "include_dir",
  "rand 0.9.5",
  "reqwest",

@@ -16,9 +16,7 @@ pub use quota::{
     QuotaCredits, QuotaService, QuotaSnapshot, QuotaWindow, RESERVE_WINDOWS, reserve_kind,
 };
 pub(crate) use quota::{window_seconds, write_private};
-pub use reset::{
-    ResetError, ResetManager, ResetOutcome, ResetRedemption, ResetScope, ResetStatus,
-};
+pub use reset::{ResetError, ResetManager, ResetOutcome, ResetRedemption, ResetScope, ResetStatus};
 pub use store::{
     AccountCredential, AccountStore, AccountSummary, EndpointPatch, SubscriptionProvider,
     SubscriptionTier, reserve_windows, valid_base_url, valid_dialect, valid_reserve, valid_route,

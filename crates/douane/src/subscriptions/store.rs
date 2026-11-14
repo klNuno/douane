@@ -217,6 +217,10 @@ pub struct AccountCredential {
     pub(crate) last_error: Option<String>,
     #[serde(default)]
     pub(crate) cooldown_until: Option<String>,
+    /// An explicit provider retry delay survives a successful usage read.
+    /// Older records have no provenance and are revalidated from fresh quotas.
+    #[serde(default)]
+    pub(crate) cooldown_retry_after: bool,
     #[serde(default)]
     pub(crate) exhausted_until: Option<String>,
     #[serde(default)]
@@ -386,6 +390,7 @@ impl AccountCredential {
     /// login.
     pub(crate) fn resting(&self) -> bool {
         self.summary().status == "cooldown"
+            && !self.cooldown_retry_after
             && !self.last_error.as_deref().is_some_and(|reason| {
                 reason.contains("authentication") || reason.contains("quota exceeded")
             })
@@ -590,6 +595,7 @@ impl AccountStore {
             .map_err(|_| SubscriptionError::InvalidImport("invalid account record"))?;
         check_record(&account)?;
         account.cooldown_until = None;
+        account.cooldown_retry_after = false;
         account.last_error = None;
         let mut accounts = self.accounts.write().await;
         let previous = accounts
@@ -770,6 +776,7 @@ impl AccountStore {
             account.access_token = key;
             account.last_error = None;
             account.cooldown_until = None;
+            account.cooldown_retry_after = false;
         }
         if account.route.is_some() && account.base_url.is_none() {
             return Err(SubscriptionError::InvalidEndpoint(
@@ -869,6 +876,17 @@ impl AccountStore {
         account.name = previous.name.clone();
         account.reserve_percent = previous.reserve_percent;
         account.reserve_windows = previous.reserve_windows.clone();
+        if previous.cooldown_retry_after
+            && previous
+                .cooldown_until
+                .as_deref()
+                .and_then(parse_timestamp)
+                .is_some_and(|until| until > time::OffsetDateTime::now_utc())
+        {
+            account.cooldown_until = previous.cooldown_until.clone();
+            account.cooldown_retry_after = true;
+            account.last_error = previous.last_error.clone();
+        }
         if account.provider != SubscriptionProvider::Meta {
             account.plan = previous.plan.clone().or(account.plan);
             account.subscription = previous.subscription.clone().or(account.subscription);
@@ -887,11 +905,31 @@ impl AccountStore {
         seconds: u64,
         error: &'static str,
     ) -> Result<AccountSummary, SubscriptionError> {
+        self.cooldown_with_retry_after(id, seconds, error, false)
+            .await
+    }
+
+    pub(crate) async fn cooldown_with_retry_after(
+        &self,
+        id: &str,
+        seconds: u64,
+        error: &'static str,
+        retry_after: bool,
+    ) -> Result<AccountSummary, SubscriptionError> {
         self.modify(id, |account| {
+            let seconds = if retry_after {
+                seconds
+            } else {
+                seconds.min(86_400)
+            };
             account.cooldown_until = Some(timestamp(
                 time::OffsetDateTime::now_utc()
-                    + time::Duration::seconds(seconds.min(86_400) as i64),
+                    .checked_add(time::Duration::seconds(
+                        i64::try_from(seconds).unwrap_or(i64::MAX),
+                    ))
+                    .unwrap_or(time::PrimitiveDateTime::MAX.assume_utc()),
             ));
+            account.cooldown_retry_after = retry_after;
             account.last_error = Some(error.into());
         })
         .await
@@ -925,6 +963,7 @@ impl AccountStore {
         let mut account = current.clone();
         account.last_error = None;
         account.cooldown_until = None;
+        account.cooldown_retry_after = false;
         account.updated_at = now();
         if self.persist(&account).is_ok() {
             accounts.insert(id.into(), account);
@@ -1397,6 +1436,7 @@ fn parse_import(
         updated_at: created,
         last_error: None,
         cooldown_until: None,
+        cooldown_retry_after: false,
         exhausted_until: None,
         exhausted_without_reset: false,
         client_id: text(&value, &["client_id"]).or_else(|| text(token, &["client_id"])),
@@ -1829,6 +1869,32 @@ mod tests {
                 .await
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_retry_after_survives_restart_without_the_inferred_delay_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AccountStore::open(directory.path()).unwrap();
+        let account = store
+            .import(json!({"type":"codex","access_token":"fixture"}), None)
+            .await
+            .unwrap();
+        let before = time::OffsetDateTime::now_utc();
+        store
+            .cooldown_with_retry_after(&account.id, 172_800, "upstream rate limit reached", true)
+            .await
+            .unwrap();
+        let reopened = AccountStore::open(directory.path()).unwrap();
+        let cooling = reopened.get(&account.id).await.unwrap();
+        let until = parse_timestamp(cooling.cooldown_until.as_deref().unwrap()).unwrap();
+        assert!(until >= before + time::Duration::days(2));
+        assert!(!cooling.resting());
+        assert!(
+            reopened
+                .eligible(SubscriptionProvider::Codex, None)
+                .await
+                .is_empty()
         );
     }
 
