@@ -3,6 +3,7 @@
 //! Credentials are persisted locally, while public account responses use an
 //! explicit allowlist. Provider failures never copy response bodies into errors.
 
+pub(crate) mod cooldown;
 mod google;
 pub(crate) mod meta;
 mod oauth;

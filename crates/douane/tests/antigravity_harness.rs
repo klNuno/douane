@@ -19,6 +19,7 @@ struct Mock {
     force_stream: AtomicBool,
     empty_stream_sentinels: AtomicBool,
     refusal_status: AtomicU16,
+    refusal_details: Mutex<Vec<Value>>,
 }
 
 struct Fixture {
@@ -63,7 +64,7 @@ async fn native(
         return (
             status,
             [("retry-after", "7")],
-            Json(json!({"error":{"status":"RESOURCE_EXHAUSTED","message":"synthetic limit"}})),
+            Json(json!({"error":{"status":"RESOURCE_EXHAUSTED","message":"synthetic limit","details":mock.refusal_details.lock().unwrap().clone()}})),
         )
             .into_response();
     }
@@ -88,7 +89,7 @@ async fn native_stream(
         return (
             status,
             [("retry-after", "7")],
-            Json(json!({"error":{"status":"RESOURCE_EXHAUSTED","message":"synthetic limit"}})),
+            Json(json!({"error":{"status":"RESOURCE_EXHAUSTED","message":"synthetic limit","details":mock.refusal_details.lock().unwrap().clone()}})),
         )
             .into_response();
     }
@@ -1149,6 +1150,41 @@ async fn replay_owner_waits_through_rate_limits_without_switching_accounts() {
             assert_eq!(alternate.received.lock().unwrap().len(), 1);
             task.abort();
         }
+    }
+}
+
+#[tokio::test]
+async fn replay_owner_keeps_scoped_retry_delays_without_another_upstream_call() {
+    let fixture = Fixture::new("antigravity", vec![reply(1)]).await;
+    let kind = "chat/completions";
+    let (status, body) = fixture
+        .post(
+            kind,
+            request(kind, &[], "antigravity"),
+            Some("scoped-owner"),
+            false,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let id = call_id(kind, &body, false);
+    *fixture.mock.refusal_details.lock().unwrap() =
+        vec![json!({"reason":"QUOTA_EXHAUSTED","metadata":{"model":"synthetic-thinking"}})];
+    fixture.mock.refusal_status.store(429, Ordering::Relaxed);
+    for attempt in 0..3 {
+        let response = fixture
+            .client
+            .post(format!("{}/v1/{kind}", fixture.url))
+            .header("x-opencode-session-id", "scoped-owner")
+            .json(&request(kind, std::slice::from_ref(&id), "antigravity"))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let retry = response.headers().get("retry-after").cloned();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, 429, "attempt={attempt}: {body}");
+        assert!(retry.unwrap().to_str().unwrap().parse::<u64>().unwrap() > 0);
+        assert_eq!(fixture.mock.received.lock().unwrap().len(), 2);
     }
 }
 

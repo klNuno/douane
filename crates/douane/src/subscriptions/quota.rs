@@ -2624,6 +2624,31 @@ mod tests {
         assert!(!recovered.serves("claude-fable-5-2"));
         assert!(recovered.serves("claude-opus-5-5"));
 
+        store
+            .scoped_cooldown(
+                &account.id,
+                super::super::cooldown::QuotaScope::Family("fable".into()),
+                172_800,
+                true,
+            )
+            .await
+            .unwrap();
+        let before = store.get(&account.id).await.unwrap();
+        // A successful quota read may clear inferred global cooldowns, but
+        // cannot shorten an explicit refusal for this model family.
+        service
+            .apply_observation(&account.id, &snapshot, None, &before.updated_at)
+            .await
+            .unwrap();
+        let after = store.get(&account.id).await.unwrap();
+        assert_eq!(after.summary().status, "ready");
+        assert_eq!(
+            after.scoped_cooldowns[0].until,
+            before.scoped_cooldowns[0].until
+        );
+        assert!(!after.serves("claude-fable-5-2"));
+        assert!(after.serves("claude-opus-5-5"));
+
         for case in [
             "empty",
             "unknown",
