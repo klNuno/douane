@@ -545,7 +545,7 @@ async fn two_signed_tool_cycles_survive_every_client_dialect_and_transport() {
                     received[0]["request"]["systemInstruction"]["parts"][0]["text"]
                         .as_str()
                         .unwrap()
-                        .contains("C\u{200b}odex")
+                        .contains("You are Codex-CLI, an agent")
                 );
                 assert!(
                     !received[0]["request"]["systemInstruction"]["parts"][0]["text"]
