@@ -221,6 +221,8 @@ pub struct AccountCredential {
     /// Older records have no provenance and are revalidated from fresh quotas.
     #[serde(default)]
     pub(crate) cooldown_retry_after: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) scoped_cooldowns: Vec<super::cooldown::ScopedCooldown>,
     #[serde(default)]
     pub(crate) exhausted_until: Option<String>,
     #[serde(default)]
@@ -375,6 +377,13 @@ impl AccountCredential {
     /// Whether this account lists `model` and no exhausted window of its
     /// family holds it back.
     pub(crate) fn serves(&self, model: &str) -> bool {
+        self.supports_model(model)
+            && !self.scoped_cooldowns.iter().any(|cooldown| {
+                cooldown.scope.applies(model) && cooldown.active(time::OffsetDateTime::now_utc())
+            })
+    }
+
+    fn supports_model(&self, model: &str) -> bool {
         (self.models.is_empty() || self.models.iter().any(|m| m == model))
             && !self.model_exhaustion.iter().any(|(family, reset)| {
                 model.contains(family)
@@ -383,6 +392,22 @@ impl AccountCredential {
                         .and_then(parse_timestamp)
                         .is_none_or(|t| t > time::OffsetDateTime::now_utc())
             })
+    }
+
+    /// A replay owner reaches the relay only to receive its longest applicable
+    /// delay locally, without sending the signed conversation upstream again.
+    pub(crate) fn retry_at(&self, model: &str) -> Option<time::OffsetDateTime> {
+        self.cooldown_until
+            .as_deref()
+            .and_then(parse_timestamp)
+            .into_iter()
+            .chain(
+                self.scoped_cooldowns
+                    .iter()
+                    .filter(|cooldown| cooldown.scope.applies(model))
+                    .filter_map(|cooldown| parse_timestamp(&cooldown.until)),
+            )
+            .max()
     }
 
     /// Cooling down after a refusal that may already be over (a rate limit,
@@ -597,6 +622,7 @@ impl AccountStore {
         account.cooldown_until = None;
         account.cooldown_retry_after = false;
         account.last_error = None;
+        account.scoped_cooldowns.clear();
         let mut accounts = self.accounts.write().await;
         let previous = accounts
             .get(&account.id)
@@ -819,7 +845,7 @@ impl AccountStore {
         model: Option<&str>,
         owner: Option<&str>,
     ) -> Vec<AccountCredential> {
-        self.pool(provider, route, model, |account| {
+        self.pool(provider, route, model, owner, |account| {
             matches!(account.summary().status.as_str(), "ready" | "error")
                 || (owner == Some(account.id.as_str()) && account.summary().status == "cooldown")
         })
@@ -836,7 +862,7 @@ impl AccountStore {
         model: Option<&str>,
     ) -> Vec<AccountCredential> {
         let mut resting = self
-            .pool(provider, route, model, AccountCredential::resting)
+            .pool(provider, route, model, None, AccountCredential::resting)
             .await;
         resting.sort_by(|a, b| a.cooldown_until.cmp(&b.cooldown_until));
         resting
@@ -847,6 +873,7 @@ impl AccountStore {
         provider: SubscriptionProvider,
         route: Option<&str>,
         model: Option<&str>,
+        owner: Option<&str>,
         status: impl Fn(&AccountCredential) -> bool,
     ) -> Vec<AccountCredential> {
         self.accounts
@@ -857,7 +884,10 @@ impl AccountStore {
                 account.provider == provider
                     && account.route.as_deref() == route
                     && status(account)
-                    && model.is_none_or(|model| account.serves(model))
+                    && model.is_none_or(|model| {
+                        account.serves(model)
+                            || (owner == Some(account.id.as_str()) && account.supports_model(model))
+                    })
             })
             .cloned()
             .collect()
@@ -876,6 +906,7 @@ impl AccountStore {
         account.name = previous.name.clone();
         account.reserve_percent = previous.reserve_percent;
         account.reserve_windows = previous.reserve_windows.clone();
+        account.scoped_cooldowns = previous.scoped_cooldowns.clone();
         if previous.cooldown_retry_after
             && previous
                 .cooldown_until
@@ -931,6 +962,48 @@ impl AccountStore {
             ));
             account.cooldown_retry_after = retry_after;
             account.last_error = Some(error.into());
+        })
+        .await
+    }
+
+    pub(crate) async fn scoped_cooldown(
+        &self,
+        id: &str,
+        scope: super::cooldown::QuotaScope,
+        seconds: u64,
+        retry_after: bool,
+    ) -> Result<AccountSummary, SubscriptionError> {
+        self.modify(id, |account| {
+            let current = time::OffsetDateTime::now_utc();
+            let seconds = if retry_after {
+                seconds
+            } else {
+                seconds.min(86_400)
+            };
+            let until = current
+                .checked_add(time::Duration::seconds(
+                    i64::try_from(seconds).unwrap_or(i64::MAX),
+                ))
+                .unwrap_or(time::PrimitiveDateTime::MAX.assume_utc());
+            account.scoped_cooldowns.retain(|c| c.active(current));
+            if let Some(existing) = account
+                .scoped_cooldowns
+                .iter_mut()
+                .find(|c| c.scope == scope)
+            {
+                if parse_timestamp(&existing.until).is_none_or(|previous| previous < until) {
+                    existing.until = timestamp(until);
+                }
+                existing.retry_after |= retry_after;
+            } else {
+                account
+                    .scoped_cooldowns
+                    .push(super::cooldown::ScopedCooldown {
+                        scope,
+                        until: timestamp(until),
+                        retry_after,
+                    });
+            }
         })
         .await
     }
@@ -1437,6 +1510,7 @@ fn parse_import(
         last_error: None,
         cooldown_until: None,
         cooldown_retry_after: false,
+        scoped_cooldowns: Vec::new(),
         exhausted_until: None,
         exhausted_without_reset: false,
         client_id: text(&value, &["client_id"]).or_else(|| text(token, &["client_id"])),
@@ -1896,6 +1970,69 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn scoped_retry_delays_survive_renewal_and_coexist_with_global_limits() {
+        use super::super::cooldown::QuotaScope;
+        let directory = tempfile::tempdir().unwrap();
+        let store = AccountStore::open(directory.path()).unwrap();
+        let account = store
+            .import(json!({"type":"claude","access_token":"fixture"}), None)
+            .await
+            .unwrap();
+        let original = store.get(&account.id).await.unwrap();
+        store
+            .scoped_cooldown(
+                &account.id,
+                QuotaScope::Family("fable".into()),
+                172_800,
+                true,
+            )
+            .await
+            .unwrap();
+        store
+            .scoped_cooldown(&account.id, QuotaScope::Family("sonnet".into()), 300, true)
+            .await
+            .unwrap();
+        let before = store.get(&account.id).await.unwrap();
+        store
+            .scoped_cooldown(&account.id, QuotaScope::Family("fable".into()), 10, false)
+            .await
+            .unwrap();
+        store.update_credential(original).await.unwrap();
+        let refreshed = store.get(&account.id).await.unwrap();
+        assert_eq!(refreshed.scoped_cooldowns.len(), 2);
+        assert_eq!(
+            refreshed.scoped_cooldowns[0].until,
+            before.scoped_cooldowns[0].until
+        );
+        assert!(
+            parse_timestamp(&refreshed.scoped_cooldowns[0].until).unwrap()
+                > time::OffsetDateTime::now_utc() + time::Duration::hours(47)
+        );
+        assert!(!refreshed.serves("claude-fable-5-1"));
+        assert!(!refreshed.serves("claude-sonnet-5-5"));
+        assert!(refreshed.serves("claude-opus-5-5"));
+        store
+            .cooldown_with_retry_after(&account.id, 600, "upstream rate limit reached", true)
+            .await
+            .unwrap();
+        let restarted = AccountStore::open(directory.path()).unwrap();
+        assert!(
+            restarted
+                .eligible(SubscriptionProvider::Claude, Some("claude-opus-5-5"))
+                .await
+                .is_empty()
+        );
+        let mut cooling = restarted.get(&account.id).await.unwrap();
+        assert_eq!(cooling.scoped_cooldowns.len(), 2);
+        cooling.scoped_cooldowns[0].until = "2000-01-01T00:00:00Z".into();
+        assert!(
+            cooling.serves("claude-fable-5-2"),
+            "only the expired scoped delay clears"
+        );
+        assert!(!cooling.serves("claude-sonnet-5-5"));
     }
 
     #[tokio::test]
