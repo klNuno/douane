@@ -564,11 +564,7 @@ pub async fn forward(
     let mut last_reason: Option<String> = None;
     for candidate in candidates {
         if owner.is_some() {
-            if let Some(until) = candidate
-                .cooldown_until
-                .as_deref()
-                .and_then(crate::subscriptions::parse_timestamp)
-            {
+            if let Some(until) = candidate.retry_at(&model) {
                 let remaining = until - time::OffsetDateTime::now_utc();
                 if remaining.is_positive() {
                     return replay_rate_limit(remaining.whole_seconds() as u64 + 1);
@@ -913,6 +909,11 @@ pub async fn forward(
             let advised = cooldown_seconds(response.headers(), unix_now());
             let retry_after = retry_after_seconds(response.headers(), unix_now()).is_some();
             let exhausted = window_exhausted(response.headers());
+            let claude_scope = crate::subscriptions::cooldown::claude_scope(
+                account.provider,
+                &model,
+                response.headers(),
+            );
             // Copilot refuses a request it cannot serve with 400; the account
             // is fine, and a model its plan lacks leaves the list.
             if account.provider == SubscriptionProvider::Copilot
@@ -966,11 +967,12 @@ pub async fn forward(
             // Google keeps only its enum reason (its free text can name the
             // project); every other refusal is read once, for the ledger and,
             // on a native request, for the client.
-            let (body, refusal) = if to == Dialect::Gemini && !native {
+            let (body, refusal) = if to == Dialect::Gemini {
                 let body = read_bounded(response, 64 * 1024, idle)
                     .await
                     .unwrap_or_default();
-                (None, google_refusal(&body))
+                let refusal = google_refusal(&body, &model);
+                (native.then_some(body), refusal)
             } else {
                 (read_bounded(response, 256 * 1024, idle).await.ok(), None)
             };
@@ -1016,17 +1018,29 @@ pub async fn forward(
             );
             if last_status == StatusCode::TOO_MANY_REQUESTS || last_status.is_server_error() {
                 let wait = advised
-                    .or_else(|| refusal.as_ref().and_then(|r| r.retry_seconds))
+                    .max(refusal.as_ref().and_then(|r| r.retry_seconds))
                     .unwrap_or(30);
                 let reason = cooldown_reason(
                     last_status,
                     exhausted,
                     refusal.as_ref().map(|r| r.reason.as_str()),
                 );
-                let _ = state
-                    .accounts
-                    .cooldown_with_retry_after(&account.id, wait, reason, retry_after)
-                    .await;
+                let scope = claude_scope.or_else(|| refusal.as_ref().and_then(|r| r.scope.clone()));
+                let retry_after =
+                    retry_after || refusal.as_ref().is_some_and(|r| r.retry_seconds.is_some());
+                if last_status == StatusCode::TOO_MANY_REQUESTS
+                    && let Some(scope) = scope
+                {
+                    let _ = state
+                        .accounts
+                        .scoped_cooldown(&account.id, scope, wait, retry_after)
+                        .await;
+                } else {
+                    let _ = state
+                        .accounts
+                        .cooldown_with_retry_after(&account.id, wait, reason, retry_after)
+                        .await;
+                }
                 if owner.is_some() && last_status == StatusCode::TOO_MANY_REQUESTS {
                     return replay_rate_limit(wait);
                 }
@@ -1260,9 +1274,10 @@ struct GoogleRefusal {
     reason: String,
     /// The delay Google advises (`RetryInfo.retryDelay` or `quotaResetDelay`).
     retry_seconds: Option<u64>,
+    scope: Option<crate::subscriptions::cooldown::QuotaScope>,
 }
 
-fn google_refusal(body: &[u8]) -> Option<GoogleRefusal> {
+fn google_refusal(body: &[u8], model: &str) -> Option<GoogleRefusal> {
     let value: Value = serde_json::from_slice(body).ok()?;
     let error = value.get("error")?;
     let token = |v: &Value| {
@@ -1284,18 +1299,17 @@ fn google_refusal(body: &[u8]) -> Option<GoogleRefusal> {
     if parts.is_empty() {
         return None;
     }
-    let retry_seconds = details.iter().find_map(|d| {
-        d["retryDelay"]
-            .as_str()
-            .or_else(|| {
-                d.pointer("/metadata/quotaResetDelay")
-                    .and_then(Value::as_str)
-            })
-            .and_then(google_duration)
-    });
+    let retry_seconds = details
+        .iter()
+        .flat_map(|d| [d.get("retryDelay"), d.pointer("/metadata/quotaResetDelay")])
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(google_duration)
+        .max();
     Some(GoogleRefusal {
         reason: parts.join("/"),
         retry_seconds,
+        scope: crate::subscriptions::cooldown::google_scope(error, model),
     })
 }
 
@@ -2206,7 +2220,7 @@ mod tests {
         let body = br#"{"error":{"code":429,"message":"No capacity on project secret-project-42 for you@example.com","status":"RESOURCE_EXHAUSTED",
             "details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"MODEL_CAPACITY_EXHAUSTED","domain":"cloudcode-pa.googleapis.com","metadata":{"model":"gemini-3.8-flash-high"}},
             {"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2.5s"}]}}"#;
-        let refusal = super::google_refusal(body).unwrap();
+        let refusal = super::google_refusal(body, "gemini-3.8-flash-high").unwrap();
         assert_eq!(
             refusal.reason,
             "RESOURCE_EXHAUSTED/MODEL_CAPACITY_EXHAUSTED"
@@ -2214,14 +2228,42 @@ mod tests {
         assert_eq!(refusal.retry_seconds, Some(3));
         let quota = br#"{"error":{"status":"RESOURCE_EXHAUSTED","details":[{"reason":"QUOTA_EXHAUSTED","metadata":{"quotaResetDelay":"1h2m3.4s"}}]}}"#;
         assert_eq!(
-            super::google_refusal(quota).unwrap().retry_seconds,
+            super::google_refusal(quota, "gemini-3.8-flash-high")
+                .unwrap()
+                .retry_seconds,
             Some(3724)
         );
         assert_eq!(super::google_duration("750ms"), Some(1));
         assert_eq!(super::google_duration("soon"), None);
         let free_text = br#"{"error":{"status":"Project secret-project-42 is blocked"}}"#;
-        assert_eq!(super::google_refusal(free_text), None);
-        assert_eq!(super::google_refusal(b"not json"), None);
+        assert_eq!(
+            super::google_refusal(free_text, "gemini-3.8-flash-high"),
+            None
+        );
+        assert_eq!(
+            super::google_refusal(b"not json", "gemini-3.8-flash-high"),
+            None
+        );
+    }
+
+    #[test]
+    fn google_refusal_keeps_the_longest_explicit_delay_in_any_order() {
+        let details = [
+            json!({"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"60s"}),
+            json!({"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED","metadata":{"model":"gemini-4-argon","quotaResetDelay":"172800s"}}),
+        ];
+        for details in [json!(details), json!([details[1], details[0]])] {
+            let body = serde_json::to_vec(
+                &json!({"error":{"status":"RESOURCE_EXHAUSTED","details":details}}),
+            )
+            .unwrap();
+            assert_eq!(
+                super::google_refusal(&body, "gemini-4-argon")
+                    .unwrap()
+                    .retry_seconds,
+                Some(172800)
+            );
+        }
     }
 
     #[tokio::test]
