@@ -64,7 +64,7 @@ pub struct OAuthManager {
     store: Arc<AccountStore>,
     pending: Mutex<BTreeMap<String, Pending>>,
     codex_token_url: String,
-    claude_token_url: String,
+    pub(crate) claude_token_url: String,
     google: GoogleOAuth,
     /// Refresh tokens a provider has revoked, by account. Asking again gets the
     /// same answer and only looks like abuse on the account; a reconnect

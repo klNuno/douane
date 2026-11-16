@@ -1,3 +1,4 @@
+use super::cooldown::QuotaScope;
 use super::oauth::send_json;
 use super::store::{subscription_from_value, text};
 use super::{
@@ -224,6 +225,69 @@ impl QuotaSnapshot {
                     .is_some_and(|value| value.is_finite())
         })
     }
+
+    /// A full reset of the exhausted window that supplied this deadline
+    /// supersedes its refusal. Positive quota alone cannot revoke Retry-After.
+    fn confirms_claude_reset(
+        &self,
+        previous: Option<&Self>,
+        until: &str,
+        scope: Option<&QuotaScope>,
+    ) -> bool {
+        let Some(previous) = previous else {
+            return false;
+        };
+        let Some(deadline) = parse_timestamp(until) else {
+            return false;
+        };
+        if self.provider != SubscriptionProvider::Claude
+            || previous.provider != self.provider
+            || previous.account_id != self.account_id
+            || self.error.is_some()
+            || !parse_timestamp(&previous.updated_at)
+                .zip(parse_timestamp(&self.updated_at))
+                .is_some_and(|(before, after)| before < after)
+        {
+            return false;
+        }
+        let applies = |id: &str| match scope {
+            None => is_global(id),
+            Some(QuotaScope::Family(family)) => id == format!("seven-day-{family}"),
+            Some(QuotaScope::Model(model)) => id == format!("seven-day-{model}"),
+        };
+        if scope.is_none()
+            && (self
+                .windows
+                .iter()
+                .filter(|w| is_global(&w.id))
+                .any(|w| !w.remaining_percent.is_some_and(|left| left > 0.0))
+                || previous
+                    .windows
+                    .iter()
+                    .filter(|w| is_global(&w.id))
+                    .any(|old| {
+                        !self.windows.iter().any(|w| {
+                            w.id == old.id && w.remaining_percent.is_some_and(|left| left > 0.0)
+                        })
+                    }))
+        {
+            return false;
+        }
+        previous.windows.iter().any(|old| {
+            applies(&old.id)
+                && old.remaining_percent == Some(0.0)
+                && old
+                    .reset_at
+                    .as_deref()
+                    .and_then(parse_timestamp)
+                    .is_some_and(|reset| (reset - deadline).abs() < time::Duration::seconds(2))
+                && self.windows.iter().any(|new| {
+                    new.id == old.id
+                        && new.remaining_percent == Some(100.0)
+                        && new.reset_at.as_deref().and_then(parse_timestamp).is_some()
+                })
+        })
+    }
 }
 
 /// Who asked for a quota read. A read asked by hand reports its failure at
@@ -263,6 +327,8 @@ pub struct QuotaService {
     failures: RwLock<BTreeMap<String, Failures>>,
     /// GitHub's Copilot entitlement endpoint; tests point it at a loopback.
     pub(crate) copilot_user_url: String,
+    /// Claude's OAuth API base; tests use a loopback for usage and profile.
+    pub(crate) claude_api: String,
 }
 
 impl QuotaService {
@@ -286,6 +352,7 @@ impl QuotaService {
             verification_urls: RwLock::new(BTreeMap::new()),
             failures: RwLock::new(BTreeMap::new()),
             copilot_user_url: "https://api.github.com/copilot_internal/user".into(),
+            claude_api: "https://api.anthropic.com".into(),
         }
     }
 
@@ -578,11 +645,19 @@ impl QuotaService {
         if !account.provider.reports_quota() {
             return Err(SubscriptionError::Unsupported);
         }
-        let result = match self.oauth.credential(id).await {
-            Ok(credential) => self.fetch(&credential).await,
-            Err(error) => Err(error),
-        };
-        self.complete_refresh(id, &account, result, trigger).await
+        match self.oauth.credential(id).await {
+            Ok(credential) => {
+                let result = self.fetch(&credential).await;
+                // Renewal may update the account before the usage read.
+                // Only a change during that read makes its version stale.
+                self.complete_refresh(id, &credential, result, trigger)
+                    .await
+            }
+            Err(error) => {
+                self.complete_refresh(id, &account, Err(error), trigger)
+                    .await
+            }
+        }
     }
 
     async fn complete_refresh(
@@ -712,7 +787,7 @@ impl QuotaService {
             SubscriptionProvider::Claude => {
                 let value = send_json(
                     self.client
-                        .get("https://api.anthropic.com/api/oauth/usage")
+                        .get(format!("{}/api/oauth/usage", self.claude_api))
                         .bearer_auth(&account.access_token)
                         .header("anthropic-beta", "oauth-2025-04-20")
                         .header("User-Agent", crate::relay::CLAUDE_USER_AGENT),
@@ -840,7 +915,7 @@ impl QuotaService {
             SubscriptionProvider::Claude => {
                 if let Ok(profile) = send_json(
                     self.client
-                        .get("https://api.anthropic.com/api/oauth/profile")
+                        .get(format!("{}/api/oauth/profile", self.claude_api))
                         .bearer_auth(&account.access_token)
                         .header("User-Agent", crate::relay::CLAUDE_USER_AGENT)
                         .header("anthropic-beta", "oauth-2025-04-20")
@@ -896,6 +971,11 @@ impl QuotaService {
         plan: Option<String>,
         account_version: &str,
     ) -> Result<(), SubscriptionError> {
+        let previous = if snapshot.provider == SubscriptionProvider::Claude {
+            self.get(id).await
+        } else {
+            None
+        };
         self.store
             .modify(id, |account| {
                 let current = time::OffsetDateTime::now_utc();
@@ -912,17 +992,31 @@ impl QuotaService {
                 // A fresh usage response may authorize another attempt after an
                 // inferred Claude quota refusal. Missing windows promise nothing;
                 // every reported global window must have known quota left. A
-                // real Retry-After, newer refusal, or exhausted window still wins.
+                // real Retry-After still wins unless its exhausted window has
+                // since been fully reset. Newer refusals always win.
                 let revalidated = account.provider == SubscriptionProvider::Claude
                     && !account.cooldown_retry_after
                     && account.last_error.as_deref() == Some("upstream quota exceeded")
                     && snapshot.error.is_none()
                     && global.peek().is_some()
                     && global.all(|w| w.remaining_percent.is_some_and(|left| left > 0.0));
-                if account.updated_at == account_version && (!cooling || revalidated) {
+                let reset = account.last_error.as_deref() == Some("upstream quota exceeded")
+                    && account.cooldown_until.as_deref().is_some_and(|until| {
+                        snapshot.confirms_claude_reset(previous.as_ref(), until, None)
+                    });
+                if account.updated_at == account_version && (!cooling || revalidated || reset) {
                     account.last_error = None;
                     account.cooldown_until = None;
                     account.cooldown_retry_after = false;
+                }
+                if account.updated_at == account_version {
+                    account.scoped_cooldowns.retain(|cooldown| {
+                        !snapshot.confirms_claude_reset(
+                            previous.as_ref(),
+                            &cooldown.until,
+                            Some(&cooldown.scope),
+                        )
+                    });
                 }
                 if let Some(plan) = plan {
                     account.plan = Some(plan);
@@ -2561,6 +2655,247 @@ mod tests {
         );
         assert_eq!(kimi[0].remaining_percent, Some(40.0));
         assert_eq!(kimi[0].reset_at.as_deref(), Some("2026-10-03T12:02:00Z"));
+    }
+
+    #[tokio::test]
+    async fn claude_reset_survives_oauth_renewal() {
+        claude_reset_through_refresh(false).await;
+    }
+
+    #[tokio::test]
+    async fn claude_reset_survives_a_failed_quota_read() {
+        claude_reset_through_refresh(true).await;
+    }
+
+    async fn claude_reset_through_refresh(failed_read: bool) {
+        use axum::{
+            Json, Router,
+            http::HeaderMap,
+            routing::{get, post},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let account = store
+            .import(
+                json!({"type":"claude", "access_token":"expired-fixture",
+            "refresh_token":"fixture-refresh", "expires_at":"2020-01-01T00:00:00Z"}),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .cooldown_with_retry_after(&account.id, 86_400, "upstream quota exceeded", true)
+            .await
+            .unwrap();
+        let account = store.get(&account.id).await.unwrap();
+        let reset = account.cooldown_until.clone().unwrap();
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let count = renewals.clone();
+        let app = Router::new()
+            .route("/token", post(move || { let count = count.clone(); async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Json(json!({"access_token":"renewed-fixture", "refresh_token":"rotated-fixture", "expires_in":3600}))
+            }}))
+            .route("/api/oauth/usage", get(move |headers: HeaderMap| { let reset = reset.clone(); async move {
+                assert_eq!(headers["authorization"], "Bearer renewed-fixture");
+                Json(json!({"seven_day":{"utilization":0, "resets_at":reset}}))
+            }}))
+            .route("/api/oauth/profile", get(|| async { Json(json!({})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let mut oauth = OAuthManager::new(client.clone(), store.clone());
+        oauth.claude_token_url = format!("{base}/token");
+        let mut service = QuotaService::with_oauth(client, store.clone(), Arc::new(oauth));
+        service.claude_api = base;
+        service
+            .insert_for_test(QuotaSnapshot {
+                account_id: account.id.clone(),
+                provider: SubscriptionProvider::Claude,
+                windows: parse_claude(
+                    &json!({"seven_day":{"utilization":100,"resets_at":account.cooldown_until}}),
+                    observed(),
+                ),
+                updated_at: timestamp(time::OffsetDateTime::now_utc() - time::Duration::minutes(1)),
+                error: None,
+                subscription: None,
+                credits: vec![],
+                verification_required: false,
+                verification_available: false,
+            })
+            .await;
+        if failed_read {
+            service
+                .complete_refresh(
+                    &account.id,
+                    &account,
+                    Err(SubscriptionError::Transport),
+                    Trigger::Manual,
+                )
+                .await
+                .unwrap();
+            assert!(service.get(&account.id).await.unwrap().error.is_some());
+        }
+        service.refresh(&account.id).await.unwrap();
+        assert_eq!(renewals.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.get(&account.id).await.unwrap().summary().status,
+            "ready"
+        );
+        service.refresh(&account.id).await.unwrap();
+        assert_eq!(
+            store.get(&account.id).await.unwrap().summary().status,
+            "ready"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn claude_confirmed_reset_releases_only_matching_cooldowns() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let account = store
+            .import(
+                json!({"type":"claude","access_token":"fixture-access"}),
+                None,
+            )
+            .await
+            .unwrap();
+        let service = QuotaService::new(reqwest::Client::new(), store.clone());
+        store
+            .cooldown_with_retry_after(&account.id, 86_400, "upstream quota exceeded", true)
+            .await
+            .unwrap();
+        for family in ["fable", "opus"] {
+            store
+                .scoped_cooldown(
+                    &account.id,
+                    super::super::cooldown::QuotaScope::Family(family.into()),
+                    86_400,
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        let before = store.get(&account.id).await.unwrap();
+        let reset = before.cooldown_until.as_deref().unwrap();
+        let previous = QuotaSnapshot {
+            account_id: account.id.clone(),
+            provider: SubscriptionProvider::Claude,
+            windows: parse_claude(
+                &json!({
+                    "seven_day":{"utilization":100,"resets_at":reset},
+                    "iguana_necktie":{"utilization":100,"resets_at":reset},
+                    "seven_day_opus":{"utilization":50,"resets_at":reset}
+                }),
+                observed(),
+            ),
+            updated_at: timestamp(time::OffsetDateTime::now_utc() - time::Duration::minutes(1)),
+            error: None,
+            subscription: None,
+            credits: Vec::new(),
+            verification_required: false,
+            verification_available: false,
+        };
+        service.insert_for_test(previous.clone()).await;
+        service.save().await;
+        let service = QuotaService::new(reqwest::Client::new(), store.clone());
+        // The reset can be redeemed outside Douane, with the same weekly deadline.
+        let mut recovered = previous.clone();
+        recovered.updated_at = now();
+        for window in &mut recovered.windows {
+            window.used = Some(0.0);
+            window.remaining_percent = Some(100.0);
+        }
+        for case in [
+            "partial",
+            "missing",
+            "deadline",
+            "stale",
+            "error",
+            "provider",
+            "account",
+            "not-exhausted",
+            "other-empty",
+            "newer-refusal",
+        ] {
+            let mut old = service.get(&account.id).await.unwrap();
+            let mut new = recovered.clone();
+            match case {
+                "partial" => new.windows[0].remaining_percent = Some(99.0),
+                "missing" => {
+                    new.windows.remove(0);
+                }
+                "deadline" => {
+                    old.windows[0].reset_at = Some(timestamp(
+                        time::OffsetDateTime::now_utc() + time::Duration::days(2),
+                    ))
+                }
+                "stale" => new.updated_at = old.updated_at.clone(),
+                "error" => new.error = Some("quota read failed".into()),
+                "provider" => new.provider = SubscriptionProvider::Codex,
+                "account" => new.account_id = "another-account".into(),
+                "not-exhausted" => old.windows[0].remaining_percent = Some(1.0),
+                "other-empty" => {
+                    let mut empty = new.windows[0].clone();
+                    empty.id = "five-hour".into();
+                    empty.remaining_percent = Some(0.0);
+                    new.windows.push(empty);
+                }
+                _ => (),
+            }
+            service.insert_for_test(old.clone()).await;
+            let version = store.get(&account.id).await.unwrap().updated_at;
+            service
+                .apply_observation(
+                    &account.id,
+                    &new,
+                    None,
+                    if case == "newer-refusal" {
+                        "old-version"
+                    } else {
+                        &version
+                    },
+                )
+                .await
+                .unwrap();
+            let after = store.get(&account.id).await.unwrap();
+            assert_eq!(after.cooldown_until, before.cooldown_until, "{case}");
+            // Restore the refusal metadata, including scopes that a legitimate
+            // family reset may have cleared while the global limit stayed put.
+            store
+                .modify(&account.id, |a| {
+                    a.cooldown_until = before.cooldown_until.clone();
+                    a.cooldown_retry_after = true;
+                    a.last_error = before.last_error.clone();
+                    a.scoped_cooldowns = before.scoped_cooldowns.clone();
+                })
+                .await
+                .unwrap();
+            service.insert_for_test(previous.clone()).await;
+        }
+        let version = store.get(&account.id).await.unwrap().updated_at;
+        service
+            .apply_observation(&account.id, &recovered, None, &version)
+            .await
+            .unwrap();
+        let reloaded = AccountStore::open(directory.path()).unwrap();
+        let after = reloaded.get(&account.id).await.unwrap();
+        assert!(
+            after.cooldown_until.is_none(),
+            "the confirmed global reset must reopen the account"
+        );
+        assert!(!after.cooldown_retry_after);
+        assert!(after.last_error.is_none());
+        assert!(after.serves("claude-fable-5-2"));
+        assert!(!after.serves("claude-opus-5-5"));
+        assert_eq!(after.scoped_cooldowns.len(), 1);
+        assert_eq!(
+            after.scoped_cooldowns[0].until,
+            before.scoped_cooldowns[1].until
+        );
     }
 
     #[tokio::test]
