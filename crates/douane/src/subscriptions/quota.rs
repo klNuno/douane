@@ -2823,20 +2823,26 @@ mod tests {
         assert_eq!(renewed.refresh_token.as_deref(), Some("rotated-fixture"));
         // A token the provider still refuses after renewal shows the refusal
         // and renews no more than once per read.
-        let app = Router::new()
-            .route(
-                "/token",
-                post(|| async {
-                    Json(json!({"access_token":"still-refused", "expires_in":864000}))
-                }),
-            )
-            .route("/usage", get(|| async { StatusCode::UNAUTHORIZED }));
+        let refusals = Arc::new(AtomicUsize::new(0));
+        let refused_reads = refusals.clone();
+        let app = Router::new().route(
+            "/usage",
+            get(move || {
+                let refused_reads = refused_reads.clone();
+                async move {
+                    refused_reads.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::UNAUTHORIZED
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let refused = format!("http://{}", listener.local_addr().unwrap());
         let second = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         service.codex_usage_url = format!("{refused}/usage");
         let snapshot = service.refresh(&account.id).await.unwrap();
         assert!(snapshot.error.unwrap().contains("HTTP 401"));
+        assert_eq!(renewals.load(Ordering::SeqCst), 2);
+        assert_eq!(refusals.load(Ordering::SeqCst), 2);
         server.abort();
         second.abort();
     }
