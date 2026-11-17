@@ -329,6 +329,8 @@ pub struct QuotaService {
     pub(crate) copilot_user_url: String,
     /// Claude's OAuth API base; tests use a loopback for usage and profile.
     pub(crate) claude_api: String,
+    /// ChatGPT's Codex usage endpoint; tests use a loopback.
+    pub(crate) codex_usage_url: String,
 }
 
 impl QuotaService {
@@ -353,6 +355,7 @@ impl QuotaService {
             failures: RwLock::new(BTreeMap::new()),
             copilot_user_url: "https://api.github.com/copilot_internal/user".into(),
             claude_api: "https://api.anthropic.com".into(),
+            codex_usage_url: "https://chatgpt.com/backend-api/wham/usage".into(),
         }
     }
 
@@ -646,8 +649,21 @@ impl QuotaService {
             return Err(SubscriptionError::Unsupported);
         }
         match self.oauth.credential(id).await {
-            Ok(credential) => {
-                let result = self.fetch(&credential).await;
+            Ok(mut credential) => {
+                let mut result = self.fetch(&credential).await;
+                // A provider can revoke an access token before its expiry
+                // (ChatGPT does for Codex). Renew once, as the relay does.
+                if matches!(result, Err(SubscriptionError::Upstream(401)))
+                    && credential.refresh_token.is_some()
+                {
+                    match self.oauth.force_refresh(id).await {
+                        Ok(fresh) => {
+                            credential = fresh;
+                            result = self.fetch(&credential).await;
+                        }
+                        Err(error) => result = Err(error),
+                    }
+                }
                 // Renewal may update the account before the usage read.
                 // Only a change during that read makes its version stale.
                 self.complete_refresh(id, &credential, result, trigger)
@@ -774,7 +790,7 @@ impl QuotaService {
             SubscriptionProvider::Codex => {
                 let mut request = self
                     .client
-                    .get("https://chatgpt.com/backend-api/wham/usage")
+                    .get(&self.codex_usage_url)
                     .bearer_auth(&account.access_token)
                     .header("User-Agent", crate::relay::CODEX_USER_AGENT);
                 if let Some(id) = &account.account_id {
@@ -2750,6 +2766,79 @@ mod tests {
             "ready"
         );
         server.abort();
+    }
+
+    /// ChatGPT can revoke a Codex access token days before its `exp`. The
+    /// usage read then answers 401 until the token is renewed, so one forced
+    /// renewal must follow a 401 instead of showing it until expiry.
+    #[tokio::test]
+    async fn codex_usage_401_renews_the_token_once_and_reads_again() {
+        use axum::{
+            Json, Router,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::{get, post},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let account = store
+            .import(
+                json!({"type":"codex", "access_token":"revoked-fixture", "account_id":"identity-fixture",
+            "refresh_token":"fixture-refresh", "expires_at":"2099-01-01T00:00:00Z"}),
+                None,
+            )
+            .await
+            .unwrap();
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (count, read) = (renewals.clone(), reads.clone());
+        let app = Router::new()
+            .route("/token", post(move || { let count = count.clone(); async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Json(json!({"access_token":"renewed-fixture", "refresh_token":"rotated-fixture", "expires_in":864000}))
+            }}))
+            .route("/usage", get(move |headers: HeaderMap| { let read = read.clone(); async move {
+                read.fetch_add(1, Ordering::SeqCst);
+                if headers["authorization"] != "Bearer renewed-fixture" {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                Json(json!({"rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000,"reset_after_seconds":600}}})).into_response()
+            }}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let mut oauth = OAuthManager::new(client.clone(), store.clone());
+        oauth.codex_token_url = format!("{base}/token");
+        let mut service = QuotaService::with_oauth(client, store.clone(), Arc::new(oauth));
+        service.codex_usage_url = format!("{base}/usage");
+        let snapshot = service.refresh(&account.id).await.unwrap();
+        assert_eq!(snapshot.error, None);
+        assert_eq!(snapshot.windows[0].remaining_percent, Some(75.0));
+        assert_eq!(renewals.load(Ordering::SeqCst), 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        let renewed = store.get(&account.id).await.unwrap();
+        assert_eq!(renewed.access_token, "renewed-fixture");
+        assert_eq!(renewed.refresh_token.as_deref(), Some("rotated-fixture"));
+        // A token the provider still refuses after renewal shows the refusal
+        // and renews no more than once per read.
+        let app = Router::new()
+            .route(
+                "/token",
+                post(|| async {
+                    Json(json!({"access_token":"still-refused", "expires_in":864000}))
+                }),
+            )
+            .route("/usage", get(|| async { StatusCode::UNAUTHORIZED }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused = format!("http://{}", listener.local_addr().unwrap());
+        let second = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        service.codex_usage_url = format!("{refused}/usage");
+        let snapshot = service.refresh(&account.id).await.unwrap();
+        assert!(snapshot.error.unwrap().contains("HTTP 401"));
+        server.abort();
+        second.abort();
     }
 
     #[tokio::test]

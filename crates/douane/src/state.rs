@@ -164,7 +164,11 @@ impl AppState {
             .tcp_nodelay(true)
             .user_agent(concat!("douane/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        let oauth = Arc::new(OAuthManager::new(client.clone(), accounts.clone()));
+        let mut oauth = OAuthManager::new(client.clone(), accounts.clone());
+        if let Some(url) = &config.server.codex_token_url {
+            oauth.codex_token_url = url.clone();
+        }
+        let oauth = Arc::new(oauth);
         let quotas = Arc::new(QuotaService::with_oauth(
             client.clone(),
             accounts.clone(),

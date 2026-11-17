@@ -212,82 +212,99 @@ async fn connect_pool(
         if !attempted.insert(candidate.id.clone()) {
             continue;
         }
-        let account = match state.oauth.credential(&candidate.id).await {
+        let mut account = match state.oauth.credential(&candidate.id).await {
             Ok(account) if account_offered(&account, model) => account,
             _ => continue,
         };
-        let (url, _) = relay::upstream(&account, Dialect::Responses, model, &[]);
-        let url = url
-            .replacen("https://", "wss://", 1)
-            .replacen("http://", "ws://", 1);
-        let Ok(mut request) = url.into_client_request() else {
-            continue;
-        };
-        for (name, value) in relay::upstream_headers(&account, headers) {
-            if let Some(name) = name {
-                request.headers_mut().insert(name, value);
-            }
-        }
-        request
-            .headers_mut()
-            .entry("openai-beta")
-            .or_insert(axum::http::HeaderValue::from_static(
-                "responses_websockets=2026-02-06",
-            ));
-        if !request.headers().contains_key("session_id") {
-            if let Some(value) = session.and_then(|key| key.parse::<axum::http::HeaderValue>().ok())
-            {
-                request.headers_mut().insert("session_id", value);
-            }
-        }
-        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-            .max_message_size(Some(64 * 1024 * 1024))
-            .max_frame_size(Some(64 * 1024 * 1024))
-            .write_buffer_size(0)
-            .max_write_buffer_size(64 * 1024 * 1024 + 4096);
-        let result = tokio::time::timeout(
-            Duration::from_secs(20),
-            tokio_tungstenite::connect_async_with_config(request, Some(config), true),
-        )
-        .await;
-        match result {
-            Ok(Ok((socket, _))) => return Some((account, socket)),
-            Ok(Err(WsError::Http(response))) => {
-                let mut failure =
-                    failure_status(response.status().as_u16()).unwrap_or(NativeFailure {
-                        status: 502,
-                        seconds: 15,
-                        reason: "websocket upstream connection failed",
-                    });
-                // Rest until the provider's own reset, as the HTTP relay does.
-                if let Some(seconds) =
-                    crate::relay::cooldown_seconds(response.headers(), crate::relay::unix_now())
-                {
-                    failure.seconds = seconds;
+        // A provider can revoke an access token before its expiry (ChatGPT
+        // does for Codex): one 401 renews it once, as the HTTP relay does.
+        let mut renewed = false;
+        loop {
+            let (url, _) = relay::upstream(&account, Dialect::Responses, model, &[]);
+            let url = url
+                .replacen("https://", "wss://", 1)
+                .replacen("http://", "ws://", 1);
+            let Ok(mut request) = url.into_client_request() else {
+                break;
+            };
+            for (name, value) in relay::upstream_headers(&account, headers) {
+                if let Some(name) = name {
+                    request.headers_mut().insert(name, value);
                 }
-                let _ = state
-                    .accounts
-                    .cooldown_with_retry_after(
-                        &account.id,
-                        failure.seconds,
-                        failure.reason,
-                        crate::relay::retry_after_seconds(
-                            response.headers(),
-                            crate::relay::unix_now(),
-                        )
-                        .is_some(),
-                    )
-                    .await;
             }
-            _ => {
-                let _ = state
-                    .accounts
-                    .cooldown(&account.id, 15, "websocket upstream connection failed")
-                    .await;
+            request.headers_mut().entry("openai-beta").or_insert(
+                axum::http::HeaderValue::from_static("responses_websockets=2026-02-06"),
+            );
+            if !request.headers().contains_key("session_id") {
+                if let Some(value) =
+                    session.and_then(|key| key.parse::<axum::http::HeaderValue>().ok())
+                {
+                    request.headers_mut().insert("session_id", value);
+                }
             }
+            let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                .max_message_size(Some(64 * 1024 * 1024))
+                .max_frame_size(Some(64 * 1024 * 1024))
+                .write_buffer_size(0)
+                .max_write_buffer_size(64 * 1024 * 1024 + 4096);
+            let result = tokio::time::timeout(
+                Duration::from_secs(20),
+                tokio_tungstenite::connect_async_with_config(request, Some(config), true),
+            )
+            .await;
+            match result {
+                Ok(Ok((socket, _))) => return Some((account, socket)),
+                Ok(Err(WsError::Http(response)))
+                    if response.status().as_u16() == 401 && !renewed =>
+                {
+                    renewed = true;
+                    if let Ok(fresh) = state.oauth.force_refresh(&account.id).await {
+                        account = fresh;
+                        continue;
+                    }
+                    failed(state, &account, &response).await;
+                }
+                Ok(Err(WsError::Http(response))) => failed(state, &account, &response).await,
+                _ => {
+                    let _ = state
+                        .accounts
+                        .cooldown(&account.id, 15, "websocket upstream connection failed")
+                        .await;
+                }
+            }
+            break;
         }
     }
     None
+}
+
+/// Rests an account after the provider refused its websocket handshake.
+async fn failed(
+    state: &AppState,
+    account: &AccountCredential,
+    response: &tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
+) {
+    let mut failure = failure_status(response.status().as_u16()).unwrap_or(NativeFailure {
+        status: 502,
+        seconds: 15,
+        reason: "websocket upstream connection failed",
+    });
+    // Rest until the provider's own reset, as the HTTP relay does.
+    if let Some(seconds) =
+        crate::relay::cooldown_seconds(response.headers(), crate::relay::unix_now())
+    {
+        failure.seconds = seconds;
+    }
+    let _ = state
+        .accounts
+        .cooldown_with_retry_after(
+            &account.id,
+            failure.seconds,
+            failure.reason,
+            crate::relay::retry_after_seconds(response.headers(), crate::relay::unix_now())
+                .is_some(),
+        )
+        .await;
 }
 
 async fn connect_replacement(
@@ -613,7 +630,14 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                             }
                             if empty { calls.remove(observed_lane); }
                             if let Some(failure) = failure {
-                                let _ = state.accounts.cooldown(&account.id, failure.seconds, failure.reason).await;
+                                // A refused token renews once; the renewed account stays
+                                // eligible for the retry instead of resting for minutes.
+                                let renewed = failure.status == 401
+                                    && account.refresh_token.is_some()
+                                    && state.oauth.force_refresh(&account.id).await.is_ok();
+                                if !renewed {
+                                    let _ = state.accounts.cooldown(&account.id, failure.seconds, failure.reason).await;
+                                }
                                 if can_retry {
                                     let request = retry_request.take().unwrap();
                                     if has_previous(&request) {
@@ -622,7 +646,11 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                                     }
                                     let _ = tokio::time::timeout(Duration::from_secs(2), upstream.close(None)).await;
                                     let requested = request["model"].as_str().unwrap_or(&model);
-                                    attempted.insert(account.id.clone());
+                                    if renewed {
+                                        attempted.remove(&account.id);
+                                    } else {
+                                        attempted.insert(account.id.clone());
+                                    }
                                     if let Some((replacement, socket)) = connect_replacement(
                                         &state, &headers, session.as_deref(), requested, provider, &mut attempted,
                                     ).await {

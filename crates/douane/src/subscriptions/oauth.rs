@@ -63,7 +63,7 @@ pub struct OAuthManager {
     meta_usage: Mutex<BTreeMap<String, (time::OffsetDateTime, Value)>>,
     store: Arc<AccountStore>,
     pending: Mutex<BTreeMap<String, Pending>>,
-    codex_token_url: String,
+    pub(crate) codex_token_url: String,
     pub(crate) claude_token_url: String,
     google: GoogleOAuth,
     /// Refresh tokens a provider has revoked, by account. Asking again gets the
