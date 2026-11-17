@@ -874,7 +874,11 @@ pub async fn forward(
             match result {
                 Ok(r) if r.status() == StatusCode::UNAUTHORIZED && retry_auth => {
                     retry_auth = false;
-                    match state.oauth.force_refresh(&account.id).await {
+                    match state
+                        .oauth
+                        .renew_refused(&account.id, &account.access_token)
+                        .await
+                    {
                         Ok(fresh) => account = fresh,
                         Err(_) => break Ok(r),
                     }

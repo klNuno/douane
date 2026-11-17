@@ -258,7 +258,11 @@ async fn connect_pool(
                     if response.status().as_u16() == 401 && !renewed =>
                 {
                     renewed = true;
-                    if let Ok(fresh) = state.oauth.force_refresh(&account.id).await {
+                    if let Ok(fresh) = state
+                        .oauth
+                        .renew_refused(&account.id, &account.access_token)
+                        .await
+                    {
                         account = fresh;
                         continue;
                     }
@@ -483,6 +487,9 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
     track_call(&mut calls, &state, &account, &initial, client.as_ref());
     // Retain at most one request, and release its payload on the first forwarded event.
     let mut retry_request = Some(initial);
+    // One token renewal per client request, so a token the provider keeps
+    // refusing after renewal rests the account instead of looping.
+    let mut renewed_turn = false;
     let beat = Duration::from_millis(
         state
             .socket_heartbeat_ms
@@ -579,6 +586,7 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                                 break;
                             }
                             retry_request = if pending == 0 { Some(body.clone()) } else { None };
+                            renewed_turn = false;
                             track_call(&mut calls, &state, &account, &body, client.as_ref());
                         } else {
                             // A cancellation/steering message makes replaying the retained create unsafe.
@@ -630,11 +638,14 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                             }
                             if empty { calls.remove(observed_lane); }
                             if let Some(failure) = failure {
-                                // A refused token renews once; the renewed account stays
-                                // eligible for the retry instead of resting for minutes.
+                                // A refused token renews once per request; the renewed account
+                                // serves the retry instead of resting for minutes.
                                 let renewed = failure.status == 401
+                                    && can_retry
+                                    && !renewed_turn
                                     && account.refresh_token.is_some()
-                                    && state.oauth.force_refresh(&account.id).await.is_ok();
+                                    && state.oauth.renew_refused(&account.id, &account.access_token).await.is_ok();
+                                renewed_turn |= renewed;
                                 if !renewed {
                                     let _ = state.accounts.cooldown(&account.id, failure.seconds, failure.reason).await;
                                 }

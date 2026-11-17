@@ -652,11 +652,11 @@ impl QuotaService {
             Ok(mut credential) => {
                 let mut result = self.fetch(&credential).await;
                 // A provider can revoke an access token before its expiry
-                // (ChatGPT does for Codex). Renew once, as the relay does.
+                // (ChatGPT does for Codex). Any OAuth provider renews once.
                 if matches!(result, Err(SubscriptionError::Upstream(401)))
                     && credential.refresh_token.is_some()
                 {
-                    match self.oauth.force_refresh(id).await {
+                    match self.oauth.renew_refused(id, &credential.access_token).await {
                         Ok(fresh) => {
                             credential = fresh;
                             result = self.fetch(&credential).await;

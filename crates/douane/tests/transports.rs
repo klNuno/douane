@@ -434,8 +434,10 @@ async fn mock_socket(mut socket: WebSocket, mock: Arc<Mock>, headers: HeaderMap,
                     body: body.clone(),
                 });
                 let failure = mock.native_failure.lock().unwrap().clone().filter(|_| {
-                    mock.rejected_token.lock().unwrap().as_deref()
-                        == headers.get("authorization").and_then(|v| v.to_str().ok())
+                    let rejected = mock.rejected_token.lock().unwrap().clone();
+                    rejected.as_deref() == Some("*")
+                        || rejected.as_deref()
+                            == headers.get("authorization").and_then(|v| v.to_str().ok())
                 });
                 if body["type"] == "response.create" {
                     if let Some(mut failure) = failure {
@@ -1383,6 +1385,34 @@ async fn native_websocket_token_refusal_renews_and_retries_on_the_same_account()
     let account = summary(&fixture, &id).await;
     assert_eq!(account.status, "ready");
     assert_eq!(account.last_error, None);
+}
+
+#[tokio::test]
+async fn native_websocket_token_refused_after_renewal_rests_the_account() {
+    let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+    let id = revoked_codex(&fixture).await;
+    // Every token is refused mid-stream: one renewal and one retry, then the
+    // account rests instead of renewing and reconnecting forever.
+    *fixture.mock.rejected_token.lock().unwrap() = Some("*".into());
+    *fixture.mock.native_failure.lock().unwrap() = Some(
+        json!({"type":"error","status":401,"error":{"type":"invalid_request_error","code":"invalid_token"}}),
+    );
+    let mut socket = fixture.socket("stream-refused").await;
+    send(
+        &mut socket,
+        json!({"type":"response.create","model":"codex/gpt-test","input":"hello"}),
+    )
+    .await;
+    assert_eq!(next(&mut socket).await["type"], "error");
+    let _ = socket.close(None).await;
+    assert_eq!(fixture.mock.renewals.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.received().len(), 2);
+    let account = summary(&fixture, &id).await;
+    assert_eq!(account.status, "cooldown");
+    assert_eq!(
+        account.last_error.as_deref(),
+        Some("websocket upstream authentication failed")
+    );
 }
 
 #[tokio::test]

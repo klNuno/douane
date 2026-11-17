@@ -434,11 +434,21 @@ impl OAuthManager {
     }
 
     pub async fn credential(&self, id: &str) -> Result<AccountCredential, SubscriptionError> {
-        self.refresh(id, false).await
+        self.refresh(id, false, None).await
     }
 
     pub async fn force_refresh(&self, id: &str) -> Result<AccountCredential, SubscriptionError> {
-        self.refresh(id, true).await
+        self.refresh(id, true, None).await
+    }
+
+    /// Renews the access token a provider refused, unless another caller
+    /// already replaced it: renewing again could revoke that newer token.
+    pub async fn renew_refused(
+        &self,
+        id: &str,
+        refused: &str,
+    ) -> Result<AccountCredential, SubscriptionError> {
+        self.refresh(id, true, Some(refused)).await
     }
 
     fn is_revoked(&self, id: &str, refresh_token: &str) -> bool {
@@ -449,7 +459,12 @@ impl OAuthManager {
             .is_some_and(|revoked| revoked == refresh_token)
     }
 
-    async fn refresh(&self, id: &str, force: bool) -> Result<AccountCredential, SubscriptionError> {
+    async fn refresh(
+        &self,
+        id: &str,
+        force: bool,
+        refused: Option<&str>,
+    ) -> Result<AccountCredential, SubscriptionError> {
         let initial = self
             .store
             .get(id)
@@ -458,6 +473,7 @@ impl OAuthManager {
         if !force && !initial.needs_refresh() {
             return Ok(initial);
         }
+        let refused = refused.unwrap_or(&initial.access_token);
         let lock = self
             .store
             .refresh_locks
@@ -472,9 +488,7 @@ impl OAuthManager {
             .get(id)
             .await
             .ok_or(SubscriptionError::NotFound)?;
-        if (!force && !account.needs_refresh())
-            || (force && account.access_token != initial.access_token)
-        {
+        if (!force && !account.needs_refresh()) || (force && account.access_token != refused) {
             return Ok(account);
         }
         if account.provider == SubscriptionProvider::Meta {
@@ -1182,6 +1196,58 @@ fn validate_xai_endpoint(endpoint: &str) -> Result<String, SubscriptionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request that still holds a token another caller already renewed
+    /// gets the stored one; renewing again could revoke it under its users.
+    #[tokio::test]
+    async fn a_stale_refused_token_reuses_the_renewed_one() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let account = store
+            .import(
+                json!({"type":"codex", "access_token":"first-fixture", "account_id":"identity-fixture",
+            "refresh_token":"fixture-refresh", "expires_at":"2099-01-01T00:00:00Z"}),
+                None,
+            )
+            .await
+            .unwrap();
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let count = renewals.clone();
+        let app = Router::new().route(
+            "/token",
+            post(move || {
+                let count = count.clone();
+                async move {
+                    let n = count.fetch_add(1, Ordering::SeqCst) + 1;
+                    Json(json!({"access_token":format!("renewed-{n}"), "expires_in":864000}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut manager = OAuthManager::new(reqwest::Client::new(), store.clone());
+        manager.codex_token_url = format!("{base}/token");
+        let fresh = manager
+            .renew_refused(&account.id, "first-fixture")
+            .await
+            .unwrap();
+        assert_eq!(fresh.access_token, "renewed-1");
+        let stale = manager
+            .renew_refused(&account.id, "first-fixture")
+            .await
+            .unwrap();
+        assert_eq!(stale.access_token, "renewed-1");
+        assert_eq!(renewals.load(Ordering::SeqCst), 1);
+        let again = manager
+            .renew_refused(&account.id, "renewed-1")
+            .await
+            .unwrap();
+        assert_eq!(again.access_token, "renewed-2");
+        server.abort();
+    }
 
     /// GitHub keeps answering 200 while the user has not entered the code,
     /// then hands over a token; the login names the account.
