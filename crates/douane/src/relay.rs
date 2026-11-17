@@ -995,6 +995,7 @@ pub async fn forward(
                 continue;
             }
             let summary = match last_status {
+                StatusCode::PAYMENT_REQUIRED => "upstream API budget exhausted",
                 StatusCode::TOO_MANY_REQUESTS => "upstream quota or rate limit reached",
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                     "upstream authentication refused"
@@ -1016,7 +1017,11 @@ pub async fn forward(
                 error = call.call.error.as_deref().unwrap_or(summary),
                 "upstream refused the request"
             );
-            if last_status == StatusCode::TOO_MANY_REQUESTS || last_status.is_server_error() {
+            if last_status == StatusCode::TOO_MANY_REQUESTS
+                || (last_status == StatusCode::PAYMENT_REQUIRED
+                    && account.provider == SubscriptionProvider::OpenaiCompatible)
+                || last_status.is_server_error()
+            {
                 let wait = advised
                     .max(refusal.as_ref().and_then(|r| r.retry_seconds))
                     .unwrap_or(30);
@@ -1414,7 +1419,9 @@ fn window_exhausted(headers: &HeaderMap) -> bool {
 /// out of the resting fallback until its reset; another 429 is a rate limit
 /// that may already be over, a server error a passing outage.
 fn cooldown_reason(status: StatusCode, exhausted: bool, refusal: Option<&str>) -> &'static str {
-    if status != StatusCode::TOO_MANY_REQUESTS {
+    if status == StatusCode::PAYMENT_REQUIRED {
+        "upstream quota exceeded"
+    } else if status != StatusCode::TOO_MANY_REQUESTS {
         "upstream temporarily unavailable"
     } else if exhausted || refusal.is_some_and(|r| r.split('/').any(|p| p == "QUOTA_EXHAUSTED")) {
         "upstream quota exceeded"
