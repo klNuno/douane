@@ -27,6 +27,7 @@ struct Seen {
 #[derive(Default)]
 struct Upstream {
     seen: Mutex<Vec<Seen>>,
+    refused: Mutex<std::collections::BTreeMap<String, StatusCode>>,
 }
 
 struct Server {
@@ -60,9 +61,23 @@ async fn answer(
     let path = uri.path().to_owned();
     upstream.seen.lock().unwrap().push(Seen {
         path: path.clone(),
-        headers,
+        headers: headers.clone(),
         body: body.clone(),
     });
+    let refused = upstream
+        .refused
+        .lock()
+        .unwrap()
+        .get(headers["authorization"].to_str().unwrap())
+        .copied();
+    if let Some(status) = refused {
+        return (
+            status,
+            Json(json!({"object":"error","message":"API budget exhausted.",
+                "type":"billing_api_budget_exhausted","code":"2303"})),
+        )
+            .into_response();
+    }
     let model = body["model"].clone();
     // Copilot lists models a plan cannot use, then refuses them.
     if model == "kimi-k3" {
@@ -247,6 +262,78 @@ fn endpoint(route: &str, base: &str, key: &str) -> Value {
 
 fn chat(model: &str) -> Value {
     json!({"model":model,"messages":[{"role":"user","content":"hi"}]})
+}
+
+#[tokio::test]
+async fn exhausted_api_budget_tries_the_other_key_and_keeps_the_replacement() {
+    for path in ["/v1/chat/completions", "/v1/messages"] {
+        let (mistral, seen) = api(&["shared-model"]).await;
+        let (other, other_seen) = api(&["shared-model"]).await;
+        let gateway = Gateway::new(&[
+            endpoint("mistral", &mistral.url, "key-one"),
+            endpoint("mistral", &mistral.url, "key-two"),
+            endpoint("other", &other.url, "key-other"),
+        ])
+        .await;
+        let mut body = chat("mistral/shared-model");
+        body["max_tokens"] = json!(32);
+        body["metadata"] = json!({"session_id":"budget-failover"});
+        assert_eq!(gateway.post(path, body.clone()).await.0, 200);
+        let first = seen.seen.lock().unwrap()[0].headers["authorization"].clone();
+        seen.refused
+            .lock()
+            .unwrap()
+            .insert(first.to_str().unwrap().into(), StatusCode::PAYMENT_REQUIRED);
+        let (status, response) = gateway.post(path, body.clone()).await;
+        assert_eq!(status, 200, "{path}: {response}");
+        assert_eq!(gateway.post(path, body).await.0, 200);
+        let calls = seen.seen.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[1].headers["authorization"], first);
+        assert_ne!(calls[2].headers["authorization"], first);
+        assert_eq!(
+            calls[3].headers["authorization"],
+            calls[2].headers["authorization"]
+        );
+        assert!(other_seen.seen.lock().unwrap().is_empty());
+        let accounts = gateway.state.accounts.list().await;
+        assert_eq!(
+            accounts.iter().filter(|a| a.status == "cooldown").count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn exhausted_api_budget_preserves_the_refusal_when_all_keys_refuse() {
+    for path in ["/v1/chat/completions", "/v1/messages"] {
+        let (mistral, seen) = api(&["shared-model"]).await;
+        let gateway = Gateway::new(&[
+            endpoint("mistral", &mistral.url, "key-one"),
+            endpoint("mistral", &mistral.url, "key-two"),
+        ])
+        .await;
+        for key in ["Bearer key-one", "Bearer key-two"] {
+            seen.refused
+                .lock()
+                .unwrap()
+                .insert(key.into(), StatusCode::PAYMENT_REQUIRED);
+        }
+        let mut body = chat("mistral/shared-model");
+        body["max_tokens"] = json!(32);
+        let (status, response) = gateway.post(path, body).await;
+        assert_eq!(status, 402, "{response}");
+        assert!(
+            response.to_string().contains("API budget exhausted"),
+            "{response}"
+        );
+        let calls = seen.seen.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_ne!(
+            calls[0].headers["authorization"],
+            calls[1].headers["authorization"]
+        );
+    }
 }
 
 #[tokio::test]
