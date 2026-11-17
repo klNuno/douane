@@ -25,6 +25,10 @@ pub struct Server {
     pub database: PathBuf,
     /// Optional management token, loaded from this environment variable.
     pub management_token_env: Option<String>,
+    /// Tests point Codex token renewal at a loopback; never read from a file.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub codex_token_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -111,6 +115,7 @@ impl Default for Server {
             auth_dir: "auth".into(),
             database: "douane.sqlite".into(),
             management_token_env: None,
+            codex_token_url: None,
         }
     }
 }

@@ -67,6 +67,10 @@ struct Mock {
     limit_headers: AtomicBool,
     /// Milliseconds between the HTTP body's chunks; a few by default.
     chunk_pause_ms: AtomicU64,
+    /// A token the websocket handshake refuses with 401.
+    refused_handshake: Mutex<Option<String>>,
+    /// Codex token renewals the loopback OAuth endpoint answered.
+    renewals: AtomicUsize,
 }
 
 struct Server {
@@ -116,6 +120,13 @@ impl Fixture {
                     "/v1/models",
                     get(|| async { axum::Json(json!({"data":[{"id":"gpt-test"}]})) }),
                 )
+                .route(
+                    "/oauth/token",
+                    post(|State(mock): State<Arc<Mock>>| async move {
+                        mock.renewals.fetch_add(1, Ordering::Relaxed);
+                        axum::Json(json!({"access_token":"renewed-fixture","expires_in":864000}))
+                    }),
+                )
                 .with_state(mock.clone()),
         )
         .await;
@@ -124,6 +135,7 @@ impl Fixture {
         config.server.auth_dir = directory.path().join("accounts");
         config.server.database = directory.path().join("calls.sqlite");
         config.settings.strategy = strategy;
+        config.server.codex_token_url = Some(format!("{}/oauth/token", upstream.url));
         let state = AppState::new(config, None).unwrap();
         let (_, key) = state
             .clients
@@ -399,8 +411,15 @@ async fn mock_upgrade(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let id = mock.connections.fetch_add(1, Ordering::Relaxed);
     mock.handshakes.lock().unwrap().push(headers.clone());
+    let refused = mock.refused_handshake.lock().unwrap().clone();
+    if refused.is_some_and(|token| {
+        token == "*"
+            || Some(token.as_str()) == headers.get("authorization").and_then(|v| v.to_str().ok())
+    }) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let id = mock.connections.fetch_add(1, Ordering::Relaxed);
     upgrade.on_upgrade(move |socket| mock_socket(socket, mock, headers, id))
 }
 
@@ -415,8 +434,10 @@ async fn mock_socket(mut socket: WebSocket, mock: Arc<Mock>, headers: HeaderMap,
                     body: body.clone(),
                 });
                 let failure = mock.native_failure.lock().unwrap().clone().filter(|_| {
-                    mock.rejected_token.lock().unwrap().as_deref()
-                        == headers.get("authorization").and_then(|v| v.to_str().ok())
+                    let rejected = mock.rejected_token.lock().unwrap().clone();
+                    rejected.as_deref() == Some("*")
+                        || rejected.as_deref()
+                            == headers.get("authorization").and_then(|v| v.to_str().ok())
                 });
                 if body["type"] == "response.create" {
                     if let Some(mut failure) = failure {
@@ -1266,6 +1287,132 @@ async fn explicit_retry_after_prevents_an_immediate_retry_on_the_only_account() 
             "Retry-After must reach account selection"
         );
     }
+}
+
+/// The only Codex account, with a refresh token, whose access token ChatGPT
+/// stopped accepting before its expiry.
+async fn revoked_codex(fixture: &Fixture) -> String {
+    let mut revoked = account("codex", "alpha", &fixture.upstream.url);
+    revoked["refresh_token"] = json!("fixture-refresh");
+    revoked["expires_at"] = json!("2099-01-01T00:00:00Z");
+    let summary = fixture
+        .state
+        .accounts
+        .import(revoked, Some("alpha".into()))
+        .await
+        .unwrap();
+    assert_eq!(summary.id, fixture.accounts[0].0);
+    summary.id
+}
+
+async fn summary(fixture: &Fixture, id: &str) -> douane::subscriptions::AccountSummary {
+    fixture
+        .state
+        .accounts
+        .list()
+        .await
+        .into_iter()
+        .find(|account| account.id == id)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn native_websocket_handshake_401_renews_the_token_once_and_connects() {
+    let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+    let id = revoked_codex(&fixture).await;
+    *fixture.mock.refused_handshake.lock().unwrap() = Some("Bearer fixture-alpha".into());
+    let mut socket = fixture.socket("handshake-renewal").await;
+    send(
+        &mut socket,
+        json!({"type":"response.create","model":"codex/gpt-test","input":"hello"}),
+    )
+    .await;
+    assert_eq!(next(&mut socket).await["type"], "response.completed");
+    let _ = socket.close(None).await;
+    assert_eq!(fixture.mock.renewals.load(Ordering::Relaxed), 1);
+    let handshakes = fixture.mock.handshakes.lock().unwrap().clone();
+    assert_eq!(handshakes.len(), 2);
+    assert_eq!(handshakes[1]["authorization"], "Bearer renewed-fixture");
+    assert_eq!(summary(&fixture, &id).await.status, "ready");
+}
+
+#[tokio::test]
+async fn native_websocket_handshake_401_after_renewal_rests_the_account() {
+    let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+    let id = revoked_codex(&fixture).await;
+    // Every token is refused: one renewal, then the usual rest, never a loop.
+    *fixture.mock.refused_handshake.lock().unwrap() = Some("*".into());
+    let mut socket = fixture.socket("handshake-refused").await;
+    send(
+        &mut socket,
+        json!({"type":"response.create","model":"codex/gpt-test","input":"hello"}),
+    )
+    .await;
+    let _ = timeout(WAIT, socket.next()).await;
+    assert_eq!(fixture.mock.renewals.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.mock.handshakes.lock().unwrap().len(), 2);
+    let account = summary(&fixture, &id).await;
+    assert_eq!(account.status, "cooldown");
+    assert_eq!(
+        account.last_error.as_deref(),
+        Some("websocket upstream authentication failed")
+    );
+}
+
+#[tokio::test]
+async fn native_websocket_token_refusal_renews_and_retries_on_the_same_account() {
+    let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+    let id = revoked_codex(&fixture).await;
+    *fixture.mock.rejected_token.lock().unwrap() = Some("Bearer fixture-alpha".into());
+    *fixture.mock.native_failure.lock().unwrap() = Some(
+        json!({"type":"error","status":401,"error":{"type":"invalid_request_error","code":"invalid_token"}}),
+    );
+    let mut socket = fixture.socket("stream-renewal").await;
+    send(
+        &mut socket,
+        json!({"type":"response.create","model":"codex/gpt-test","input":"hello"}),
+    )
+    .await;
+    assert_eq!(next(&mut socket).await["type"], "response.completed");
+    let _ = socket.close(None).await;
+    assert_eq!(fixture.mock.renewals.load(Ordering::Relaxed), 1);
+    let received = fixture.received();
+    assert_eq!(received.len(), 2);
+    assert_eq!(
+        received[1].headers["authorization"],
+        "Bearer renewed-fixture"
+    );
+    let account = summary(&fixture, &id).await;
+    assert_eq!(account.status, "ready");
+    assert_eq!(account.last_error, None);
+}
+
+#[tokio::test]
+async fn native_websocket_token_refused_after_renewal_rests_the_account() {
+    let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+    let id = revoked_codex(&fixture).await;
+    // Every token is refused mid-stream: one renewal and one retry, then the
+    // account rests instead of renewing and reconnecting forever.
+    *fixture.mock.rejected_token.lock().unwrap() = Some("*".into());
+    *fixture.mock.native_failure.lock().unwrap() = Some(
+        json!({"type":"error","status":401,"error":{"type":"invalid_request_error","code":"invalid_token"}}),
+    );
+    let mut socket = fixture.socket("stream-refused").await;
+    send(
+        &mut socket,
+        json!({"type":"response.create","model":"codex/gpt-test","input":"hello"}),
+    )
+    .await;
+    assert_eq!(next(&mut socket).await["type"], "error");
+    let _ = socket.close(None).await;
+    assert_eq!(fixture.mock.renewals.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.received().len(), 2);
+    let account = summary(&fixture, &id).await;
+    assert_eq!(account.status, "cooldown");
+    assert_eq!(
+        account.last_error.as_deref(),
+        Some("websocket upstream authentication failed")
+    );
 }
 
 #[tokio::test]
