@@ -3,7 +3,7 @@ use crate::{
     scheduler::{Candidate, Scheduler, Strategy},
     settings::Config,
     subscriptions::{
-        AccountCredential, AccountStore, OAuthManager, QuotaService, ResetManager,
+        AccountCredential, AccountStore, AccountSummary, OAuthManager, QuotaService, ResetManager,
         SubscriptionProvider, antigravity_user_agent,
     },
 };
@@ -1326,13 +1326,18 @@ impl AppState {
     /// A read asked by hand, for one account or all of them: a failure shows
     /// at once.
     pub async fn refresh_quotas(&self, id: Option<&str>) {
+        self.refresh_quotas_matching(|account| id.is_none_or(|id| account.id == id))
+            .await;
+    }
+
+    pub(crate) async fn refresh_quotas_matching(&self, matches: impl Fn(&AccountSummary) -> bool) {
         use futures_util::{StreamExt, stream};
         let ids: Vec<String> = self
             .accounts
             .list()
             .await
             .into_iter()
-            .filter(|a| id.is_none_or(|id| a.id == id))
+            .filter(matches)
             .map(|a| a.id)
             .collect();
         stream::iter(ids)

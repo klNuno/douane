@@ -43,8 +43,8 @@ impl SubscriptionProvider {
         }
     }
 
-    /// Whether douane can read this provider's quota. Custom endpoints and
-    /// Qwen expose none, so they never reach the quota poller or overview.
+    /// Whether every account on this provider has a quota reader. Compatible
+    /// endpoints may report billing data depending on their base URL.
     pub fn reports_quota(self) -> bool {
         !matches!(self, Self::OpenaiCompatible | Self::Qwen)
     }
@@ -181,6 +181,8 @@ pub struct AccountSummary {
     pub models: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(skip)]
+    pub(crate) endpoint_revision: u64,
 }
 
 /// Request credentials are available only inside the broker. Do not serialize
@@ -213,6 +215,8 @@ pub struct AccountCredential {
     pub(crate) enabled: bool,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
+    #[serde(skip)]
+    pub(crate) endpoint_revision: u64,
     #[serde(default)]
     pub(crate) last_error: Option<String>,
     #[serde(default)]
@@ -476,6 +480,7 @@ impl AccountCredential {
             },
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
+            endpoint_revision: self.endpoint_revision,
         }
     }
 
@@ -556,6 +561,16 @@ impl AccountStore {
 
     pub async fn get(&self, id: &str) -> Option<AccountCredential> {
         self.accounts.read().await.get(id).cloned()
+    }
+
+    pub(super) async fn read_account(
+        &self,
+        id: &str,
+    ) -> Option<tokio::sync::RwLockReadGuard<'_, AccountCredential>> {
+        tokio::sync::RwLockReadGuard::try_map(self.accounts.read().await, |accounts| {
+            accounts.get(id)
+        })
+        .ok()
     }
 
     pub(crate) fn reset_state_path(&self) -> PathBuf {
@@ -642,6 +657,9 @@ impl AccountStore {
             account.created_at = now();
         }
         account.updated_at = now();
+        if account.provider == SubscriptionProvider::OpenaiCompatible {
+            account.endpoint_revision = rand::random();
+        }
         self.persist(&account)?;
         let summary = account.summary();
         accounts.insert(account.id.clone(), account);
@@ -803,6 +821,9 @@ impl AccountStore {
             account.last_error = None;
             account.cooldown_until = None;
             account.cooldown_retry_after = false;
+        }
+        if account.access_token != current.access_token || account.base_url != current.base_url {
+            account.endpoint_revision = rand::random();
         }
         if account.route.is_some() && account.base_url.is_none() {
             return Err(SubscriptionError::InvalidEndpoint(
@@ -1458,6 +1479,7 @@ fn parse_import(
         id: random_id(),
         name: String::new(),
         provider,
+        endpoint_revision: rand::random(),
         access_token,
         refresh_token: text(token, &["refresh_token", "refreshToken"]),
         dca_token: if provider == SubscriptionProvider::Meta {

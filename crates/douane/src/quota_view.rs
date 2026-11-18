@@ -371,6 +371,7 @@ mod tests {
     fn summary(id: &str, provider: SubscriptionProvider, status: &str) -> AccountSummary {
         AccountSummary {
             id: id.into(),
+            endpoint_revision: 0,
             name: format!("{id}@example.com"),
             provider,
             email: Some(format!("{id}@example.com")),
