@@ -147,6 +147,7 @@ export const en = {
 	'usage.applicableSpendingBudget': 'Applicable spending budget',
 	'usage.effectiveBudget': 'Effective budget',
 	'usage.freeModelsDaily': 'Free model requests per day',
+	'usage.vibeMonthly': 'Vibe Code monthly quota',
 	'usage.premiumRequests': 'Premium requests',
 	'usage.chat': 'Chat',
 	'usage.completions': 'Completions',

@@ -965,17 +965,21 @@ impl QuotaService {
                 .ok_or(SubscriptionError::Transport)?;
             format!("{origin}{}", reqwest::Url::parse(url).unwrap().path())
         };
-        let value = send_json(
+        let result = send_json(
             self.billing_client
                 .get(url)
                 .bearer_auth(&account.access_token),
         )
-        .await?;
+        .await;
+        let credits = match (api, result) {
+            (BillingApi::MistralVibe, Err(SubscriptionError::Upstream(403))) => vec![],
+            (_, result) => api.parse(&result?, time::OffsetDateTime::now_utc())?,
+        };
         Ok(Observation {
             windows: vec![],
             plan: None,
             subscription: None,
-            credits: api.parse(&value, time::OffsetDateTime::now_utc())?,
+            credits,
             organization_id: None,
         })
     }
@@ -2084,8 +2088,16 @@ mod tests {
 
     #[tokio::test]
     async fn compatible_quota_reads_only_documented_billing_endpoints() {
-        use axum::{Json, Router, http::HeaderMap, routing::get};
+        use axum::{
+            Json, Router,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::get,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
 
+        let vibe_forbidden = Arc::new(AtomicBool::new(false));
+        let forbid_vibe = vibe_forbidden.clone();
         let app = Router::new()
             .route(
                 "/api/v1/key",
@@ -2103,6 +2115,27 @@ mod tests {
                     assert_eq!(headers["authorization"], "Bearer fixture-refuseless");
                     Json(json!({"available": 0, "unit": "usd", "key_limit": 0, "key_spent": 1.25}))
                 }),
+            )
+            .route(
+                "/v1/billing/budget",
+                get(move |headers: HeaderMap| {
+                    let forbidden = forbid_vibe.load(Ordering::Relaxed);
+                    async move {
+                        let budget = match headers["authorization"].to_str().unwrap() {
+                            "Bearer fixture-mistral-vibe" if forbidden => {
+                                return StatusCode::FORBIDDEN.into_response();
+                            }
+                            "Bearer fixture-mistral-vibe" => json!({
+                                "initial_budget": 20,
+                                "usage_percentage": 37.5,
+                                "reset_at": "2026-12-01T00:00:00Z"
+                            }),
+                            "Bearer fixture-mistral-studio" => Value::Null,
+                            _ => panic!("unexpected fixture key"),
+                        };
+                        Json(json!({"vibe_budget": budget})).into_response()
+                    }
+                }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -2115,7 +2148,8 @@ mod tests {
         for (name, base, supported) in [
             ("openrouter", "https://openrouter.ai/api/v1/", true),
             ("refuseless", "https://api.refuseless.com/v1", true),
-            ("mistral", "https://api.mistral.ai/v1", false),
+            ("mistral-vibe", "https://api.mistral.ai/v1", true),
+            ("mistral-studio", "https://api.mistral.ai/v1", true),
             ("hinoki", "https://inference.hinoki.security/v1", false),
             ("private", "https://api.refuseless.com.example/v1", false),
         ] {
@@ -2156,16 +2190,38 @@ mod tests {
             let first = service.refresh(&account.id).await.unwrap();
             assert!(first.error.is_none());
             assert!(first.windows.is_empty());
-            assert_eq!(first.credits.len(), 2);
-            if name == "openrouter" {
-                assert_eq!(first.credits[0].unlimited, Some(true));
-                assert_eq!(first.credits[0].remaining, None);
-                assert_eq!(first.credits[1].unit, "requests");
-            } else {
-                assert_eq!(first.credits[0].remaining, Some(0.0));
-                assert_eq!(first.credits[1].limit, None);
+            match name {
+                "openrouter" => {
+                    assert_eq!(first.credits.len(), 2);
+                    assert_eq!(first.credits[0].unlimited, Some(true));
+                    assert_eq!(first.credits[0].remaining, None);
+                    assert_eq!(first.credits[1].unit, "requests");
+                    assert_eq!(first.credits[1].remaining, Some(0.0));
+                }
+                "refuseless" => {
+                    assert_eq!(first.credits.len(), 2);
+                    assert_eq!(first.credits[0].remaining, Some(0.0));
+                    assert_eq!(first.credits[1].limit, None);
+                    assert_eq!(first.credits[1].remaining, Some(0.0));
+                }
+                "mistral-vibe" => {
+                    assert_eq!(first.credits.len(), 1);
+                    let budget = &first.credits[0];
+                    assert_eq!(budget.id, "mistral-vibe-monthly");
+                    assert_eq!(budget.unit, "%");
+                    assert_eq!(budget.remaining, Some(62.5));
+                    assert_eq!(budget.used, Some(37.5));
+                    assert_eq!(budget.reset_at.as_deref(), Some("2026-12-01T00:00:00Z"));
+
+                    vibe_forbidden.store(true, Ordering::Relaxed);
+                    let unavailable = service.refresh(&account.id).await.unwrap();
+                    assert!(unavailable.error.is_none());
+                    assert!(unavailable.credits.is_empty());
+                    assert!(service.get(&account.id).await.unwrap().credits.is_empty());
+                }
+                "mistral-studio" => assert!(first.credits.is_empty()),
+                _ => unreachable!(),
             }
-            assert_eq!(first.credits[1].remaining, Some(0.0));
             let saved = store.get(&account.id).await.unwrap();
             assert_eq!(saved.last_error.as_deref(), Some("upstream quota exceeded"));
             assert!(service.get(&account.id).await.is_some());

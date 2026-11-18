@@ -6,6 +6,7 @@ use time::OffsetDateTime;
 pub(super) enum BillingApi {
     OpenRouter,
     Refuseless,
+    MistralVibe,
 }
 
 impl BillingApi {
@@ -23,6 +24,7 @@ impl BillingApi {
         match (url.host_str()?, url.path().trim_end_matches('/')) {
             ("openrouter.ai", "/api/v1") => Some(Self::OpenRouter),
             ("api.refuseless.com", "/v1") => Some(Self::Refuseless),
+            ("api.mistral.ai", "/v1") => Some(Self::MistralVibe),
             _ => None,
         }
     }
@@ -31,6 +33,7 @@ impl BillingApi {
         match self {
             Self::OpenRouter => "https://openrouter.ai/api/v1/key",
             Self::Refuseless => "https://api.refuseless.com/v1/credits",
+            Self::MistralVibe => "https://api.mistral.ai/v1/billing/budget",
         }
     }
 
@@ -42,6 +45,7 @@ impl BillingApi {
         match self {
             Self::OpenRouter => openrouter(&response["data"], observed),
             Self::Refuseless => refuseless(response),
+            Self::MistralVibe => mistral_vibe(response),
         }
     }
 }
@@ -178,6 +182,40 @@ fn refuseless(response: &Value) -> Result<Vec<QuotaCredits>, SubscriptionError> 
         credits.push(entry);
     }
     Ok(credits)
+}
+
+fn mistral_vibe(response: &Value) -> Result<Vec<QuotaCredits>, SubscriptionError> {
+    let response = response
+        .as_object()
+        .ok_or(SubscriptionError::InvalidResponse)?;
+    let Some(budget) = response
+        .get("vibe_budget")
+        .filter(|budget| !budget.is_null())
+    else {
+        return Ok(vec![]);
+    };
+    let initial = budget["initial_budget"]
+        .as_f64()
+        .ok_or(SubscriptionError::InvalidResponse)?;
+    if initial <= 0.0 {
+        return Ok(vec![]);
+    }
+    let used = budget["usage_percentage"]
+        .as_f64()
+        .ok_or(SubscriptionError::InvalidResponse)?
+        .max(0.0);
+    let mut entry = credit(
+        "mistral-vibe-monthly",
+        "Vibe Code monthly quota",
+        "%",
+        Some((100.0 - used).max(0.0)),
+    );
+    entry.used = Some(used);
+    entry.reset_at = budget["reset_at"]
+        .as_str()
+        .and_then(parse_timestamp)
+        .map(timestamp);
+    Ok(vec![entry])
 }
 
 #[cfg(test)]
