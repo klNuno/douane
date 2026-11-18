@@ -74,7 +74,14 @@
 		}
 		return [...merged.values()];
 	}
-	function remaining(id: string) { const values = quotas.find(q => q.account_id === id)?.windows.map(w => w.remaining_percent).filter((v): v is number => v != null) ?? []; return values.length ? Math.min(...values) : null; }
+	function remaining(id: string) {
+		const quota = quotas.find(q => q.account_id === id);
+		const percentages = [
+			...(quota?.windows.map(window => window.remaining_percent) ?? []),
+			...shownCredits(quota).filter(credit => credit.unit === '%').map(credit => credit.remaining)
+		].filter((value): value is number => value != null);
+		return percentages.length ? Math.min(...percentages) : null;
+	}
 </script>
 
 <svelte:window onpointerdown={() => pressing = true} onpointerup={pressEnd} onpointercancel={pressEnd}/>

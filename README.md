@@ -39,7 +39,7 @@ douane connects your Claude, ChatGPT (Codex), Antigravity, Muse Code, Grok, GitH
 | Gemini CLI, Kimi | Credential import | Read from the provider |
 | GitHub Copilot | Device code in the dashboard, or OpenCode's `auth.json` | Monthly premium requests |
 | Qwen | Credential import | Not reported |
-| Custom endpoints (DeepSeek, OpenRouter, Groq, NVIDIA NIM...) | An API key in the dashboard or `douanectl endpoint add` | Not reported |
+| Custom endpoints (DeepSeek, OpenRouter, Groq, NVIDIA NIM...) | An API key in the dashboard or `douanectl endpoint add` | OpenRouter key limits and free-model requests, Refuseless credits, and Mistral Vibe monthly usage when the key has usage permission |
 
 What a provider exposes depends on the account and plan. A quota douane cannot read stays unknown; it is never estimated.
 

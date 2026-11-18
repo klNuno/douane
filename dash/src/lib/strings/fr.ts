@@ -149,6 +149,7 @@ export const fr: Record<StringKey, string> = {
 	'usage.applicableSpendingBudget': 'Budget de dépenses applicable',
 	'usage.effectiveBudget': 'Budget effectif',
 	'usage.freeModelsDaily': 'Requêtes quotidiennes sur les modèles gratuits',
+	'usage.vibeMonthly': 'Quota mensuel Vibe Code',
 	'usage.premiumRequests': 'Requêtes premium',
 	'usage.chat': 'Chat',
 	'usage.completions': 'Complétions',
