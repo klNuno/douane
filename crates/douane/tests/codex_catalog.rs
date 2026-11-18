@@ -112,8 +112,7 @@ async fn native_catalog_only_offers_tiers_supported_by_the_clients_subscriptions
     let model = |slug: &str, tiers: Value| json!({"slug":slug, "supported_in_api":false, "service_tiers":tiers});
     let f = Fixture::new(vec![
         json!({"models":[model("gpt-6.2-sol", json!([priority, ultrafast]))]}),
-        json!({"models":[model("gpt-6.2-sol", json!([priority])),
-            model("gpt-6.2-astra", json!([priority]))]}),
+        json!({"error":"unavailable"}),
     ])
     .await;
     let create_key = |name, access| {
@@ -191,6 +190,23 @@ async fn native_catalog_only_offers_tiers_supported_by_the_clients_subscriptions
         one["models"][1]["service_tiers"],
         one["models"][0]["service_tiers"]
     );
+    for method in [reqwest::Method::HEAD, reqwest::Method::GET] {
+        assert_eq!(
+            http.request(method, &url)
+                .bearer_auth(&both)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            503
+        );
+    }
+    f.replies.lock().unwrap().insert(
+        "1".into(),
+        json!({"models":[model("gpt-6.2-sol", json!([priority])),
+            model("gpt-6.2-astra", json!([priority]))]}),
+    );
+    f.state.refresh_models_in(Some("codex")).await;
     let all = get(both.clone()).await;
     assert_eq!(all["models"].as_array().unwrap().len(), 4);
     let sol = all["models"]

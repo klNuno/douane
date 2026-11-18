@@ -824,63 +824,73 @@ impl AppState {
         let disabled = self.config.read().await.disabled_models.clone();
         let models = self.models.read().await;
         let listed = self.listed.lock().unwrap_or_else(|e| e.into_inner());
-        let rows: Vec<_> =
-            models
+        let mut catalog = Vec::new();
+        for model in models
+            .iter()
+            .filter(|m| Self::codex_catalog_model_enabled(m, &disabled))
+        {
+            let id = &model.upstream_id;
+            let rows: Vec<_> = accounts
                 .iter()
-                .filter(|m| Self::codex_catalog_model_enabled(m, &disabled))
-                .filter_map(|model| {
-                    let id = &model.upstream_id;
-                    let rows: Vec<_> = accounts
-                        .iter()
-                        .filter_map(|a| self.codex_catalog_source(&listed, a, id))
-                        .collect();
-                    let mut row = rows.iter().find_map(|row| *row)?.as_object()?.clone();
-                    // The gateway can route subscription-only models with a client key.
-                    row.insert("supported_in_api".into(), json!(true));
-                    row.remove("available_access_programs");
-                    row.remove("availability_nux");
-                    // Rotation may use any of these accounts. Keep a tier only if
-                    // each account that could serve this model advertises it.
-                    fn tier_id(tier: &Value) -> Option<&str> {
-                        tier.as_str().or_else(|| tier["id"].as_str())
-                    }
-                    for field in ["service_tiers", "additional_speed_tiers"] {
-                        if let Some(tiers) = row.get_mut(field).and_then(Value::as_array_mut) {
-                            tiers.retain(|tier| {
-                                let Some(id) = tier_id(tier) else {
-                                    return false;
-                                };
-                                rows.iter().all(|source| {
-                                    source.and_then(|row| row[field].as_array()).is_some_and(
-                                        |other| other.iter().any(|tier| tier_id(tier) == Some(id)),
-                                    )
-                                })
-                            });
-                        }
-                    }
-                    if let Some(default) = row.get("default_service_tier")
-                        && default != "default"
-                        && !row
-                            .get("service_tiers")
-                            .and_then(Value::as_array)
-                            .is_some_and(|tiers| tiers.iter().any(|tier| &tier["id"] == default))
-                    {
-                        row.remove("default_service_tier");
-                    }
-                    // Older clients saved qualified ids. Codex needs the exact
-                    // slug in its catalog to keep its metadata when resuming them.
-                    let mut alias = row.clone();
-                    alias.insert("slug".into(), json!(model.id));
-                    alias.insert("visibility".into(), json!("hide"));
-                    Some([Value::Object(row), Value::Object(alias)])
-                })
-                .flatten()
+                .filter_map(|a| self.codex_catalog_source(&listed, a, id))
                 .collect();
+            let Some(mut row) = rows
+                .iter()
+                .find_map(|row| *row)
+                .and_then(Value::as_object)
+                .cloned()
+            else {
+                continue;
+            };
+            // An unlisted account may still receive the model. Keep the client's
+            // bundled catalog until every account in this rotation has answered.
+            if rows.iter().any(Option::is_none) {
+                return None;
+            }
+            // The gateway can route subscription-only models with a client key.
+            row.insert("supported_in_api".into(), json!(true));
+            row.remove("available_access_programs");
+            row.remove("availability_nux");
+            // Rotation may use any of these accounts. Keep a tier only if
+            // each account that could serve this model advertises it.
+            fn tier_id(tier: &Value) -> Option<&str> {
+                tier.as_str().or_else(|| tier["id"].as_str())
+            }
+            for field in ["service_tiers", "additional_speed_tiers"] {
+                if let Some(tiers) = row.get_mut(field).and_then(Value::as_array_mut) {
+                    tiers.retain(|tier| {
+                        let Some(id) = tier_id(tier) else {
+                            return false;
+                        };
+                        rows.iter().flatten().all(|source| {
+                            source[field].as_array().is_some_and(|other| {
+                                other.iter().any(|tier| tier_id(tier) == Some(id))
+                            })
+                        })
+                    });
+                }
+            }
+            if let Some(default) = row.get("default_service_tier")
+                && default != "default"
+                && !row
+                    .get("service_tiers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tiers| tiers.iter().any(|tier| &tier["id"] == default))
+            {
+                row.remove("default_service_tier");
+            }
+            // Older clients saved qualified ids. Codex needs the exact
+            // slug in its catalog to keep its metadata when resuming them.
+            let mut alias = row.clone();
+            alias.insert("slug".into(), json!(model.id));
+            alias.insert("visibility".into(), json!("hide"));
+            catalog.extend([Value::Object(row), Value::Object(alias)]);
+        }
         // A temporarily missing first listing is not an authoritative empty catalog.
-        if rows.is_empty() && accounts.iter().any(|a| !listed.contains_key(&a.id)) {
+        if catalog.is_empty() && accounts.iter().any(|a| !listed.contains_key(&a.id)) {
             return None;
         }
-        Some(rows)
+        Some(catalog)
     }
 
     /// Google renames Antigravity models without notice, so the bundled ids
