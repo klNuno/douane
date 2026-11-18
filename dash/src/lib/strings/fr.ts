@@ -147,7 +147,7 @@ export const fr: Record<StringKey, string> = {
 	'usage.availablePaidCredits': 'Crédits payants disponibles',
 	'usage.keySpendingCap': 'Plafond de dépenses de la clé',
 	'usage.applicableSpendingBudget': 'Budget de dépenses applicable',
-	'usage.effectiveBudget': 'Budget applicable',
+	'usage.effectiveBudget': 'Budget effectif',
 	'usage.freeModelsDaily': 'Requêtes quotidiennes sur les modèles gratuits',
 	'usage.premiumRequests': 'Requêtes premium',
 	'usage.chat': 'Chat',

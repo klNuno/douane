@@ -44,7 +44,7 @@
 	let filtersNeed = $derived.by(() => { void toolbarWidth; if (!filters) return 0; const items = [...filters.children] as HTMLElement[]; return items.reduce((sum, item) => sum + (item === searchLabel ? 40 : item.offsetWidth), 0) + (items.length - 1) * (parseFloat(getComputedStyle(filters).columnGap) || 0); });
 	let filtersRow = $derived(stacked && (searchFocused || !!search || titleWidth + filtersNeed + 16 > toolbarWidth));
 	// Pool chart: options, a 14-day range (4 days back) and the recorded history behind it.
-	let showPool = $derived(!!settings?.show_provider_pace && supported.some(a => a.provider !== 'openai_compatible'));
+	let showPool = $derived(!!settings?.show_provider_pace && groups.some(group => group.id !== 'openai_compatible'));
 	let mode = $state<PoolMode>('remaining'), burnHours = $state(3), future = $state<FutureUsage>('same'), showAccounts = $state(false), offset = $state(0);
 	let now = $state(Date.now());
 	let rangeStart = $derived(addDays(midnight(now), -4 + 7 * offset));
