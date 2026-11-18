@@ -773,6 +773,22 @@ pub async fn public_models(
         Err(refusal) => error(StatusCode::UNAUTHORIZED, refusal.message()),
     }
 }
+/// Codex needs its native model rows to negotiate service tiers.
+pub async fn codex_models(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    match state.clients.authenticate(&headers) {
+        Ok(client) => match state.codex_catalog(&client).await {
+            Some(models) => Json(json!({"models": models})).into_response(),
+            None => error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Codex model catalog is temporarily unavailable",
+            ),
+        },
+        Err(refusal) => error(StatusCode::UNAUTHORIZED, refusal.message()),
+    }
+}
 /// The native Muse CLI needs provider metadata and bare ids from Meta only.
 pub async fn muse_models(
     State(state): State<Arc<AppState>>,

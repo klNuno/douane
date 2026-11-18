@@ -42,7 +42,6 @@ pub const COPILOT_API: &str = "https://api.githubcopilot.com";
 /// douane signs in through the OpenCode app and presents itself the same way.
 pub const COPILOT_USER_AGENT: &str = "opencode/1.19.5";
 pub const COPILOT_API_VERSION: &str = "2026-06-01";
-pub(crate) const CODEX_VERSION: &str = "0.166.0";
 pub(crate) const CODEX_USER_AGENT: &str = "codex_cli_rs/0.166.0";
 pub(crate) const CLAUDE_USER_AGENT: &str = "claude-cli/2.1.312 (external, cli)";
 pub(crate) const GEMINI_USER_AGENT: &str = "GeminiCLI/0.66.0";
@@ -246,6 +245,7 @@ pub(crate) fn upstream_headers(account: &AccountCredential, incoming: &HeaderMap
                 | "x-douane-admin"
                 | "x-management-key"
                 | "x-douane-provider"
+                | "x-douane-model-catalog"
                 | "proxy-authorization"
                 | "connection"
                 | "keep-alive"
@@ -416,6 +416,7 @@ async fn replay_owner(
     body: &Value,
     headers: &HeaderMap,
     from: Dialect,
+    provider_hint: Option<&str>,
 ) -> Result<Option<String>, String> {
     let Some(session) = crate::affinity::session_key(headers, body) else {
         return Ok(None);
@@ -434,10 +435,7 @@ async fn replay_owner(
             }
         }
         let config = state.config.read().await;
-        let provider = headers
-            .get("x-douane-provider")
-            .and_then(|v| v.to_str().ok())
-            .or(config.settings.default_provider.as_deref());
+        let provider = provider_hint.or(config.settings.default_provider.as_deref());
         if provider.is_some_and(|provider| {
             SubscriptionProvider::parse(provider) != Some(SubscriptionProvider::Antigravity)
         }) {
@@ -463,13 +461,44 @@ async fn replay_owner(
         .owner(model, &session, &history)
 }
 
+pub(crate) fn uses_codex_catalog(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-douane-model-catalog")
+        .is_some_and(|v| v == "codex")
+}
+
+async fn provider_hint<'a>(
+    state: &AppState,
+    body: &Value,
+    headers: &'a HeaderMap,
+    client: Option<&crate::clients::Client>,
+) -> Option<&'a str> {
+    let explicit = headers
+        .get("x-douane-provider")
+        .and_then(|v| v.to_str().ok());
+    if explicit.is_some() {
+        return explicit;
+    }
+    // The catalog's bare ids select Codex only for clients that see that row.
+    if uses_codex_catalog(headers)
+        && let Some(client) = client
+        && let Some(model) = body["model"].as_str().filter(|m| !m.contains('/'))
+        && state.codex_catalog_contains(client, model).await
+    {
+        return Some("codex");
+    }
+    None
+}
+
 pub(crate) async fn choose(
     state: &AppState,
     body: &Value,
     headers: &HeaderMap,
     client: Option<&crate::clients::Client>,
+    advance_rotation: bool,
 ) -> Result<(String, Vec<AccountCredential>, Option<String>), String> {
-    choose_for_replay(state, body, headers, client, None).await
+    let hint = provider_hint(state, body, headers, client).await;
+    choose_for_replay(state, body, headers, client, hint, None, advance_rotation).await
 }
 
 async fn choose_for_replay(
@@ -477,7 +506,9 @@ async fn choose_for_replay(
     body: &Value,
     headers: &HeaderMap,
     client: Option<&crate::clients::Client>,
+    provider_hint: Option<&str>,
     owner: Option<&str>,
+    advance_rotation: bool,
 ) -> Result<(String, Vec<AccountCredential>, Option<String>), String> {
     let model = body["model"]
         .as_str()
@@ -487,12 +518,11 @@ async fn choose_for_replay(
     let (upstream, accounts) = state
         .candidates_for_replay(
             model,
-            headers
-                .get("x-douane-provider")
-                .and_then(|v| v.to_str().ok()),
+            provider_hint,
             session.as_deref(),
             client,
             owner,
+            advance_rotation,
         )
         .await?;
     Ok((upstream, accounts, session))
@@ -532,7 +562,8 @@ pub async fn forward(
         }
     }
     let stream = value["stream"].as_bool().unwrap_or(false);
-    let owner = match replay_owner(&state, &value, &headers, from).await {
+    let hint = provider_hint(&state, &value, &headers, client.as_ref()).await;
+    let owner = match replay_owner(&state, &value, &headers, from, hint).await {
         Ok(owner) => owner,
         Err(e) => return error(StatusCode::BAD_REQUEST, &e),
     };
@@ -541,7 +572,9 @@ pub async fn forward(
         &value,
         &headers,
         client.as_ref(),
+        hint,
         owner.as_deref(),
+        true,
     )
     .await
     {

@@ -409,8 +409,13 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
             return;
         }
     };
+    let catalog_model = if relay::uses_codex_catalog(&headers) {
+        initial["model"].as_str().map(str::to_owned)
+    } else {
+        None
+    };
     let (model, candidates, session) =
-        match relay::choose(&state, &initial, &headers, client.as_ref()).await {
+        match relay::choose(&state, &initial, &headers, client.as_ref(), true).await {
             Ok(v) => v,
             Err(e) => {
                 if has_previous(&initial) {
@@ -512,8 +517,38 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                             Err(_) => { reject(&mut downstream, "websocket message must be valid JSON").await; break; }
                         };
                         if body["type"] == "response.create" {
-                            let requested = body["model"].as_str().unwrap_or(&model).to_owned();
-                            let requested = requested.strip_prefix(&format!("{}/", provider.as_str())).unwrap_or(&requested).to_owned();
+                            // Each request reads the client again: a revoked key stops here,
+                            // and changed access or shares apply to the next request.
+                            client = match state.clients.authenticate(&headers) {
+                                Ok(client) => Some(client),
+                                Err(refusal) => {
+                                    reject(&mut downstream, refusal.message()).await;
+                                    break;
+                                }
+                            };
+                            let requested = if let Some(default_model) = &catalog_model {
+                                if !body["model"].is_string() {
+                                    body["model"] = json!(default_model);
+                                }
+                                // Reuse the socket only if its subscription can
+                                // still serve the model in the selected pool.
+                                match relay::choose(&state, &body, &headers, client.as_ref(), false).await {
+                                    Ok((model, choices, _)) if choices.iter().any(|choice| choice.id == account.id) => model,
+                                    result => {
+                                        if has_previous(&body) {
+                                            previous_not_found(&mut downstream, &body).await;
+                                        } else if let Err(error) = result {
+                                            reject(&mut downstream, &error).await;
+                                        } else {
+                                            close_for_recovery(&mut downstream).await;
+                                        }
+                                        break;
+                                    }
+                                }
+                            } else {
+                                let model = body["model"].as_str().unwrap_or(&model);
+                                model.strip_prefix(&format!("{}/", provider.as_str())).unwrap_or(model).to_owned()
+                            };
                             if (requested.contains('/') || !account.models.is_empty()) && !account.models.contains(&requested) {
                                 reject(&mut downstream, "a websocket session cannot switch provider or subscription").await;
                                 break;
@@ -529,15 +564,6 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                                 break;
                             }
                             if pending == 0 { attempted.clear(); }
-                            // Each request reads the client again: a revoked key stops here,
-                            // and changed access or shares apply to the next request.
-                            client = match state.clients.authenticate(&headers) {
-                                Ok(client) => Some(client),
-                                Err(refusal) => {
-                                    reject(&mut downstream, refusal.message()).await;
-                                    break;
-                                }
-                            };
                             let current = state.accounts.get(&account.id).await;
                             // A resting account stays only while its pool still has nothing else.
                             let kept = match &current {

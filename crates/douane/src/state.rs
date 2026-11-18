@@ -1,6 +1,6 @@
 use crate::{
     ledger::Ledger,
-    scheduler::{Candidate, Scheduler},
+    scheduler::{Candidate, Scheduler, Strategy},
     settings::Config,
     subscriptions::{
         AccountCredential, AccountStore, OAuthManager, QuotaService, ResetManager,
@@ -16,6 +16,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::sync::RwLock;
+
+type AccountListing = BTreeMap<String, Option<Value>>;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Model {
@@ -132,10 +134,8 @@ pub struct AppState {
     /// Models an account refused although a catalog lists them, by account
     /// and model, with the time of the refusal.
     refused: Mutex<BTreeMap<(String, String), std::time::Instant>>,
-    /// The upstream ids each Codex, Copilot or Antigravity account's own live
-    /// listing returned last: one Google or GitHub plan can offer models
-    /// another one of the same pool lacks.
-    listed: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    /// Each account's last live model list, with native rows for Codex.
+    listed: Mutex<BTreeMap<String, AccountListing>>,
     /// Effort levels an OpenAI-compatible endpoint named for a model, by
     /// account and model, read once and kept across refreshes. Empty when it
     /// answered without a list.
@@ -238,7 +238,7 @@ impl AppState {
                 .unwrap_or_else(|e| e.into_inner())
                 .get(account)
                 .map_or(provider != SubscriptionProvider::Meta, |ids| {
-                    ids.contains(model)
+                    ids.contains_key(model)
                 })
     }
 
@@ -403,7 +403,7 @@ impl AppState {
                         if account.provider == SubscriptionProvider::Meta {
                             let ids = data
                                 .iter()
-                                .filter_map(|m| m["id"].as_str().map(str::to_owned))
+                                .filter_map(|m| Some((m["id"].as_str()?.to_owned(), None)))
                                 .collect();
                             self.listed
                                 .lock()
@@ -482,8 +482,8 @@ impl AppState {
             // ones on a first read, and is retried like a failed listing.
             if account.provider == SubscriptionProvider::Antigravity && account.models.is_empty() {
                 match self.antigravity_models(&account).await {
-                    Some(live) => {
-                        self.remember_listing(&account.id, &live);
+                    Some(mut live) => {
+                        self.remember_listing(&account.id, &mut live);
                         available = live
                             .into_iter()
                             .filter(|m| !self.refuses(&account.id, &m.id))
@@ -507,8 +507,8 @@ impl AppState {
                     self.copilot_models(&account).await
                 };
                 match live {
-                    Some(live) => {
-                        self.remember_listing(&account.id, &live);
+                    Some(mut live) => {
+                        self.remember_listing(&account.id, &mut live);
                         available = live
                             .into_iter()
                             .filter(|m| account.models.is_empty() || account.models.contains(&m.id))
@@ -600,6 +600,7 @@ impl AppState {
     /// Codex's native list carries newly released models and their current
     /// context/reasoning metadata, independently of the bundled fallback.
     async fn codex_models(&self, stored: &AccountCredential) -> Option<Vec<Model>> {
+        const VERSION: &str = "0.170.0";
         let account = self.oauth.credential(&stored.id).await.ok()?;
         let base = account
             .base_url
@@ -608,10 +609,10 @@ impl AppState {
         let mut request = self
             .client
             .get(crate::relay::endpoint(base, "/models"))
-            .query(&[("client_version", crate::relay::CODEX_VERSION)])
+            .query(&[("client_version", VERSION)])
             .bearer_auth(&account.access_token)
             .header("originator", "codex_cli_rs")
-            .header("user-agent", crate::relay::CODEX_USER_AGENT)
+            .header("user-agent", format!("codex_cli_rs/{VERSION}"))
             .timeout(std::time::Duration::from_secs(15));
         if let Some(id) = &account.account_id {
             request = request.header("chatgpt-account-id", id);
@@ -627,7 +628,7 @@ impl AppState {
             let Some(id) = row
                 .get("slug")
                 .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
+                .filter(|id| !id.trim().is_empty())
             else {
                 continue;
             };
@@ -665,6 +666,7 @@ impl AppState {
                 } else {
                     Some(json!({"levels":levels}))
                 },
+                metadata: Some(row.clone()),
                 ..Model::default()
             });
         }
@@ -734,14 +736,151 @@ impl AppState {
     }
 
     /// What an account's own live listing named, for routing its requests.
-    fn remember_listing(&self, account: &str, live: &[Model]) {
+    fn remember_listing(&self, account: &str, live: &mut [Model]) {
         self.listed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(
                 account.to_owned(),
-                live.iter().map(|m| m.id.clone()).collect(),
+                live.iter_mut()
+                    .map(|m| {
+                        let native = if m.provider == SubscriptionProvider::Codex {
+                            m.metadata.take()
+                        } else {
+                            None
+                        };
+                        (m.id.clone(), native)
+                    })
+                    .collect(),
             );
+    }
+
+    async fn codex_catalog_accounts(
+        &self,
+        client: &crate::clients::Client,
+    ) -> Vec<AccountCredential> {
+        self.accounts
+            .enabled_subscriptions(SubscriptionProvider::Codex)
+            .await
+            .into_iter()
+            .filter(|a| client.access.allows(a))
+            .collect()
+    }
+
+    fn codex_catalog_source<'a>(
+        &self,
+        listed: &'a BTreeMap<String, AccountListing>,
+        account: &AccountCredential,
+        id: &str,
+    ) -> Option<Option<&'a Value>> {
+        if (!account.models.is_empty() && !account.models.iter().any(|model| model == id))
+            || self.refuses(&account.id, id)
+        {
+            return None;
+        }
+        // An unlisted account may still serve the model, with unknown tiers.
+        match listed.get(&account.id) {
+            Some(catalog) => catalog.get(id).map(Option::as_ref),
+            None => Some(None),
+        }
+    }
+
+    fn codex_catalog_model_enabled(model: &Model, disabled: &BTreeSet<String>) -> bool {
+        model.provider == SubscriptionProvider::Codex
+            && model.enabled
+            && !disabled.contains(&model.id)
+            && !disabled.contains(&model.upstream_id)
+    }
+
+    pub(crate) async fn codex_catalog_contains(
+        &self,
+        client: &crate::clients::Client,
+        id: &str,
+    ) -> bool {
+        let accounts = self.codex_catalog_accounts(client).await;
+        if accounts.is_empty() {
+            return false;
+        }
+        let disabled = self.config.read().await.disabled_models.clone();
+        let models = self.models.read().await;
+        if !models.iter().any(|model| {
+            model.upstream_id == id && Self::codex_catalog_model_enabled(model, &disabled)
+        }) {
+            return false;
+        }
+        let listed = self.listed.lock().unwrap_or_else(|e| e.into_inner());
+        accounts.iter().any(|account| {
+            self.codex_catalog_source(&listed, account, id)
+                .flatten()
+                .is_some_and(Value::is_object)
+        })
+    }
+
+    pub(crate) async fn codex_catalog(
+        &self,
+        client: &crate::clients::Client,
+    ) -> Option<Vec<Value>> {
+        let accounts = self.codex_catalog_accounts(client).await;
+        let disabled = self.config.read().await.disabled_models.clone();
+        let models = self.models.read().await;
+        let listed = self.listed.lock().unwrap_or_else(|e| e.into_inner());
+        let rows: Vec<_> =
+            models
+                .iter()
+                .filter(|m| Self::codex_catalog_model_enabled(m, &disabled))
+                .filter_map(|model| {
+                    let id = &model.upstream_id;
+                    let rows: Vec<_> = accounts
+                        .iter()
+                        .filter_map(|a| self.codex_catalog_source(&listed, a, id))
+                        .collect();
+                    let mut row = rows.iter().find_map(|row| *row)?.as_object()?.clone();
+                    // The gateway can route subscription-only models with a client key.
+                    row.insert("supported_in_api".into(), json!(true));
+                    row.remove("available_access_programs");
+                    row.remove("availability_nux");
+                    // Rotation may use any of these accounts. Keep a tier only if
+                    // each account that could serve this model advertises it.
+                    fn tier_id(tier: &Value) -> Option<&str> {
+                        tier.as_str().or_else(|| tier["id"].as_str())
+                    }
+                    for field in ["service_tiers", "additional_speed_tiers"] {
+                        if let Some(tiers) = row.get_mut(field).and_then(Value::as_array_mut) {
+                            tiers.retain(|tier| {
+                                let Some(id) = tier_id(tier) else {
+                                    return false;
+                                };
+                                rows.iter().all(|source| {
+                                    source.and_then(|row| row[field].as_array()).is_some_and(
+                                        |other| other.iter().any(|tier| tier_id(tier) == Some(id)),
+                                    )
+                                })
+                            });
+                        }
+                    }
+                    if let Some(default) = row.get("default_service_tier")
+                        && default != "default"
+                        && !row
+                            .get("service_tiers")
+                            .and_then(Value::as_array)
+                            .is_some_and(|tiers| tiers.iter().any(|tier| &tier["id"] == default))
+                    {
+                        row.remove("default_service_tier");
+                    }
+                    // Older clients saved qualified ids. Codex needs the exact
+                    // slug in its catalog to keep its metadata when resuming them.
+                    let mut alias = row.clone();
+                    alias.insert("slug".into(), json!(model.id));
+                    alias.insert("visibility".into(), json!("hide"));
+                    Some([Value::Object(row), Value::Object(alias)])
+                })
+                .flatten()
+                .collect();
+        // A temporarily missing first listing is not an authoritative empty catalog.
+        if rows.is_empty() && accounts.iter().any(|a| !listed.contains_key(&a.id)) {
+            return None;
+        }
+        Some(rows)
     }
 
     /// Google renames Antigravity models without notice, so the bundled ids
@@ -794,7 +933,7 @@ impl AppState {
         session: Option<&str>,
         client: Option<&crate::clients::Client>,
     ) -> Result<(String, Vec<AccountCredential>), String> {
-        self.candidates_for_replay(requested, provider_hint, session, client, None)
+        self.candidates_for_replay(requested, provider_hint, session, client, None, true)
             .await
     }
 
@@ -805,6 +944,7 @@ impl AppState {
         session: Option<&str>,
         client: Option<&crate::clients::Client>,
         owner: Option<&str>,
+        advance_rotation: bool,
     ) -> Result<(String, Vec<AccountCredential>), String> {
         let config = self.config.read().await.clone();
         if config.disabled_models.contains(requested) {
@@ -991,11 +1131,16 @@ impl AppState {
                     return Ok((model.into(), pinned));
                 }
             }
-            let order = self
-                .scheduler
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .order(pool, strategy, &candidates, now);
+            let order = if advance_rotation {
+                self.scheduler
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .order(pool, strategy, &candidates, now)
+            } else {
+                // A reused socket only checks whether its account is still in
+                // the selected pool. Account order cannot change that pool.
+                Scheduler::default().order(pool, Strategy::FillFirst, &candidates, now)
+            };
             for id in order {
                 if let Some(a) = eligible.iter().find(|a| a.id == id) {
                     ordered.push(a.clone());
@@ -2121,7 +2266,14 @@ mod tests {
             .await
             .unwrap();
         let pick = || {
-            state.candidates_for_replay("antigravity/synthetic", None, None, None, Some(&owner.id))
+            state.candidates_for_replay(
+                "antigravity/synthetic",
+                None,
+                None,
+                None,
+                Some(&owner.id),
+                true,
+            )
         };
         assert_eq!(pick().await.unwrap().1[0].id, owner.id);
         let mut snapshot = weekly(&owner.id, "2099-01-08T00:00:00Z");

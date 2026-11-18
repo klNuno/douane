@@ -836,6 +836,15 @@ impl AccountStore {
             .await
     }
 
+    /// Catalog access includes enabled accounts during temporary cooldowns.
+    pub(crate) async fn enabled_subscriptions(
+        &self,
+        provider: SubscriptionProvider,
+    ) -> Vec<AccountCredential> {
+        self.pool(provider, None, None, None, |account| account.enabled)
+            .await
+    }
+
     /// A history owner may be returned during cooldown so the relay can report
     /// its retry delay. All other eligibility checks still apply.
     pub(crate) async fn eligible_in_for_replay(
