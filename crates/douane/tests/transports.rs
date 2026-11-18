@@ -113,6 +113,10 @@ impl Fixture {
                 .route("/v1/responses", post(mock_http).get(mock_upgrade))
                 .route("/v1/chat/completions", post(mock_http))
                 .route(
+                    "/models",
+                    get(|| async { axum::Json(json!({"models":[{"slug":"gpt-test"}]})) }),
+                )
+                .route(
                     "/v1/messages/count_tokens",
                     post(|| async { axum::Json(json!({"input_tokens":12})) }),
                 )
@@ -198,6 +202,25 @@ impl Fixture {
         ] {
             request.headers_mut().insert(name, value.parse().unwrap());
         }
+        timeout(WAIT, connect_async(request))
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+    }
+
+    async fn catalog_socket(&self) -> ClientSocket {
+        let url = format!(
+            "{}/v1/responses",
+            self.gateway.url.replace("http://", "ws://")
+        );
+        let mut request = url.into_client_request().unwrap();
+        let headers = request.headers_mut();
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", self.key).parse().unwrap(),
+        );
+        headers.insert("x-douane-model-catalog", "codex".parse().unwrap());
         timeout(WAIT, connect_async(request))
             .await
             .unwrap()
@@ -1497,6 +1520,179 @@ async fn native_websocket_request_error_without_lane_releases_the_only_active_ca
         1
     );
     assert_eq!(fixture.mock.connections.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn native_catalog_routes_only_models_advertised_to_the_calling_client() {
+    let fixture = Fixture::new(
+        &[("codex", "native"), ("openai_compatible", "compatible")],
+        Strategy::FillFirst,
+    )
+    .await;
+    fixture.state.config.write().await.settings.default_provider = Some("openai_compatible".into());
+    let (_, restricted) = fixture
+        .state
+        .clients
+        .create(douane::clients::ClientPatch {
+            name: Some("Only compatible".into()),
+            access: Some(douane::clients::Access {
+                all: false,
+                accounts: [fixture.accounts[1].0.clone()].into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    let http = reqwest::Client::builder().timeout(WAIT).build().unwrap();
+    let catalog = format!("{}/v1/codex/models", fixture.gateway.url);
+    for (key, expected) in [(&fixture.key, 2), (&restricted, 0)] {
+        let models: Value = http
+            .get(&catalog)
+            .bearer_auth(key)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(models["models"].as_array().unwrap().len(), expected);
+    }
+    for (key, model, marker, explicit, expected) in [
+        (&fixture.key, "gpt-test", true, None, "native"),
+        (&restricted, "gpt-test", true, None, "compatible"),
+        (&fixture.key, "gpt-test", false, None, "compatible"),
+        (
+            &fixture.key,
+            "gpt-test",
+            true,
+            Some("openai_compatible"),
+            "compatible",
+        ),
+        (
+            &fixture.key,
+            "codex/gpt-test",
+            true,
+            Some("openai_compatible"),
+            "native",
+        ),
+    ] {
+        let mut request = http
+            .post(format!("{}/v1/responses", fixture.gateway.url))
+            .bearer_auth(key)
+            .json(&json!({"model":model,"input":"test","stream":true}));
+        if marker {
+            request = request.header("x-douane-model-catalog", "codex");
+        }
+        if let Some(provider) = explicit {
+            request = request.header("x-douane-provider", provider);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let requests = fixture.received();
+        let sent = requests.last().unwrap();
+        assert_eq!(
+            sent.headers["authorization"],
+            format!("Bearer fixture-{expected}")
+        );
+        assert_eq!(sent.body["model"], "gpt-test");
+        assert!(!sent.headers.contains_key("x-douane-model-catalog"));
+    }
+}
+
+#[tokio::test]
+async fn native_catalog_switch_reconnects_a_reused_websocket_before_forwarding() {
+    let fixture = Fixture::new(
+        &[("codex", "native"), ("openai_compatible", "compatible")],
+        Strategy::FillFirst,
+    )
+    .await;
+    fixture.state.config.write().await.settings.default_provider = Some("openai_compatible".into());
+    for (first, second, first_account, second_account) in [
+        (
+            "openai-compatible/gpt-test",
+            "gpt-test",
+            "compatible",
+            "native",
+        ),
+        (
+            "gpt-test",
+            "openai-compatible/gpt-test",
+            "native",
+            "compatible",
+        ),
+    ] {
+        let mut socket = fixture.catalog_socket().await;
+        send(
+            &mut socket,
+            json!({"type":"response.create","model":first,"input":"first"}),
+        )
+        .await;
+        assert_eq!(next(&mut socket).await["type"], "response.completed");
+        let before = fixture.received().len();
+        assert_eq!(
+            fixture.received()[before - 1].headers["authorization"],
+            format!("Bearer fixture-{first_account}")
+        );
+        let next_turn = json!({"type":"response.create","model":second,"input":"second"});
+        send(&mut socket, next_turn.clone()).await;
+        let message = timeout(WAIT, socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&message, Message::Close(Some(frame)) if u16::from(frame.code) == 1013),
+            "{message:?}"
+        );
+        assert_eq!(fixture.received().len(), before);
+
+        let mut socket = fixture.catalog_socket().await;
+        send(&mut socket, next_turn).await;
+        assert_eq!(next(&mut socket).await["type"], "response.completed");
+        let received = fixture.received();
+        assert_eq!(received.len(), before + 1);
+        assert_eq!(
+            received[before].headers["authorization"],
+            format!("Bearer fixture-{second_account}")
+        );
+        assert!(
+            !received[before]
+                .headers
+                .contains_key("x-douane-model-catalog")
+        );
+    }
+}
+
+#[tokio::test]
+async fn reusing_a_catalog_websocket_preserves_new_connection_rotation() {
+    let fixture = Fixture::new(
+        &[("codex", "first"), ("codex", "second")],
+        Strategy::RoundRobin,
+    )
+    .await;
+    let request = json!({"type":"response.create","model":"gpt-test","input":"test"});
+    let mut socket = fixture.catalog_socket().await;
+    for _ in 0..2 {
+        send(&mut socket, request.clone()).await;
+        assert_eq!(next(&mut socket).await["type"], "response.completed");
+    }
+    let mut fresh = fixture.catalog_socket().await;
+    send(&mut fresh, request).await;
+    assert_eq!(next(&mut fresh).await["type"], "response.completed");
+    let received = fixture.received();
+    assert_eq!(received.len(), 3);
+    assert_eq!(
+        received[0].headers["authorization"],
+        received[1].headers["authorization"]
+    );
+    assert_ne!(
+        received[0].headers["authorization"],
+        received[2].headers["authorization"]
+    );
 }
 
 #[tokio::test]
