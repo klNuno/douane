@@ -6,6 +6,7 @@ export type Account = {
 	subscription?: Subscription | null;
 	enabled: boolean; hidden?: boolean; status: string; last_error?: string | null; updated_at?: string | null;
 	reserve_percent?: number | null; reserve_windows?: ReserveWindow[]; reserve_measured?: boolean | null; reserve_reached?: boolean;
+	quota_supported?: boolean;
 	route?: string | null; base_url?: string | null; dialect?: Dialect | null; models?: string[];
 };
 export type Dialect = 'chat' | 'responses' | 'messages';
@@ -174,11 +175,12 @@ export function resetLabel(value?: string | null) {
 }
 export function creditValue(value: number | null | undefined, unit: string) {
 	if (value == null) return t('credit.unknown');
-	if (unit === 'USD') return new Intl.NumberFormat(locale(), { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value);
+	if (unit === 'USD') return new Intl.NumberFormat(locale(), { style: 'currency', currency: 'USD', maximumFractionDigits: Math.abs(value) < 0.01 && value !== 0 ? 6 : 2 }).format(value);
 	if (/^[A-Z]{3}_minor$/.test(unit)) return new Intl.NumberFormat(locale(), { style: 'currency', currency: unit.slice(0, 3), maximumFractionDigits: 2 }).format(value / 100);
+	if (unit === 'requests') return t(value === 1 ? 'credit.requests.one' : 'credit.requests.other', { count: value });
 	return `${new Intl.NumberFormat(locale(), { maximumFractionDigits: 2 }).format(value)} ${unit === 'credits' ? t('credit.credits') : unit}`;
 }
-const usageKeys: Record<string, StringKey> = { weekly: 'usage.weekly', 'codex weekly': 'usage.weekly', 'grok weekly': 'usage.weekly', monthly: 'usage.monthly', '5 hours': 'usage.fiveHours', 'five hour': 'usage.fiveHours', 'extra usage': 'usage.extra', 'additional usage': 'usage.extra', 'codex credits': 'usage.codexCredits', 'credit balance': 'usage.creditBalance', 'premium requests': 'usage.premiumRequests', chat: 'usage.chat', completions: 'usage.completions' };
+const usageKeys: Record<string, StringKey> = { weekly: 'usage.weekly', 'codex weekly': 'usage.weekly', 'grok weekly': 'usage.weekly', monthly: 'usage.monthly', '5 hours': 'usage.fiveHours', 'five hour': 'usage.fiveHours', 'extra usage': 'usage.extra', 'additional usage': 'usage.extra', 'codex credits': 'usage.codexCredits', 'credit balance': 'usage.creditBalance', 'available paid credits': 'usage.availablePaidCredits', 'key spending cap': 'usage.keySpendingCap', 'applicable spending budget': 'usage.applicableSpendingBudget', 'effective budget': 'usage.effectiveBudget', 'free models daily': 'usage.freeModelsDaily', 'premium requests': 'usage.premiumRequests', chat: 'usage.chat', completions: 'usage.completions' };
 /** A display label for a quota label the server sends in English. */
 export function usageLabel(label: string) {
 	const key = usageKeys[label.toLowerCase()];

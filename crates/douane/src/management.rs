@@ -147,7 +147,9 @@ async fn account_value(
         now,
         state.free_before_reset_seconds().await,
     );
+    let quota_supported = crate::subscriptions::QuotaService::supports(&summary);
     let mut value = json!(summary);
+    value["quota_supported"] = json!(quota_supported);
     value["reserve_measured"] = json!(measured);
     value["reserve_reached"] = json!(reached);
     value
@@ -510,12 +512,12 @@ pub async fn update_account(
         models: body.models,
         api_key: body.api_key,
     };
-    let endpoint_change = endpoint.route.is_some()
-        || endpoint.base_url.is_some()
+    let endpoint_change = endpoint.base_url.is_some()
+        || endpoint.api_key.is_some()
+        || endpoint.route.is_some()
         || endpoint.dialect.is_some()
         || endpoint.image_limit.is_some()
-        || endpoint.models.is_some()
-        || endpoint.api_key.is_some();
+        || endpoint.models.is_some();
     if name.is_none()
         && body.enabled.is_none()
         && body.hidden.is_none()
@@ -947,7 +949,11 @@ pub async fn public_quotas(
         // A read asked by hand: failures show at once, and a success clears
         // any shown error. The task outlives a timeout so no write is cut.
         let worker = state.clone();
-        let task = tokio::spawn(async move { worker.refresh_quotas(None).await });
+        let task = tokio::spawn(async move {
+            worker
+                .refresh_quotas_matching(|account| account.provider.reports_quota())
+                .await;
+        });
         let _ = tokio::time::timeout(CLIENT_REFRESH_WAIT, task).await;
     }
     let settings = state.config.read().await.settings.clone();
@@ -1321,6 +1327,53 @@ pub async fn auth_file_models(
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn public_quota_refresh_skips_compatible_billing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::settings::Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let account = state
+            .accounts
+            .import(
+                json!({
+                    "type": "openai_compatible", "route": "openrouter",
+                    "base_url": "https://openrouter.ai/api/v1", "api_key": "fixture-key"
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let (_, key) = state
+            .clients
+            .create(crate::clients::ClientPatch {
+                name: Some("Fixture".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {key}").parse().unwrap(),
+        );
+
+        let response = public_quotas(
+            State(state.clone()),
+            headers,
+            Query(QuotaRead {
+                refresh: Some("1".into()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.quotas.get(&account.id).await.is_none());
+
+        state.refresh_quotas(Some(&account.id)).await;
+        // In tests the billing client fails locally unless given a loopback origin.
+        assert!(state.quotas.get(&account.id).await.unwrap().error.is_some());
+    }
 
     #[tokio::test]
     async fn account_listing_reports_reserve_state_per_quota_shape() {

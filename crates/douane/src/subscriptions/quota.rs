@@ -1,9 +1,11 @@
+use super::compatible_quota::BillingApi;
 use super::cooldown::QuotaScope;
 use super::oauth::send_json;
 use super::store::{subscription_from_value, text};
 use super::{
-    AccountCredential, AccountStore, OAuthManager, SubscriptionError, SubscriptionProvider,
-    SubscriptionTier, antigravity_user_agent, now, parse_timestamp, timestamp,
+    AccountCredential, AccountStore, AccountSummary, OAuthManager, SubscriptionError,
+    SubscriptionProvider, SubscriptionTier, antigravity_user_agent, now, parse_timestamp,
+    timestamp,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -317,11 +319,87 @@ struct Failures {
     retry_at: time::OffsetDateTime,
 }
 
+impl Failures {
+    fn after(previous: Option<Self>, observed: time::OffsetDateTime) -> Self {
+        let count = previous.map_or(1, |failure| failure.count.saturating_add(1));
+        Self {
+            count,
+            retry_at: observed + retry_delay(count),
+        }
+    }
+}
+
+struct BillingReading {
+    revision: u64,
+    snapshot: QuotaSnapshot,
+    failure: Option<Failures>,
+}
+
+fn quota_read_due(
+    snapshot: Option<&QuotaSnapshot>,
+    failure: Option<Failures>,
+    interval: time::Duration,
+    now: time::OffsetDateTime,
+) -> bool {
+    match failure {
+        Some(failure) => failure.retry_at <= now,
+        None => snapshot
+            .and_then(|snapshot| parse_timestamp(&snapshot.updated_at))
+            .is_none_or(|at| now - at >= interval),
+    }
+}
+
+fn failed_read(
+    account: &AccountCredential,
+    previous: Option<&QuotaSnapshot>,
+    error: SubscriptionError,
+    failure: Failures,
+    trigger: Trigger,
+) -> QuotaSnapshot {
+    // Keep the last observation dated as such. Anthropic can rate-limit
+    // usage reads for days while inference supplies fresher windows.
+    let quiet = matches!(error, SubscriptionError::Upstream(429))
+        && previous.is_some_and(|value| !value.windows.is_empty());
+    let shown = previous.is_some_and(|value| value.error.is_some())
+        || (!quiet
+            && (trigger == Trigger::Manual
+                || !error.is_transient()
+                || failure.count >= FAILURES_SHOWN));
+    if !shown {
+        tracing::debug!(
+            account = account.id,
+            count = failure.count,
+            "quota read failed, retrying quietly"
+        );
+    }
+    let mut snapshot = previous.cloned().unwrap_or_else(|| QuotaSnapshot {
+        account_id: account.id.clone(),
+        provider: account.provider,
+        windows: vec![],
+        updated_at: now(),
+        error: None,
+        subscription: account.summary().subscription,
+        credits: vec![],
+        verification_required: false,
+        verification_available: false,
+    });
+    if snapshot.subscription.is_none() {
+        snapshot.subscription = account.summary().subscription;
+    }
+    snapshot.verification_required = error.is_verification_required();
+    snapshot.verification_available = error.verification_url().is_some();
+    snapshot.error = shown.then(|| error.to_string());
+    snapshot
+}
+
 pub struct QuotaService {
     client: reqwest::Client,
+    billing_client: reqwest::Client,
     store: Arc<AccountStore>,
     oauth: Arc<OAuthManager>,
     cache: RwLock<BTreeMap<String, QuotaSnapshot>>,
+    // The key revision is process-local, so billing readings only live in memory.
+    billing: RwLock<BTreeMap<String, BillingReading>>,
     save_lock: tokio::sync::Mutex<()>,
     verification_urls: RwLock<BTreeMap<String, String>>,
     failures: RwLock<BTreeMap<String, Failures>>,
@@ -331,6 +409,8 @@ pub struct QuotaService {
     pub(crate) claude_api: String,
     /// ChatGPT's Codex usage endpoint; tests use a loopback.
     pub(crate) codex_usage_url: String,
+    #[cfg(test)]
+    billing_test_origin: Option<String>,
 }
 
 impl QuotaService {
@@ -344,18 +424,26 @@ impl QuotaService {
         store: Arc<AccountStore>,
         oauth: Arc<OAuthManager>,
     ) -> Self {
-        let cache = load_snapshots(&store.quota_snapshot_path());
+        let mut cache = load_snapshots(&store.quota_snapshot_path());
+        cache.retain(|_, snapshot| snapshot.provider != SubscriptionProvider::OpenaiCompatible);
         Self {
             client,
+            billing_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("billing HTTP client"),
             store,
             oauth,
             cache: RwLock::new(cache),
+            billing: RwLock::new(BTreeMap::new()),
             save_lock: tokio::sync::Mutex::new(()),
             verification_urls: RwLock::new(BTreeMap::new()),
             failures: RwLock::new(BTreeMap::new()),
             copilot_user_url: "https://api.github.com/copilot_internal/user".into(),
             claude_api: "https://api.anthropic.com".into(),
             codex_usage_url: "https://chatgpt.com/backend-api/wham/usage".into(),
+            #[cfg(test)]
+            billing_test_origin: None,
         }
     }
 
@@ -376,19 +464,21 @@ impl QuotaService {
     }
 
     pub async fn list(&self) -> Vec<QuotaSnapshot> {
-        let accounts: std::collections::BTreeSet<_> = self
-            .store
-            .list()
-            .await
+        let accounts = self.store.list().await;
+        let cache = self.cache.read().await;
+        let billing = self.billing.read().await;
+        accounts
             .into_iter()
-            .map(|account| account.id)
-            .collect();
-        self.cache
-            .read()
-            .await
-            .values()
-            .filter(|snapshot| accounts.contains(&snapshot.account_id))
-            .cloned()
+            .filter_map(|account| {
+                if account.provider == SubscriptionProvider::OpenaiCompatible {
+                    billing
+                        .get(&account.id)
+                        .filter(|reading| reading.revision == account.endpoint_revision)
+                        .map(|reading| reading.snapshot.clone())
+                } else {
+                    cache.get(&account.id).cloned()
+                }
+            })
             .collect()
     }
 
@@ -401,7 +491,22 @@ impl QuotaService {
     }
 
     pub async fn get(&self, id: &str) -> Option<QuotaSnapshot> {
-        self.cache.read().await.get(id).cloned()
+        if let Some(snapshot) = self.cache.read().await.get(id).cloned() {
+            return Some(snapshot);
+        }
+        let (revision, snapshot) = self
+            .billing
+            .read()
+            .await
+            .get(id)
+            .map(|reading| (reading.revision, reading.snapshot.clone()))?;
+        (revision == self.store.read_account(id).await?.endpoint_revision).then_some(snapshot)
+    }
+
+    pub(crate) fn supports(account: &AccountSummary) -> bool {
+        account.provider.reports_quota()
+            || (account.provider == SubscriptionProvider::OpenaiCompatible
+                && BillingApi::for_base_url(account.base_url.as_deref()).is_some())
     }
 
     pub async fn verification_url(&self, id: &str) -> Option<String> {
@@ -431,6 +536,26 @@ impl QuotaService {
             .await
             .get(id)
             .is_some_and(|failures| failures.retry_at > now)
+        {
+            return None;
+        }
+        let waiting_revision = self
+            .billing
+            .read()
+            .await
+            .get(id)
+            .filter(|reading| {
+                reading
+                    .failure
+                    .is_some_and(|failure| failure.retry_at > now)
+            })
+            .map(|reading| reading.revision);
+        if let Some(revision) = waiting_revision
+            && self
+                .store
+                .read_account(id)
+                .await
+                .is_some_and(|account| account.endpoint_revision == revision)
         {
             return None;
         }
@@ -583,27 +708,44 @@ impl QuotaService {
     /// delay has passed, a healthy one once its snapshot is `interval` old.
     /// Retry state of deleted accounts goes.
     pub async fn due(&self, interval: time::Duration, now: time::OffsetDateTime) -> Vec<String> {
-        let ids: Vec<String> = self
-            .store
-            .list()
-            .await
-            .into_iter()
+        let accounts = self.store.list().await;
+        let due_accounts: Vec<_> = accounts
+            .iter()
             .filter(|account| {
-                account.provider.reports_quota() && account.provider != SubscriptionProvider::Meta
+                Self::supports(account)
+                    && account.provider != SubscriptionProvider::Meta
+                    && (account.provider != SubscriptionProvider::OpenaiCompatible
+                        || account.enabled)
             })
-            .map(|account| account.id)
             .collect();
         let mut failures = self.failures.write().await;
-        failures.retain(|id, _| ids.contains(id));
+        failures.retain(|id, _| due_accounts.iter().any(|account| account.id == *id));
         let cache = self.cache.read().await;
-        ids.into_iter()
-            .filter(|id| match failures.get(id) {
-                Some(failures) => failures.retry_at <= now,
-                None => cache
-                    .get(id)
-                    .and_then(|snapshot| parse_timestamp(&snapshot.updated_at))
-                    .is_none_or(|at| now - at >= interval),
+        let mut billing = self.billing.write().await;
+        billing.retain(|id, _| accounts.iter().any(|account| account.id == *id));
+        due_accounts
+            .into_iter()
+            .filter(|account| {
+                if account.provider == SubscriptionProvider::OpenaiCompatible {
+                    let reading = billing
+                        .get(&account.id)
+                        .filter(|reading| reading.revision == account.endpoint_revision);
+                    quota_read_due(
+                        reading.map(|reading| &reading.snapshot),
+                        reading.and_then(|reading| reading.failure),
+                        interval,
+                        now,
+                    )
+                } else {
+                    quota_read_due(
+                        cache.get(&account.id),
+                        failures.get(&account.id).copied(),
+                        interval,
+                        now,
+                    )
+                }
             })
+            .map(|account| account.id.clone())
             .collect()
     }
 
@@ -644,6 +786,12 @@ impl QuotaService {
                 verification_available: false,
             }));
         }
+        if account.provider == SubscriptionProvider::OpenaiCompatible {
+            let api = BillingApi::for_base_url(account.base_url.as_deref())
+                .ok_or(SubscriptionError::Unsupported)?;
+            let result = self.fetch_billing(&account, api).await;
+            return self.complete_refresh(id, &account, result, trigger).await;
+        }
         // Nothing to read: no request, and no error snapshot to show.
         if !account.provider.reports_quota() {
             return Err(SubscriptionError::Unsupported);
@@ -683,16 +831,14 @@ impl QuotaService {
         result: Result<Observation, SubscriptionError>,
         trigger: Trigger,
     ) -> Result<QuotaSnapshot, SubscriptionError> {
+        if account.provider == SubscriptionProvider::OpenaiCompatible {
+            return self.complete_billing(id, account, result, trigger).await;
+        }
         let verification_url = result
             .as_ref()
             .err()
             .and_then(SubscriptionError::verification_url)
             .map(str::to_owned);
-        let verification_required = result
-            .as_ref()
-            .err()
-            .is_some_and(SubscriptionError::is_verification_required);
-        let verification_available = verification_url.is_some();
         let snapshot = match result {
             Ok(observation) => {
                 let snapshot = QuotaSnapshot {
@@ -722,55 +868,12 @@ impl QuotaService {
                 snapshot
             }
             Err(error) => {
-                // Keep the last real observation on a transient error. Its
-                // timestamp still states when those numbers were observed.
                 let previous = self.cache.read().await.get(id).cloned();
                 let observed = time::OffsetDateTime::now_utc();
-                let count = {
-                    let mut failures = self.failures.write().await;
-                    let entry = failures.entry(id.into()).or_insert(Failures {
-                        count: 0,
-                        retry_at: observed,
-                    });
-                    entry.count = entry.count.saturating_add(1);
-                    entry.retry_at = observed + retry_delay(entry.count);
-                    entry.count
-                };
-                // Anthropic can answer usage reads with 429 for days. The last
-                // numbers stand, dated by their observation: inference headers
-                // renew them while the account serves, and an idle account
-                // spends nothing. Only an account with no numbers shows it.
-                let quiet = matches!(error, SubscriptionError::Upstream(429))
-                    && previous.as_ref().is_some_and(|v| !v.windows.is_empty());
-                // A shown error stays until a read succeeds.
-                let shown = previous.as_ref().is_some_and(|v| v.error.is_some())
-                    || (!quiet
-                        && (trigger == Trigger::Manual
-                            || !error.is_transient()
-                            || count >= FAILURES_SHOWN));
-                if !shown {
-                    tracing::debug!(account = id, count, "quota read failed, retrying quietly");
-                }
-                QuotaSnapshot {
-                    account_id: id.into(),
-                    provider: account.provider,
-                    windows: previous
-                        .as_ref()
-                        .map(|v| v.windows.clone())
-                        .unwrap_or_default(),
-                    updated_at: previous
-                        .as_ref()
-                        .map(|v| v.updated_at.clone())
-                        .unwrap_or_else(now),
-                    error: shown.then(|| error.to_string()),
-                    subscription: previous
-                        .as_ref()
-                        .and_then(|v| v.subscription.clone())
-                        .or_else(|| account.summary().subscription),
-                    credits: previous.map(|v| v.credits).unwrap_or_default(),
-                    verification_required,
-                    verification_available,
-                }
+                let mut failures = self.failures.write().await;
+                let failure = Failures::after(failures.get(id).copied(), observed);
+                failures.insert(id.into(), failure);
+                failed_read(account, previous.as_ref(), error, failure, trigger)
             }
         };
         let mut cache = self.cache.write().await;
@@ -782,6 +885,99 @@ impl QuotaService {
         }
         cache.insert(id.into(), snapshot.clone());
         Ok(snapshot)
+    }
+
+    async fn complete_billing(
+        &self,
+        id: &str,
+        account: &AccountCredential,
+        result: Result<Observation, SubscriptionError>,
+        trigger: Trigger,
+    ) -> Result<QuotaSnapshot, SubscriptionError> {
+        // Hold the account read lock through publication so a change to the
+        // endpoint and this read cannot update the same revision concurrently.
+        let current = self
+            .store
+            .read_account(id)
+            .await
+            .ok_or(SubscriptionError::NotFound)?;
+        if current.endpoint_revision != account.endpoint_revision {
+            return Err(SubscriptionError::NotFound);
+        }
+        let mut billing = self.billing.write().await;
+        let (snapshot, failure) = match result {
+            Ok(observation) => (
+                QuotaSnapshot {
+                    account_id: id.into(),
+                    provider: account.provider,
+                    windows: vec![],
+                    updated_at: now(),
+                    error: None,
+                    subscription: None,
+                    credits: observation.credits,
+                    verification_required: false,
+                    verification_available: false,
+                },
+                None,
+            ),
+            Err(error) => {
+                let previous = billing
+                    .get(id)
+                    .filter(|reading| reading.revision == account.endpoint_revision);
+                let failure = Failures::after(
+                    previous.and_then(|reading| reading.failure),
+                    time::OffsetDateTime::now_utc(),
+                );
+                (
+                    failed_read(
+                        account,
+                        previous.map(|reading| &reading.snapshot),
+                        error,
+                        failure,
+                        trigger,
+                    ),
+                    Some(failure),
+                )
+            }
+        };
+        billing.insert(
+            id.into(),
+            BillingReading {
+                revision: account.endpoint_revision,
+                snapshot: snapshot.clone(),
+                failure,
+            },
+        );
+        Ok(snapshot)
+    }
+
+    async fn fetch_billing(
+        &self,
+        account: &AccountCredential,
+        api: BillingApi,
+    ) -> Result<Observation, SubscriptionError> {
+        let url = api.url();
+        #[cfg(test)]
+        let url = {
+            let origin = self
+                .billing_test_origin
+                .as_deref()
+                .ok_or(SubscriptionError::Transport)?;
+            format!("{origin}{}", reqwest::Url::parse(url).unwrap().path())
+        };
+        let value = send_json(
+            self.billing_client
+                .get(url)
+                .bearer_auth(&account.access_token),
+        )
+        .await?;
+        Ok(Observation {
+            windows: vec![],
+            plan: None,
+            subscription: None,
+            credits: api.parse(&value, time::OffsetDateTime::now_utc())?,
+            organization_id: None,
+        })
     }
 
     async fn fetch(&self, account: &AccountCredential) -> Result<Observation, SubscriptionError> {
@@ -1802,6 +1998,180 @@ fn parse_kimi(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindow>
 mod tests {
     use super::*;
     use serde_json::json;
+
+    async fn billing_fixture() -> (tempfile::TempDir, Arc<AccountStore>, QuotaService, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let account = store
+            .import(
+                json!({
+                    "type": "openai_compatible", "route": "refuseless",
+                    "base_url": "https://api.refuseless.com/v1", "api_key": "fixture-old"
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let service = QuotaService::new(reqwest::Client::new(), store.clone());
+        (directory, store, service, account.id)
+    }
+
+    #[tokio::test]
+    async fn compatible_quota_does_not_persist_a_key_balance() {
+        let (_directory, store, service, id) = billing_fixture().await;
+        let credential = store.get(&id).await.unwrap();
+        let reading = Observation {
+            windows: vec![],
+            plan: None,
+            subscription: None,
+            organization_id: None,
+            credits: BillingApi::Refuseless
+                .parse(
+                    &json!({"available": 7, "unit": "usd"}),
+                    time::OffsetDateTime::now_utc(),
+                )
+                .unwrap(),
+        };
+        service
+            .complete_refresh(&id, &credential, Ok(reading), Trigger::Manual)
+            .await
+            .unwrap();
+        service.save().await;
+        let restarted = QuotaService::new(reqwest::Client::new(), store);
+        assert!(restarted.get(&id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn compatible_quota_drops_old_balance_and_backoff_on_key_rotation() {
+        let (_directory, store, service, id) = billing_fixture().await;
+        let old = store.get(&id).await.unwrap();
+        service
+            .complete_refresh(
+                &id,
+                &old,
+                Err(SubscriptionError::Upstream(503)),
+                Trigger::Manual,
+            )
+            .await
+            .unwrap();
+        store
+            .update_endpoint(
+                &id,
+                super::super::EndpointPatch {
+                    api_key: Some("fixture-new".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .complete_refresh(
+                    &id,
+                    &old,
+                    Err(SubscriptionError::Upstream(503)),
+                    Trigger::Manual
+                )
+                .await,
+            Err(SubscriptionError::NotFound)
+        ));
+        assert!(
+            service.refresh_background(&id).await.is_some(),
+            "the old key delayed a read for the new key"
+        );
+        assert!(service.get(&id).await.unwrap().credits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compatible_quota_reads_only_documented_billing_endpoints() {
+        use axum::{Json, Router, http::HeaderMap, routing::get};
+
+        let app = Router::new()
+            .route(
+                "/api/v1/key",
+                get(|headers: HeaderMap| async move {
+                    assert_eq!(headers["authorization"], "Bearer fixture-openrouter");
+                    Json(json!({"data": {
+                        "limit": null, "limit_remaining": null, "usage": 3.5,
+                        "free_model_daily_requests": {"limit": 50, "used": 50, "remaining": 0}
+                    }}))
+                }),
+            )
+            .route(
+                "/v1/credits",
+                get(|headers: HeaderMap| async move {
+                    assert_eq!(headers["authorization"], "Bearer fixture-refuseless");
+                    Json(json!({"available": 0, "unit": "usd", "key_limit": 0, "key_spent": 1.25}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let mut service = QuotaService::new(reqwest::Client::new(), store.clone());
+        service.billing_test_origin = Some(origin);
+
+        for (name, base, supported) in [
+            ("openrouter", "https://openrouter.ai/api/v1/", true),
+            ("refuseless", "https://api.refuseless.com/v1", true),
+            ("mistral", "https://api.mistral.ai/v1", false),
+            ("hinoki", "https://inference.hinoki.security/v1", false),
+            ("private", "https://api.refuseless.com.example/v1", false),
+        ] {
+            let account = store
+                .import(
+                    json!({
+                        "type": "openai_compatible", "route": name, "base_url": base,
+                        "api_key": format!("fixture-{name}")
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(QuotaService::supports(&account), supported);
+            let now = time::OffsetDateTime::now_utc();
+            assert_eq!(
+                service
+                    .due(time::Duration::minutes(5), now)
+                    .await
+                    .contains(&account.id),
+                supported
+            );
+            if !supported {
+                assert!(matches!(
+                    service.refresh(&account.id).await,
+                    Err(SubscriptionError::Unsupported)
+                ));
+                assert!(service.get(&account.id).await.is_none());
+                continue;
+            }
+
+            store
+                .modify(&account.id, |account| {
+                    account.last_error = Some("upstream quota exceeded".into());
+                })
+                .await
+                .unwrap();
+            let first = service.refresh(&account.id).await.unwrap();
+            assert!(first.error.is_none());
+            assert!(first.windows.is_empty());
+            assert_eq!(first.credits.len(), 2);
+            if name == "openrouter" {
+                assert_eq!(first.credits[0].unlimited, Some(true));
+                assert_eq!(first.credits[0].remaining, None);
+                assert_eq!(first.credits[1].unit, "requests");
+            } else {
+                assert_eq!(first.credits[0].remaining, Some(0.0));
+                assert_eq!(first.credits[1].limit, None);
+            }
+            assert_eq!(first.credits[1].remaining, Some(0.0));
+            let saved = store.get(&account.id).await.unwrap();
+            assert_eq!(saved.last_error.as_deref(), Some("upstream quota exceeded"));
+            assert!(service.get(&account.id).await.is_some());
+        }
+        server.abort();
+    }
 
     #[tokio::test]
     async fn meta_session_uses_the_known_reserve_window_and_unknown_duration_stays_unknown() {
