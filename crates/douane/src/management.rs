@@ -448,6 +448,8 @@ pub struct AccountPatch {
     /// Images per Chat request; `null` returns to the default of 20.
     #[serde(default, deserialize_with = "present_count")]
     image_limit: Option<Option<u32>>,
+    /// Entries added to each request's `metadata`; `{}` removes them.
+    metadata: Option<std::collections::BTreeMap<String, String>>,
     models: Option<Vec<String>>,
     api_key: Option<String>,
 }
@@ -509,6 +511,7 @@ pub async fn update_account(
         base_url: body.base_url,
         dialect: body.dialect,
         image_limit: body.image_limit,
+        metadata: body.metadata,
         models: body.models,
         api_key: body.api_key,
     };
@@ -517,6 +520,7 @@ pub async fn update_account(
         || endpoint.route.is_some()
         || endpoint.dialect.is_some()
         || endpoint.image_limit.is_some()
+        || endpoint.metadata.is_some()
         || endpoint.models.is_some();
     if name.is_none()
         && body.enabled.is_none()

@@ -792,6 +792,19 @@ pub async fn forward(
                 );
             }
         }
+        if account.provider == SubscriptionProvider::OpenaiCompatible {
+            // The client's value takes precedence even if translation dropped it.
+            let client_metadata = &value["metadata"];
+            let metadata = account
+                .metadata
+                .iter()
+                .map(|(key, default)| {
+                    let entry = client_metadata[key.as_str()].as_str().unwrap_or(default);
+                    (key.clone(), entry.to_owned())
+                })
+                .collect();
+            crate::endpoint_metadata::merge(&mut translated, &metadata);
+        }
         if account.provider == SubscriptionProvider::Antigravity {
             crate::antigravity_system::normalize_system(&mut translated);
         }

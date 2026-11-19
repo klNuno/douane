@@ -263,6 +263,11 @@ enum Endpoint {
         /// Images per Chat request (0 to 1000); `default` returns to 20.
         #[arg(long)]
         image_limit: Option<String>,
+        /// Comma-separated key=value entries added to each request's
+        /// `metadata` (Mistral bills `call_type=main_call` to Vibe Code);
+        /// an empty value removes them.
+        #[arg(long, value_delimiter = ',')]
+        metadata: Option<Vec<String>>,
         /// Comma-separated model ids; an empty value serves every model.
         #[arg(long, value_delimiter = ',')]
         models: Option<Vec<String>>,
@@ -347,7 +352,7 @@ async fn endpoint(client: &reqwest::Client, root: &str, command: Endpoint) -> Re
                 .filter(|a| a["provider"] == "openai_compatible")
                 .map(|a| {
                     json!({"id":a["id"],"name":a["name"],"route":a["route"],"base_url":a["base_url"],
-                        "dialect":a["dialect"],"image_limit":a["image_limit"],"models":a["models"],"enabled":a["enabled"],"status":a["status"]})
+                        "dialect":a["dialect"],"image_limit":a["image_limit"],"metadata":a["metadata"],"models":a["models"],"enabled":a["enabled"],"status":a["status"]})
                 })
                 .collect();
             Ok(json!({ "endpoints": rows }))
@@ -385,6 +390,7 @@ async fn endpoint(client: &reqwest::Client, root: &str, command: Endpoint) -> Re
             base_url,
             dialect,
             image_limit,
+            metadata,
             models,
             route,
             key_file,
@@ -411,6 +417,22 @@ async fn endpoint(client: &reqwest::Client, root: &str, command: Endpoint) -> Re
                         ))?)
                     };
             }
+            if let Some(entries) = metadata {
+                if accounts.len() != 1 {
+                    bail!(
+                        "{route_or_id} has {} keys; set metadata on one by its account id",
+                        accounts.len()
+                    );
+                }
+                let mut map = serde_json::Map::new();
+                for entry in entries.into_iter().filter(|e| !e.is_empty()) {
+                    let Some((key, value)) = entry.split_once('=') else {
+                        bail!("--metadata takes key=value entries, got {entry}");
+                    };
+                    map.insert(key.trim().to_owned(), json!(value.trim()));
+                }
+                patch["metadata"] = Value::Object(map);
+            }
             if let Some(models) = models {
                 patch["models"] = json!(
                     models
@@ -432,7 +454,9 @@ async fn endpoint(client: &reqwest::Client, root: &str, command: Endpoint) -> Re
                 patch["api_key"] = json!(read_key(&path).await?);
             }
             if patch.as_object().is_some_and(|p| p.is_empty()) {
-                bail!("give --base-url, --dialect, --image-limit, --models, --route or --key-file");
+                bail!(
+                    "give --base-url, --dialect, --image-limit, --metadata, --models, --route or --key-file"
+                );
             }
             let mut changed = vec![];
             for account in accounts {

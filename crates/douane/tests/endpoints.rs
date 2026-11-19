@@ -304,6 +304,112 @@ async fn exhausted_api_budget_tries_the_other_key_and_keeps_the_replacement() {
     }
 }
 
+/// Mistral bills a key's request to the Vibe Code allowance only when the body
+/// carries `metadata.call_type`: the key holding that metadata must still get
+/// it after the other key's API budget runs out, and only that key.
+#[tokio::test]
+async fn an_endpoint_adds_its_metadata_to_each_request_it_serves() {
+    for path in ["/v1/chat/completions", "/v1/messages"] {
+        let (mistral, seen) = api(&["shared-model"]).await;
+        let gateway = Gateway::new(&[
+            endpoint("mistral", &mistral.url, "key-one"),
+            endpoint("mistral", &mistral.url, "key-two"),
+        ])
+        .await;
+        let accounts = gateway.admin(reqwest::Method::GET, "/accounts", None).await;
+        // A route without quota data takes its keys in id order: the last id
+        // is tried after the other key refused, as in production.
+        let id = accounts["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a["id"].as_str())
+            .max()
+            .unwrap()
+            .to_owned();
+        let patch = |body: Value| {
+            gateway
+                .client
+                .patch(format!("{}/admin/api/accounts/{id}", gateway.server.url))
+                .json(&body)
+                .send()
+        };
+        assert_eq!(
+            patch(json!({"metadata":{"call_type":""}}))
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+        let set = json!({"api_key":"key-vibe","metadata":{"call_type":"main_call"}});
+        assert_eq!(patch(set).await.unwrap().status(), 200);
+        let accounts = gateway.admin(reqwest::Method::GET, "/accounts", None).await;
+        let listed = accounts["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == id.as_str())
+            .unwrap();
+        assert_eq!(listed["metadata"], json!({"call_type":"main_call"}));
+        for key in ["Bearer key-one", "Bearer key-two"] {
+            seen.refused
+                .lock()
+                .unwrap()
+                .insert(key.into(), StatusCode::PAYMENT_REQUIRED);
+        }
+        let mut body = chat("mistral/shared-model");
+        body["max_tokens"] = json!(32);
+        if path.ends_with("/completions") {
+            body["metadata"] = json!({"session_id":"client"});
+        }
+        let (status, response) = gateway.post(path, body.clone()).await;
+        assert_eq!(status, 200, "{path}: {response}");
+        {
+            let calls = seen.seen.lock().unwrap();
+            let served = calls.last().unwrap();
+            assert_eq!(served.headers["authorization"], "Bearer key-vibe");
+            assert_eq!(served.body["metadata"]["call_type"], "main_call", "{path}");
+            if path.ends_with("/completions") {
+                assert_eq!(served.body["metadata"]["session_id"], "client");
+            }
+            let refused: Vec<_> = calls
+                .iter()
+                .filter(|c| c.headers["authorization"] != "Bearer key-vibe")
+                .collect();
+            assert_eq!(refused.len(), 1, "{path}: the other key answers first");
+            for refused in refused {
+                assert!(
+                    refused.body.pointer("/metadata/call_type").is_none(),
+                    "{path}: {}",
+                    refused.body
+                );
+            }
+        }
+        let mut client_override = body.clone();
+        client_override["metadata"]["call_type"] = json!("client_call");
+        let (status, response) = gateway.post(path, client_override).await;
+        assert_eq!(status, 200, "{path}: {response}");
+        assert_eq!(
+            seen.seen.lock().unwrap().last().unwrap().body["metadata"]["call_type"],
+            "client_call",
+            "{path}"
+        );
+        assert_eq!(patch(json!({"metadata":{}})).await.unwrap().status(), 200);
+        seen.seen.lock().unwrap().clear();
+        let (status, response) = gateway.post(path, body).await;
+        assert_eq!(status, 200, "{path}: {response}");
+        let calls = seen.seen.lock().unwrap();
+        assert!(
+            calls
+                .last()
+                .unwrap()
+                .body
+                .pointer("/metadata/call_type")
+                .is_none()
+        );
+    }
+}
+
 #[tokio::test]
 async fn exhausted_api_budget_preserves_the_refusal_when_all_keys_refuse() {
     for path in ["/v1/chat/completions", "/v1/messages"] {

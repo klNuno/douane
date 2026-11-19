@@ -387,6 +387,7 @@ mod tests {
             base_url: None,
             dialect: None,
             image_limit: None,
+            metadata: Default::default(),
             models: vec![],
             created_at: "2026-10-01T00:00:00Z".into(),
             updated_at: "2026-10-01T00:00:00Z".into(),

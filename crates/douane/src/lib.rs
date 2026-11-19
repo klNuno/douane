@@ -5,6 +5,7 @@ mod antigravity_system;
 mod antigravity_thinking;
 mod chat_images;
 pub mod clients;
+pub mod endpoint_metadata;
 pub mod ledger;
 pub mod management;
 mod openai_reasoning;

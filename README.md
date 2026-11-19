@@ -236,6 +236,7 @@ Any OpenAI-, Anthropic- or Responses-compatible API becomes a route: its keys se
 | `dialect` | What the API speaks: `chat`, `responses` or `messages`; douane translates the client's format to it. Absent forwards the client's format unchanged |
 | `models` | Model ids to serve; empty serves every model the API lists at `/v1/models` |
 | `image_limit` | Images a Chat request carries at most, 0 to 1000, default 20. Past it, the oldest images become the text `[image omitted: upstream image limit]` and the newest stay. Mistral answers HTTP 503 to a 21st image, and an agent resends every image of its conversation each turn |
+| `metadata` | Entries added to each request's top-level `metadata` object, at most 16; a key the client already set keeps its value. Mistral bills a request carrying `call_type` (as Mistral Vibe sends it) to the Vibe Code monthly allowance and any other to the API budget, so `call_type=main_call` on one key of the route spends Vibe Code while the other keys keep the API budget. HTTP requests only, not the native Responses WebSocket; changing it clears the key's cooldown |
 
 ![Connect dialog adding a DeepSeek key as the deepseek route](docs/images/endpoint.png)
 
@@ -247,11 +248,12 @@ printf %s "$GROQ_API_KEY" | douanectl endpoint add groq https://api.groq.com/ope
 douanectl endpoint set deepseek --models deepseek-v4-pro,deepseek-flash
 douanectl endpoint set deepseek --key-file new.key
 douanectl endpoint set mistral --image-limit 20
+douanectl endpoint set <account-id> --metadata call_type=main_call
 douanectl endpoint list
 douanectl endpoint remove groq
 ```
 
-The same fields go through `POST /admin/api/accounts/import` with `{"type":"openai_compatible","route":...,"base_url":...,"api_key":...}`, and `PATCH /admin/api/accounts/{id}` changes `route`, `base_url`, `dialect`, `image_limit` (`null` returns to 20), `models` or `api_key`. An account without a route keeps its previous behavior under `openai_compatible/`.
+The same fields go through `POST /admin/api/accounts/import` with `{"type":"openai_compatible","route":...,"base_url":...,"api_key":...}`, and `PATCH /admin/api/accounts/{id}` changes `route`, `base_url`, `dialect`, `image_limit` (`null` returns to 20), `metadata` (`{}` removes it), `models` or `api_key`; `metadata` is set only this way, after the import. An account without a route keeps its previous behavior under `openai_compatible/`.
 
 The **Models** page lists models under their provider or route, each one folded until opened. A provider rereads its catalog on its own (`POST /admin/api/models/refresh?pool=openrouter`; no `pool` rereads all), and its switch turns every shown model on or off in one write (`PATCH /admin/api/models` with `{"ids":[...],"enabled":false}`). Every catalog is reread each hour, so a model a provider adds or retires shows without a restart. When a live listing fails, the provider keeps its previous models, is marked as such, and is reread every minute.
 
@@ -334,7 +336,7 @@ douanectl disable <account-id>
 douanectl enable <account-id>
 douanectl remove <account-id>
 douanectl endpoint add <route> <base-url> --key-file <file|->
-douanectl endpoint set <route|account-id> [--base-url ...] [--dialect ...] [--image-limit <n|default>] [--models ...] [--key-file ...]
+douanectl endpoint set <route|account-id> [--base-url ...] [--dialect ...] [--image-limit <n|default>] [--metadata key=value,...] [--models ...] [--key-file ...]
 douanectl client list
 douanectl client add <name> [--pools ...] [--accounts ...] [--share pool=percent,...] [--key-file <file>]
 douanectl client set <client-id> [--name ...] [--all|--pools ...] [--share ...] [--rotate-key]
