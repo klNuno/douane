@@ -118,6 +118,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(management::public_models))
         .route("/v1/codex/models", get(management::codex_models))
         .route("/muse-code/models", get(management::muse_models))
+        .route("/v1beta/models", get(management::gemini_models))
+        .route("/v1beta/models/{*call}", post(relay::forward))
         .route("/muse-code/responses", post(relay::forward))
         .route("/v1/quotas", get(management::public_quotas))
         .route("/v1/messages", post(relay::forward))

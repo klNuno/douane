@@ -56,6 +56,70 @@ fn configured_dialect(value: &str) -> Option<Dialect> {
     }
 }
 
+/// A Gemini API call, `/v1beta/models/{model}:{method}`, as Antigravity's own
+/// clients send it to a custom gateway: the model and whether a stream was
+/// asked for.
+fn gemini_call(path: &str) -> Option<Result<(&str, bool), &'static str>> {
+    let call = path.strip_prefix("/v1beta/models/")?;
+    Some(match call.rsplit_once(':') {
+        Some((model, "generateContent")) if !model.is_empty() => Ok((model, false)),
+        Some((model, "streamGenerateContent")) if !model.is_empty() => Ok((model, true)),
+        _ => Err("only generateContent and streamGenerateContent are offered"),
+    })
+}
+
+/// Antigravity clients name a leveled model by its family and send the level
+/// apart (`gemini-3.8-flash` or `gemini-3.1-pro-preview` with `thinkingLevel:
+/// low`), where the catalog lists `gemini-3.8-flash-low` or
+/// `gemini-3.1-pro-low`. The leveled variant wins over a listed family; an
+/// unlisted id is kept as sent.
+async fn gemini_model(state: &AppState, model: &str, body: &Value) -> String {
+    let models = state.models.read().await;
+    let listed = |id: &str| {
+        models.iter().any(|m| {
+            m.provider == SubscriptionProvider::Antigravity && m.enabled && m.upstream_id == id
+        })
+    };
+    let families: Vec<&str> = std::iter::once(model)
+        .chain(model.strip_suffix("-preview"))
+        .collect();
+    let level = body
+        .pointer("/generationConfig/thinkingConfig/thinkingLevel")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let leveled = level.iter().flat_map(|level| {
+        families
+            .iter()
+            .map(move |family| format!("{family}-{level}"))
+    });
+    leveled
+        .chain(families.iter().map(|family| family.to_string()))
+        .find(|id| listed(id))
+        .unwrap_or_else(|| model.to_owned())
+}
+
+/// A Gemini API client's signed history belongs to the account that signed
+/// it: the one its session was last served by. A signed turn waits for that
+/// account rather than move.
+fn gemini_owner(state: &AppState, headers: &HeaderMap, body: &Value) -> Option<String> {
+    let signed = body["contents"].as_array().is_some_and(|turns| {
+        turns.iter().any(|turn| {
+            turn["parts"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|p| p.get("thoughtSignature").is_some()))
+        })
+    });
+    if !signed {
+        return None;
+    }
+    let session = crate::affinity::session_key(headers, body)?;
+    state
+        .affinity
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(SubscriptionProvider::Antigravity.as_str(), &session)
+}
+
 fn copilot_path(dialect: Dialect) -> &'static str {
     match dialect {
         Dialect::Messages => "/v1/messages",
@@ -539,7 +603,14 @@ pub async fn forward(
         Err(refusal) => return error(StatusCode::UNAUTHORIZED, refusal.message()),
     };
     let count_tokens = uri.path().ends_with("/messages/count_tokens");
-    let from = if uri.path().ends_with("/messages") || count_tokens {
+    let gemini = match gemini_call(uri.path()) {
+        Some(Ok(call)) => Some(call),
+        Some(Err(e)) => return error(StatusCode::NOT_FOUND, e),
+        None => None,
+    };
+    let from = if gemini.is_some() {
+        Dialect::Gemini
+    } else if uri.path().ends_with("/messages") || count_tokens {
         Dialect::Messages
     } else if uri.path().ends_with("/chat/completions") {
         Dialect::Chat
@@ -561,11 +632,40 @@ pub async fn forward(
             return error(StatusCode::BAD_REQUEST, "Muse Code requires a Meta model");
         }
     }
+    if let Some((model, streamed)) = gemini {
+        if !value.is_object() {
+            return error(StatusCode::BAD_REQUEST, "body must be a JSON object");
+        }
+        // Only Antigravity accounts serve the Gemini API natively. The model
+        // and stream choice travel in the path; both leave the body again
+        // before it goes upstream.
+        // A prefix names a provider; this route has only one.
+        let model = model.strip_prefix("antigravity/").unwrap_or(model);
+        if model.is_empty() || model.contains('/') {
+            return error(
+                StatusCode::NOT_FOUND,
+                "the Gemini API serves Antigravity models only",
+            );
+        }
+        headers.insert("x-douane-provider", "antigravity".parse().unwrap());
+        value["model"] = json!(gemini_model(&state, model, &value).await);
+        value["stream"] = json!(streamed);
+        // The client's own session id keeps its turns, and the signatures
+        // they carry, on one account.
+        if let Some(session) = value["sessionId"].as_str().filter(|s| !s.is_empty()) {
+            value["prompt_cache_key"] = json!(session);
+        }
+    }
     let stream = value["stream"].as_bool().unwrap_or(false);
     let hint = provider_hint(&state, &value, &headers, client.as_ref()).await;
-    let owner = match replay_owner(&state, &value, &headers, from, hint).await {
-        Ok(owner) => owner,
-        Err(e) => return error(StatusCode::BAD_REQUEST, &e),
+    // A native Gemini client keeps its own signed history.
+    let owner = if from == Dialect::Gemini {
+        gemini_owner(&state, &headers, &value)
+    } else {
+        match replay_owner(&state, &value, &headers, from, hint).await {
+            Ok(owner) => owner,
+            Err(e) => return error(StatusCode::BAD_REQUEST, &e),
+        }
     };
     let (model, candidates, session) = match choose_for_replay(
         &state,
@@ -650,6 +750,13 @@ pub async fn forward(
             Ok(v) => v,
             Err(e) => return error(StatusCode::BAD_REQUEST, &e),
         };
+        if from == Dialect::Gemini {
+            if let Some(request) = translated.as_object_mut() {
+                request.remove("model");
+                request.remove("stream");
+                request.remove("prompt_cache_key");
+            }
+        }
         // Chat Completions has no `output_config`: a Messages client's effort
         // reaches a custom endpoint only as the `reasoning_effort` its model
         // lists.
@@ -698,8 +805,14 @@ pub async fn forward(
                 .collect();
             crate::endpoint_metadata::merge(&mut translated, &metadata);
         }
-        let mut replay = if account.provider == SubscriptionProvider::Antigravity {
+        if account.provider == SubscriptionProvider::Antigravity {
             crate::antigravity_system::normalize_system(&mut translated);
+        }
+        // A native Gemini client sends its own thinking settings and signed
+        // parts: nothing to configure or replay for it.
+        let mut replay = if account.provider == SubscriptionProvider::Antigravity
+            && from != Dialect::Gemini
+        {
             let mut history = match translate::antigravity_history(&value, from) {
                 Ok(history) => history,
                 Err(e) => return error(StatusCode::BAD_REQUEST, &e),
@@ -1196,11 +1309,22 @@ pub async fn forward(
                 replay.observe(&mut result);
             }
         }
-        if to == Dialect::Gemini {
-            if let Some(message) = translate::gemini_refusal(&result) {
+        let refusal = if to == Dialect::Gemini {
+            translate::gemini_refusal(&result)
+        } else {
+            None
+        };
+        if let Some(message) = refusal {
+            if from == Dialect::Gemini {
+                // A Gemini API client reads Google's refusal as Google wrote it.
+                call.observe(&result);
                 call.fail(message);
-                return error(StatusCode::BAD_GATEWAY, message);
+                let mut answer = Json(unwrap_gemini(result)).into_response();
+                answer.headers_mut().extend(passed);
+                return answer;
             }
+            call.fail(message);
+            return error(StatusCode::BAD_GATEWAY, message);
         }
         if to == Dialect::Gemini && !gemini_finished(&result) {
             call.fail("upstream response did not contain a Gemini completion");
@@ -1216,13 +1340,16 @@ pub async fn forward(
                 "upstream reported an error in its response",
             );
         }
-        let result = match translate::response(&result, to, from, &model, &custom) {
+        let mut result = match translate::response(&result, to, from, &model, &custom) {
             Ok(v) => v,
             Err(e) => {
                 call.fail(&e);
                 return error(StatusCode::BAD_GATEWAY, &e);
             }
         };
+        if from == Dialect::Gemini {
+            result = unwrap_gemini(result);
+        }
         if let Some(replay) = &mut replay {
             if let Err(e) = replay.commit() {
                 call.fail(&e);
@@ -1310,6 +1437,15 @@ impl Drop for NativeReplay {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .release(&self.scope);
+    }
+}
+
+/// Cloud Code wraps each Gemini API answer in `{"response": ...}`; a Gemini API
+/// client reads the answer itself.
+fn unwrap_gemini(mut answer: Value) -> Value {
+    match answer.get_mut("response") {
+        Some(inner) if inner.is_object() => inner.take(),
+        _ => answer,
     }
 }
 
@@ -1679,9 +1815,7 @@ impl Collected {
         }
         if to == Dialect::Gemini {
             let body = frame.get("response").unwrap_or(frame);
-            if let Some(message) = translate::gemini_refusal(body) {
-                return Err(message.into());
-            }
+            let refused = translate::gemini_refusal(body).is_some();
             if body.get("error").is_some() {
                 return Err("upstream reported a stream error".into());
             }
@@ -1706,11 +1840,14 @@ impl Collected {
             if let Some(usage) = body.get("usageMetadata") {
                 result["usageMetadata"] = usage.clone();
             }
+            if let Some(feedback) = body.get("promptFeedback") {
+                result["promptFeedback"] = feedback.clone();
+            }
             if gemini_finished(frame) {
                 result["candidates"][0]["finishReason"] =
                     body["candidates"][0]["finishReason"].clone();
             }
-            if gemini_finished(result) {
+            if gemini_finished(result) || refused {
                 self.result = Some(result.clone());
             }
             return Ok(());
@@ -1746,6 +1883,8 @@ fn stream_response(
     quota_state: Arc<AppState>,
 ) -> Response {
     let meta = call.call.provider == "meta";
+    // A Gemini API client reads Cloud Code's answers without their envelope.
+    let envelope = from == Dialect::Gemini && to == Dialect::Gemini;
     let bridge = if from == to {
         None
     } else {
@@ -1807,6 +1946,15 @@ fn stream_response(
                                     replay.observe(&mut event);
                                 }
                                 call.observe(&event);
+                                if envelope {
+                                    if let Some(message) = translate::gemini_refusal(&event) {
+                                        call.fail(message);
+                                    } else if gemini_finished(&event) {
+                                        call.complete = true;
+                                    }
+                                    let answer = unwrap_gemini(event.clone());
+                                    translated.push_str(&format!("data: {answer}\r\n\r\n"));
+                                }
                                 let defer = replay.as_ref().is_some_and(|replay| {
                                     gemini_finished(&event) || replay.terminal_output.is_some()
                                 });
@@ -1848,7 +1996,7 @@ fn stream_response(
                             }
                             if let Some(e) = failure {
                                 Err(e)
-                            } else if bridge.is_some() || meta {
+                            } else if bridge.is_some() || meta || envelope {
                                 Ok((!translated.is_empty()).then(|| Bytes::from(translated)))
                             } else {
                                 Ok(Some(chunk))
@@ -1940,6 +2088,16 @@ fn stream_response(
                                             ));
                                         }
                                         call.observe(&event);
+                                        if envelope {
+                                            if let Some(message) = translate::gemini_refusal(&event)
+                                            {
+                                                call.fail(message);
+                                            } else if gemini_finished(&event) {
+                                                call.complete = true;
+                                            }
+                                            let answer = unwrap_gemini(event);
+                                            tail.push_str(&format!("data: {answer}\r\n\r\n"));
+                                        }
                                     }
                                     if call.complete {
                                         Ok((!tail.is_empty()).then(|| Bytes::from(tail)))

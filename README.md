@@ -138,6 +138,7 @@ If clients reach the API at a different address than the dashboard (a reverse pr
 | `POST /v1/messages/count_tokens` | Claude token counting, relayed to the provider |
 | `POST /v1/responses` | Responses, streaming included |
 | `POST /v1/responses/compact` | Native compaction on compatible upstreams |
+| `GET /v1beta/models`, `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent` | The Gemini API, served by Antigravity accounts for Antigravity's own clients |
 | `GET /v1/responses` (WebSocket) | Native Codex sessions, and a streaming bridge for the other subscriptions |
 | `/admin/api/*` | Accounts, clients, quotas, models, request history, settings and OAuth |
 | `/v0/management`, `/v8/management` | A CLIProxyAPI-compatible subset of its management API |
@@ -187,6 +188,30 @@ account's list, and a request goes only to the accounts whose own list names its
 model. An account that still answers `NOT_FOUND` for a model is skipped for it
 for 24 hours or until a restart, the next account is tried, and the account
 stays usable.
+
+### Antigravity's own clients
+
+Google's Antigravity ACP server (`agy_acp_server`, the agent Boite and other
+ACP hosts start) reaches its models through a custom gateway that speaks the
+Gemini API. douane is such a gateway: no Google sign-in on the client, and each
+request goes to one of the Antigravity accounts with that account's token and
+project.
+
+```sh
+# <home>/antigravity-acp/settings.json, <home> being $GEMINI_HOME or ~/.gemini
+{"auth":{"type":"gateway"}}
+# environment of the ACP server
+AGY_LLM_GATEWAY_URL=http://127.0.0.1:8787
+AGY_LLM_GATEWAY_API_KEY=<douane client key>
+```
+
+The model picker lists the Antigravity models the key may use, by their
+provider ids. The client names a leveled model by its family and sends the
+level (`gemini-3.8-flash` with `thinkingLevel: low`); douane sends it to
+`gemini-3.8-flash-low` when the catalog lists that id. Requests and answers
+cross unchanged apart from Cloud Code's envelope and the system text
+normalization above; the client keeps its own signed history, so no replay
+cache is used.
 
 ### Muse Code subscription
 

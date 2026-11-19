@@ -811,6 +811,39 @@ pub async fn muse_models(
     )
     .await
 }
+/// The Gemini API model list, for Antigravity's own clients pointed at douane
+/// as a custom gateway: the Antigravity models this client may use, by their
+/// provider ids.
+pub async fn gemini_models(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let client = match state.clients.authenticate(&headers) {
+        Ok(client) => client,
+        Err(refusal) => return error(StatusCode::UNAUTHORIZED, refusal.message()),
+    };
+    let query = Params {
+        provider: Some("antigravity".into()),
+        ids: Some("upstream".into()),
+        ..Default::default()
+    };
+    let listed = list_models(&state, &query, Some(&client)).await;
+    let models: Vec<Value> = listed["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|m| {
+            json!({
+                "name": format!("models/{}", m["id"].as_str().unwrap_or_default()),
+                "displayName": m["name"],
+                "inputTokenLimit": m["context_length"],
+                "outputTokenLimit": m["max_output_tokens"],
+                "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
+            })
+        })
+        .collect();
+    Json(json!({ "models": models })).into_response()
+}
 /// The management listing of client models: every model, as without keys.
 pub async fn management_models(
     State(state): State<Arc<AppState>>,
