@@ -98,6 +98,28 @@ async fn gemini_model(state: &AppState, model: &str, body: &Value) -> String {
         .unwrap_or_else(|| model.to_owned())
 }
 
+/// A Gemini API client's signed history belongs to the account that signed
+/// it: the one its session was last served by. A signed turn waits for that
+/// account rather than move.
+fn gemini_owner(state: &AppState, headers: &HeaderMap, body: &Value) -> Option<String> {
+    let signed = body["contents"].as_array().is_some_and(|turns| {
+        turns.iter().any(|turn| {
+            turn["parts"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|p| p.get("thoughtSignature").is_some()))
+        })
+    });
+    if !signed {
+        return None;
+    }
+    let session = crate::affinity::session_key(headers, body)?;
+    state
+        .affinity
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(SubscriptionProvider::Antigravity.as_str(), &session)
+}
+
 fn copilot_path(dialect: Dialect) -> &'static str {
     match dialect {
         Dialect::Messages => "/v1/messages",
@@ -638,7 +660,7 @@ pub async fn forward(
     let hint = provider_hint(&state, &value, &headers, client.as_ref()).await;
     // A native Gemini client keeps its own signed history.
     let owner = if from == Dialect::Gemini {
-        None
+        gemini_owner(&state, &headers, &value)
     } else {
         match replay_owner(&state, &value, &headers, from, hint).await {
             Ok(owner) => owner,

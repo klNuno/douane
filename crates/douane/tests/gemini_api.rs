@@ -1,6 +1,13 @@
 //! The Gemini API route serves Antigravity's own clients through a synthetic
 //! Cloud Code upstream.
-use axum::{Json, Router, body::Body, extract::State, response::IntoResponse, routing::post};
+use axum::{
+    Json, Router,
+    body::Body,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::post,
+};
 use douane::{settings::Config, state::AppState};
 use serde_json::{Value, json};
 use std::{
@@ -12,6 +19,31 @@ use tokio::{net::TcpListener, task::JoinHandle};
 #[derive(Default)]
 struct Mock {
     received: Mutex<Vec<Value>>,
+    /// The bearer each request carried, in order.
+    tokens: Mutex<Vec<String>>,
+    /// A token this upstream answers with 429.
+    limited: Mutex<Option<String>>,
+}
+
+impl Mock {
+    fn limit(&self, headers: &HeaderMap) -> Option<Response> {
+        let token = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        self.tokens.lock().unwrap().push(token.clone());
+        (self.limited.lock().unwrap().as_deref() == Some(token.as_str())).then(|| {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(
+                    json!({"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[
+                    {"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"30s"}]}}),
+                ),
+            )
+                .into_response()
+        })
+    }
 }
 
 struct Fixture {
@@ -58,10 +90,17 @@ fn answer() -> Value {
     ]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3}})
 }
 
-async fn generate(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> impl IntoResponse {
+async fn generate(
+    State(mock): State<Arc<Mock>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Some(limited) = mock.limit(&headers) {
+        return limited;
+    }
     let reply = if blocked(&body) { refusal() } else { answer() };
     mock.received.lock().unwrap().push(body);
-    Json(json!({"response": reply, "traceId": "synthetic"}))
+    Json(json!({"response": reply, "traceId": "synthetic"})).into_response()
 }
 
 async fn stream(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> impl IntoResponse {
@@ -399,4 +438,27 @@ async fn google_refusals_reach_the_client_as_google_wrote_them() {
     let event: Value =
         serde_json::from_str(text.trim_end().strip_prefix("data: ").unwrap()).unwrap();
     assert_eq!(event, refusal(), "{text}");
+}
+
+#[tokio::test]
+async fn a_signed_turn_waits_for_the_account_that_signed_it() {
+    let fixture = Fixture::with(&["synthetic-pro"], 2).await;
+    let mut body = request(None);
+    body["sessionId"] = json!("synthetic-session-b");
+    assert_eq!(
+        generate_on(&fixture, "synthetic-pro", &body).await.status(),
+        200
+    );
+    let signer = fixture.mock.tokens.lock().unwrap()[0].clone();
+    *fixture.mock.limited.lock().unwrap() = Some(signer.clone());
+    body["contents"] = json!([
+        {"role":"user","parts":[{"text":"say pong"}]},
+        {"role":"model","parts":[{"text":"pong","thoughtSignature":"U1lOVEhFVElD"}]},
+        {"role":"user","parts":[{"text":"again"}]}
+    ]);
+    let refused = generate_on(&fixture, "synthetic-pro", &body).await;
+    assert_eq!(refused.status(), 429);
+    assert!(refused.headers().contains_key("retry-after"));
+    let tokens = fixture.mock.tokens.lock().unwrap();
+    assert!(tokens.iter().all(|t| *t == signer), "{tokens:?}");
 }
