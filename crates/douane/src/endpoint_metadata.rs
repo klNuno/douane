@@ -30,10 +30,12 @@ pub fn valid(metadata: &BTreeMap<String, String>) -> bool {
 
 pub const RULE: &str = "metadata takes at most 16 entries: keys of 1 to 64 letters, digits, _, - or ., values of 1 to 512 characters without control characters";
 
-/// Adds each entry the request's `metadata` object lacks, in place: a key the
-/// client set keeps the client's value. A request whose `metadata` is absent
-/// or null gets a new object; any other `metadata` value is left alone.
-/// Returns how many entries were added.
+/// Adds each entry the upstream request's `metadata` object lacks, in place,
+/// up to [`MAX_ENTRIES`] in all, OpenAI's own limit: a key already there keeps
+/// its value. It runs after translation, so it sees what the translation kept
+/// of the client's metadata. A request whose `metadata` is absent or null gets
+/// a new object; any other `metadata` value is left alone. Returns how many
+/// entries were added.
 pub fn merge(request: &mut Value, metadata: &BTreeMap<String, String>) -> usize {
     if metadata.is_empty() {
         return 0;
@@ -52,6 +54,9 @@ pub fn merge(request: &mut Value, metadata: &BTreeMap<String, String>) -> usize 
     };
     let mut added = 0;
     for (key, value) in metadata {
+        if target.len() >= MAX_ENTRIES {
+            break;
+        }
         if !target.contains_key(key) {
             target.insert(key.clone(), Value::String(value.clone()));
             added += 1;
@@ -87,6 +92,9 @@ mod tests {
         let mut odd = json!({"model":"m","metadata":"text"});
         assert_eq!(merge(&mut odd, &account), 0);
         assert_eq!(odd["metadata"], "text");
+        let full: Map<String, Value> = (0..16).map(|i| (format!("c{i}"), json!("v"))).collect();
+        let mut crowded = json!({"model":"m","metadata":full});
+        assert_eq!(merge(&mut crowded, &account), 0);
         let mut untouched = json!({"model":"m"});
         assert_eq!(merge(&mut untouched, &BTreeMap::new()), 0);
         assert!(untouched.get("metadata").is_none());

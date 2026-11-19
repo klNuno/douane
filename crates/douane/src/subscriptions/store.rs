@@ -833,6 +833,13 @@ impl AccountStore {
             account.image_limit = limit;
         }
         if let Some(metadata) = patch.metadata {
+            // New metadata can move the key to another budget (Mistral's Vibe
+            // Code allowance): a refusal under the old one no longer holds.
+            if metadata != account.metadata {
+                account.last_error = None;
+                account.cooldown_until = None;
+                account.cooldown_retry_after = false;
+            }
             account.metadata = metadata;
         }
         if let Some(models) = models {
