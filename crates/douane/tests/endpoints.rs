@@ -385,6 +385,15 @@ async fn an_endpoint_adds_its_metadata_to_each_request_it_serves() {
                 );
             }
         }
+        let mut client_override = body.clone();
+        client_override["metadata"]["call_type"] = json!("client_call");
+        let (status, response) = gateway.post(path, client_override).await;
+        assert_eq!(status, 200, "{path}: {response}");
+        assert_eq!(
+            seen.seen.lock().unwrap().last().unwrap().body["metadata"]["call_type"],
+            "client_call",
+            "{path}"
+        );
         assert_eq!(patch(json!({"metadata":{}})).await.unwrap().status(), 200);
         seen.seen.lock().unwrap().clear();
         let (status, response) = gateway.post(path, body).await;
