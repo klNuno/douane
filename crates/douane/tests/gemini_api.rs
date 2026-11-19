@@ -103,14 +103,22 @@ async fn generate(
     Json(json!({"response": reply, "traceId": "synthetic"})).into_response()
 }
 
-async fn stream(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> impl IntoResponse {
+async fn stream(
+    State(mock): State<Arc<Mock>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Some(limited) = mock.limit(&headers) {
+        return limited;
+    }
     if blocked(&body) {
         mock.received.lock().unwrap().push(body);
         let event = json!({ "response": refusal() });
         return (
             [("content-type", "text/event-stream")],
             Body::from(format!("data: {event}\r\n\r\n")),
-        );
+        )
+            .into_response();
     }
     mock.received.lock().unwrap().push(body);
     let full = answer();
@@ -125,7 +133,7 @@ async fn stream(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> impl 
     }
     let last = json!({"response":{"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishReason":"STOP"}],"usageMetadata":full["usageMetadata"]}});
     data.push_str(&format!("data: {last}\r\n\r\n"));
-    ([("content-type", "text/event-stream")], Body::from(data))
+    ([("content-type", "text/event-stream")], Body::from(data)).into_response()
 }
 
 impl Fixture {
@@ -178,6 +186,16 @@ impl Fixture {
                 .await
                 .unwrap();
         }
+        state
+            .accounts
+            .import(
+                json!({"type":"gemini","access_token":"synthetic-gemini-access",
+                    "base_url":upstream,"project_id":"synthetic-gemini-project",
+                    "models":["synthetic-gemini","synthetic-pro"]}),
+                None,
+            )
+            .await
+            .unwrap();
         state.refresh_models().await;
         let (url, gate_task) = serve(douane::router(state.clone())).await;
         Self {
@@ -306,7 +324,12 @@ async fn stream_resolves_the_leveled_model_and_unwraps_every_event() {
     assert_eq!(events[3]["candidates"][0]["finishReason"], "STOP");
     let received = fixture.mock.received.lock().unwrap();
     assert_eq!(received[0]["model"], "synthetic-flash-low");
+    assert_eq!(received[0]["project"], "synthetic-project");
     assert_eq!(received[0]["request"], request(Some("LOW")));
+    assert_eq!(
+        *fixture.mock.tokens.lock().unwrap(),
+        ["Bearer synthetic-access-0"]
+    );
 }
 
 #[tokio::test]
@@ -357,6 +380,8 @@ async fn a_provider_prefix_cannot_leave_the_antigravity_pool() {
     let fixture = Fixture::new().await;
     let other = generate_on(&fixture, "gemini-cli/synthetic-pro", &request(None)).await;
     assert_eq!(other.status(), 404);
+    let empty = generate_on(&fixture, "antigravity/", &request(None)).await;
+    assert_eq!(empty.status(), 404);
     assert!(fixture.mock.received.lock().unwrap().is_empty());
     let own = generate_on(&fixture, "antigravity/synthetic-pro", &request(None)).await;
     assert_eq!(own.status(), 200);

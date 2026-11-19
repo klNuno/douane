@@ -641,7 +641,7 @@ pub async fn forward(
         // before it goes upstream.
         // A prefix names a provider; this route has only one.
         let model = model.strip_prefix("antigravity/").unwrap_or(model);
-        if model.contains('/') {
+        if model.is_empty() || model.contains('/') {
             return error(
                 StatusCode::NOT_FOUND,
                 "the Gemini API serves Antigravity models only",
