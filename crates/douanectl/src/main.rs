@@ -418,6 +418,12 @@ async fn endpoint(client: &reqwest::Client, root: &str, command: Endpoint) -> Re
                     };
             }
             if let Some(entries) = metadata {
+                if accounts.len() != 1 {
+                    bail!(
+                        "{route_or_id} has {} keys; set metadata on one by its account id",
+                        accounts.len()
+                    );
+                }
                 let mut map = serde_json::Map::new();
                 for entry in entries.into_iter().filter(|e| !e.is_empty()) {
                     let Some((key, value)) = entry.split_once('=') else {
@@ -448,7 +454,9 @@ async fn endpoint(client: &reqwest::Client, root: &str, command: Endpoint) -> Re
                 patch["api_key"] = json!(read_key(&path).await?);
             }
             if patch.as_object().is_some_and(|p| p.is_empty()) {
-                bail!("give --base-url, --dialect, --image-limit, --models, --route or --key-file");
+                bail!(
+                    "give --base-url, --dialect, --image-limit, --metadata, --models, --route or --key-file"
+                );
             }
             let mut changed = vec![];
             for account in accounts {

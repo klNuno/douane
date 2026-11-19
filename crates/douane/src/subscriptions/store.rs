@@ -1204,6 +1204,14 @@ fn check_record(account: &AccountCredential) -> Result<(), SubscriptionError> {
     {
         return Err(SubscriptionError::InvalidImport("invalid base URL"));
     }
+    if !account.metadata.is_empty()
+        && (account.provider != SubscriptionProvider::OpenaiCompatible
+            || !crate::endpoint_metadata::valid(&account.metadata))
+    {
+        return Err(SubscriptionError::InvalidEndpoint(
+            crate::endpoint_metadata::RULE,
+        ));
+    }
     if account.route.is_some() || account.dialect.is_some() || account.image_limit.is_some() {
         if account.provider != SubscriptionProvider::OpenaiCompatible {
             return Err(SubscriptionError::InvalidEndpoint(

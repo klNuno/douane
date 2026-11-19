@@ -317,7 +317,16 @@ async fn an_endpoint_adds_its_metadata_to_each_request_it_serves() {
         ])
         .await;
         let accounts = gateway.admin(reqwest::Method::GET, "/accounts", None).await;
-        let id = accounts["accounts"][0]["id"].as_str().unwrap().to_owned();
+        // A route without quota data takes its keys in id order: the last id
+        // is tried after the other key refused, as in production.
+        let id = accounts["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a["id"].as_str())
+            .max()
+            .unwrap()
+            .to_owned();
         let patch = |body: Value| {
             gateway
                 .client
@@ -363,10 +372,12 @@ async fn an_endpoint_adds_its_metadata_to_each_request_it_serves() {
             if path.ends_with("/completions") {
                 assert_eq!(served.body["metadata"]["session_id"], "client");
             }
-            for refused in calls
+            let refused: Vec<_> = calls
                 .iter()
                 .filter(|c| c.headers["authorization"] != "Bearer key-vibe")
-            {
+                .collect();
+            assert_eq!(refused.len(), 1, "{path}: the other key answers first");
+            for refused in refused {
                 assert!(
                     refused.body.pointer("/metadata/call_type").is_none(),
                     "{path}: {}",
