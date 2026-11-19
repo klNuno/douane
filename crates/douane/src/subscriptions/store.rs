@@ -177,6 +177,10 @@ pub struct AccountSummary {
     /// the default of 20.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_limit: Option<u32>,
+    /// Entries added to each request's `metadata`; see
+    /// [`crate::endpoint_metadata`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
     pub created_at: String,
@@ -257,6 +261,9 @@ pub struct AccountCredential {
     /// become a text placeholder. Absent uses [`crate::chat_images::DEFAULT_LIMIT`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) image_limit: Option<u32>,
+    /// Entries a custom endpoint adds to each request's `metadata`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) metadata: BTreeMap<String, String>,
     /// The user hid it from the Quotas page; routing ignores this.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) hidden: bool,
@@ -315,6 +322,8 @@ pub struct EndpointPatch {
     pub dialect: Option<Option<String>>,
     /// `Some(None)` returns to the default image limit.
     pub image_limit: Option<Option<u32>>,
+    /// Replaces the request metadata entries; an empty map removes them.
+    pub metadata: Option<BTreeMap<String, String>>,
     /// An empty list serves every model the endpoint lists.
     pub models: Option<Vec<String>>,
     pub api_key: Option<String>,
@@ -473,6 +482,7 @@ impl AccountCredential {
                 .flatten(),
             dialect: self.dialect.clone(),
             image_limit: self.image_limit,
+            metadata: self.metadata.clone(),
             models: if self.provider == SubscriptionProvider::OpenaiCompatible {
                 self.models.clone()
             } else {
@@ -770,6 +780,15 @@ impl AccountStore {
         {
             return Err(SubscriptionError::InvalidEndpoint(IMAGE_LIMIT_RULE));
         }
+        if patch
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| !crate::endpoint_metadata::valid(metadata))
+        {
+            return Err(SubscriptionError::InvalidEndpoint(
+                crate::endpoint_metadata::RULE,
+            ));
+        }
         let api_key = patch.api_key.map(|key| key.trim().to_owned());
         if api_key.as_deref().is_some_and(|key| {
             key.is_empty() || key.len() > 8192 || key.chars().any(char::is_control)
@@ -797,7 +816,7 @@ impl AccountStore {
         let current = accounts.get(id).ok_or(SubscriptionError::NotFound)?;
         if current.provider != SubscriptionProvider::OpenaiCompatible {
             return Err(SubscriptionError::InvalidEndpoint(
-                "only openai_compatible endpoints take a route, base_url, dialect, image_limit, models or api_key",
+                "only openai_compatible endpoints take a route, base_url, dialect, image_limit, metadata, models or api_key",
             ));
         }
         let mut account = current.clone();
@@ -812,6 +831,9 @@ impl AccountStore {
         }
         if let Some(limit) = patch.image_limit {
             account.image_limit = limit;
+        }
+        if let Some(metadata) = patch.metadata {
+            account.metadata = metadata;
         }
         if let Some(models) = models {
             account.models = models;
@@ -1553,6 +1575,7 @@ fn parse_import(
         route,
         dialect,
         image_limit,
+        metadata: BTreeMap::new(),
         hidden: false,
     };
     apply_identity(&mut account);

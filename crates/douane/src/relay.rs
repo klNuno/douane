@@ -685,6 +685,9 @@ pub async fn forward(
                 );
             }
         }
+        if account.provider == SubscriptionProvider::OpenaiCompatible {
+            crate::endpoint_metadata::merge(&mut translated, &account.metadata);
+        }
         let mut replay = if account.provider == SubscriptionProvider::Antigravity {
             crate::antigravity_system::normalize_system(&mut translated);
             let mut history = match translate::antigravity_history(&value, from) {
