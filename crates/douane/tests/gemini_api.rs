@@ -42,6 +42,14 @@ async fn serve(router: Router) -> (String, JoinHandle<()>) {
     )
 }
 
+fn blocked(body: &Value) -> bool {
+    body.pointer("/request/contents/0/parts/0/text") == Some(&json!("blocked prompt"))
+}
+
+fn refusal() -> Value {
+    json!({"promptFeedback":{"blockReason":"PROHIBITED_CONTENT"},"usageMetadata":{"promptTokenCount":5}})
+}
+
 fn answer() -> Value {
     json!({"candidates":[{"content":{"role":"model","parts":[
         {"thought":true,"text":"synthetic hidden"},
@@ -51,11 +59,20 @@ fn answer() -> Value {
 }
 
 async fn generate(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> impl IntoResponse {
+    let reply = if blocked(&body) { refusal() } else { answer() };
     mock.received.lock().unwrap().push(body);
-    Json(json!({"response": answer(), "traceId": "synthetic"}))
+    Json(json!({"response": reply, "traceId": "synthetic"}))
 }
 
 async fn stream(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> impl IntoResponse {
+    if blocked(&body) {
+        mock.received.lock().unwrap().push(body);
+        let event = json!({ "response": refusal() });
+        return (
+            [("content-type", "text/event-stream")],
+            Body::from(format!("data: {event}\r\n\r\n")),
+        );
+    }
     mock.received.lock().unwrap().push(body);
     let full = answer();
     let mut data = String::new();
@@ -74,6 +91,18 @@ async fn stream(State(mock): State<Arc<Mock>>, Json(body): Json<Value>) -> impl 
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with(
+            &[
+                "synthetic-flash-low",
+                "synthetic-flash-high",
+                "synthetic-pro",
+            ],
+            1,
+        )
+        .await
+    }
+
+    async fn with(models: &[&str], accounts: usize) -> Self {
         let mock = Arc::new(Mock::default());
         let (upstream, up_task) = serve(
             Router::new()
@@ -94,16 +123,22 @@ impl Fixture {
                 ..Default::default()
             })
             .unwrap();
-        state
-            .accounts
-            .import(
-                json!({"type":"antigravity","access_token":"synthetic-access","base_url":upstream,
-                    "project_id":"synthetic-project",
-                    "models":["synthetic-flash-low","synthetic-flash-high","synthetic-pro"]}),
-                None,
-            )
-            .await
-            .unwrap();
+        for n in 0..accounts {
+            let project = if n == 0 {
+                "synthetic-project".to_owned()
+            } else {
+                format!("synthetic-project-{n}")
+            };
+            state
+                .accounts
+                .import(
+                    json!({"type":"antigravity","access_token":format!("synthetic-access-{n}"),
+                        "base_url":upstream,"project_id":project,"models":models}),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
         state.refresh_models().await;
         let (url, gate_task) = serve(douane::router(state.clone())).await;
         Self {
@@ -262,4 +297,106 @@ async fn other_gemini_methods_and_missing_keys_are_refused() {
         .unwrap();
     assert_eq!(anonymous.status(), 401);
     assert!(fixture.mock.received.lock().unwrap().is_empty());
+}
+
+async fn generate_on(fixture: &Fixture, model: &str, body: &Value) -> reqwest::Response {
+    fixture
+        .client
+        .post(format!(
+            "{}/v1beta/models/{model}:generateContent",
+            fixture.url
+        ))
+        .bearer_auth(&fixture.key)
+        .json(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_provider_prefix_cannot_leave_the_antigravity_pool() {
+    let fixture = Fixture::new().await;
+    let other = generate_on(&fixture, "gemini-cli/synthetic-pro", &request(None)).await;
+    assert_eq!(other.status(), 404);
+    assert!(fixture.mock.received.lock().unwrap().is_empty());
+    let own = generate_on(&fixture, "antigravity/synthetic-pro", &request(None)).await;
+    assert_eq!(own.status(), 200);
+    assert_eq!(
+        fixture.mock.received.lock().unwrap()[0]["model"],
+        "synthetic-pro"
+    );
+}
+
+#[tokio::test]
+async fn the_leveled_variant_wins_over_a_listed_family_and_a_preview_suffix() {
+    let fixture = Fixture::with(
+        &["synthetic-pro", "synthetic-pro-low", "synthetic-pro-high"],
+        1,
+    )
+    .await;
+    for (model, level, want) in [
+        ("synthetic-pro", "LOW", "synthetic-pro-low"),
+        ("synthetic-pro-preview", "HIGH", "synthetic-pro-high"),
+        ("synthetic-pro-preview", "MINIMAL", "synthetic-pro"),
+    ] {
+        let response = generate_on(&fixture, model, &request(Some(level))).await;
+        assert_eq!(response.status(), 200, "{model} {level}");
+        let received = fixture.mock.received.lock().unwrap();
+        assert_eq!(received.last().unwrap()["model"], want, "{model} {level}");
+    }
+}
+
+#[tokio::test]
+async fn one_client_session_stays_on_one_account() {
+    let fixture = Fixture::with(&["synthetic-pro"], 2).await;
+    let mut body = request(None);
+    body["sessionId"] = json!("synthetic-session-a");
+    for _ in 0..4 {
+        assert_eq!(
+            generate_on(&fixture, "synthetic-pro", &body).await.status(),
+            200
+        );
+    }
+    let received = fixture.mock.received.lock().unwrap();
+    assert!(
+        received
+            .iter()
+            .all(|r| r["project"] == received[0]["project"]),
+        "{:?}",
+        received
+            .iter()
+            .map(|r| r["project"].clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        received
+            .iter()
+            .all(|r| r["request"].get("prompt_cache_key").is_none())
+    );
+}
+
+#[tokio::test]
+async fn google_refusals_reach_the_client_as_google_wrote_them() {
+    let fixture = Fixture::new().await;
+    let mut body = request(None);
+    body["contents"][0]["parts"][0]["text"] = json!("blocked prompt");
+    let plain = generate_on(&fixture, "synthetic-pro", &body).await;
+    assert_eq!(plain.status(), 200);
+    assert_eq!(plain.json::<Value>().await.unwrap(), refusal());
+    let streamed = fixture
+        .client
+        .post(format!(
+            "{}/v1beta/models/synthetic-pro:streamGenerateContent?alt=sse",
+            fixture.url
+        ))
+        .bearer_auth(&fixture.key)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(streamed.status(), 200);
+    let text = streamed.text().await.unwrap();
+    let event: Value =
+        serde_json::from_str(text.trim_end().strip_prefix("data: ").unwrap()).unwrap();
+    assert_eq!(event, refusal(), "{text}");
 }
