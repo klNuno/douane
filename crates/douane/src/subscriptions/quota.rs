@@ -1229,8 +1229,9 @@ impl QuotaService {
                     && global.peek().is_some()
                     && global.all(|w| w.remaining_percent.is_some_and(|left| left > 0.0));
                 // A confirmed reset releases the refusal that was there when
-                // the read started, even if the account changed meanwhile; a
-                // newer refusal writes a new deadline and stays.
+                // the read started, even if the account changed meanwhile:
+                // every account-wide refusal writes a new deadline, so a newer
+                // one stays.
                 let fresh = account.updated_at == started.updated_at;
                 let reset = matches!(
                     account.last_error.as_deref(),
@@ -1249,19 +1250,18 @@ impl QuotaService {
                     account.cooldown_until = None;
                     account.cooldown_retry_after = false;
                 }
-                account.scoped_cooldowns.retain(|cooldown| {
-                    let seen = started
-                        .scoped_cooldowns
-                        .iter()
-                        .any(|old| old.scope == cooldown.scope && old.until == cooldown.until);
-                    !(seen
-                        && snapshot.confirms_reset(
+                // A scoped refusal keeps the later of two deadlines, so an
+                // unchanged deadline does not prove no newer refusal came.
+                if fresh {
+                    account.scoped_cooldowns.retain(|cooldown| {
+                        !snapshot.confirms_reset(
                             previous.as_ref(),
                             &cooldown.until,
                             cooldown.retry_after,
                             Some(&cooldown.scope),
-                        ))
-                });
+                        )
+                    });
+                }
                 if let Some(plan) = plan {
                     account.plan = Some(plan);
                 }
