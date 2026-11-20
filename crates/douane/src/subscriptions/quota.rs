@@ -230,7 +230,9 @@ impl QuotaSnapshot {
 
     /// A full reset of the exhausted window that supplied this deadline
     /// supersedes its refusal. Positive quota alone cannot revoke Retry-After.
-    fn confirms_claude_reset(
+    /// Claude's deadline is that window's reset. Codex caps its deadline at a
+    /// day, so its exhausted window may reset after the deadline, never before.
+    fn confirms_reset(
         &self,
         previous: Option<&Self>,
         until: &str,
@@ -242,8 +244,10 @@ impl QuotaSnapshot {
         let Some(deadline) = parse_timestamp(until) else {
             return false;
         };
-        if self.provider != SubscriptionProvider::Claude
-            || previous.provider != self.provider
+        if !matches!(
+            self.provider,
+            SubscriptionProvider::Claude | SubscriptionProvider::Codex
+        ) || previous.provider != self.provider
             || previous.account_id != self.account_id
             || self.error.is_some()
             || !parse_timestamp(&previous.updated_at)
@@ -282,7 +286,12 @@ impl QuotaSnapshot {
                     .reset_at
                     .as_deref()
                     .and_then(parse_timestamp)
-                    .is_some_and(|reset| (reset - deadline).abs() < time::Duration::seconds(2))
+                    .is_some_and(|reset| match self.provider {
+                        SubscriptionProvider::Codex => {
+                            reset > deadline - time::Duration::seconds(2)
+                        }
+                        _ => (reset - deadline).abs() < time::Duration::seconds(2),
+                    })
                 && self.windows.iter().any(|new| {
                     new.id == old.id
                         && new.remaining_percent == Some(100.0)
@@ -1187,7 +1196,10 @@ impl QuotaService {
         plan: Option<String>,
         account_version: &str,
     ) -> Result<(), SubscriptionError> {
-        let previous = if snapshot.provider == SubscriptionProvider::Claude {
+        let previous = if matches!(
+            snapshot.provider,
+            SubscriptionProvider::Claude | SubscriptionProvider::Codex
+        ) {
             self.get(id).await
         } else {
             None
@@ -1216,10 +1228,13 @@ impl QuotaService {
                     && snapshot.error.is_none()
                     && global.peek().is_some()
                     && global.all(|w| w.remaining_percent.is_some_and(|left| left > 0.0));
-                let reset = account.last_error.as_deref() == Some("upstream quota exceeded")
-                    && account.cooldown_until.as_deref().is_some_and(|until| {
-                        snapshot.confirms_claude_reset(previous.as_ref(), until, None)
-                    });
+                let reset = matches!(
+                    account.last_error.as_deref(),
+                    Some("upstream quota exceeded" | "websocket upstream quota exceeded")
+                ) && account
+                    .cooldown_until
+                    .as_deref()
+                    .is_some_and(|until| snapshot.confirms_reset(previous.as_ref(), until, None));
                 if account.updated_at == account_version && (!cooling || revalidated || reset) {
                     account.last_error = None;
                     account.cooldown_until = None;
@@ -1227,7 +1242,7 @@ impl QuotaService {
                 }
                 if account.updated_at == account_version {
                     account.scoped_cooldowns.retain(|cooldown| {
-                        !snapshot.confirms_claude_reset(
+                        !snapshot.confirms_reset(
                             previous.as_ref(),
                             &cooldown.until,
                             Some(&cooldown.scope),
@@ -3417,6 +3432,117 @@ mod tests {
             after.scoped_cooldowns[0].until,
             before.scoped_cooldowns[1].until
         );
+    }
+
+    /// A Codex weekly limit refused over the websocket rests the account for
+    /// at most a day, often before the window's own reset. When OpenAI resets
+    /// the window early, the next read showing it full reopens the account.
+    #[tokio::test]
+    async fn codex_confirmed_reset_releases_a_quota_cooldown() {
+        for reason in [
+            "websocket upstream quota exceeded",
+            "upstream quota exceeded",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+            let account = store
+                .import(
+                    json!({"type":"codex","access_token":"fixture","account_id":"a","name":"a"}),
+                    None,
+                )
+                .await
+                .unwrap();
+            let service = QuotaService::new(reqwest::Client::new(), store.clone());
+            store.cooldown(&account.id, 86_400, reason).await.unwrap();
+            let before = store.get(&account.id).await.unwrap();
+            let in_days = |days| {
+                Some(timestamp(
+                    time::OffsetDateTime::now_utc() + time::Duration::days(days),
+                ))
+            };
+            let window = |left: f64, reset_at| QuotaWindow {
+                id: "weekly".into(),
+                label: "Codex Weekly".into(),
+                remaining_percent: Some(left),
+                reset_at,
+                used: None,
+                limit: None,
+            };
+            // The window was due to reset in four days; the cooldown stops at one.
+            let previous = QuotaSnapshot {
+                account_id: account.id.clone(),
+                provider: SubscriptionProvider::Codex,
+                windows: vec![window(0.0, in_days(4))],
+                updated_at: timestamp(time::OffsetDateTime::now_utc() - time::Duration::minutes(1)),
+                error: None,
+                subscription: None,
+                credits: Vec::new(),
+                verification_required: false,
+                verification_available: false,
+            };
+            let mut recovered = previous.clone();
+            recovered.updated_at = now();
+            recovered.windows = vec![window(100.0, in_days(7))];
+            for case in [
+                "partial",
+                "not-exhausted",
+                "earlier-reset",
+                "stale",
+                "error",
+                "account",
+                "newer-refusal",
+            ] {
+                let mut old = previous.clone();
+                let mut new = recovered.clone();
+                match case {
+                    "partial" => new.windows[0].remaining_percent = Some(99.0),
+                    "not-exhausted" => old.windows[0].remaining_percent = Some(1.0),
+                    // An exhausted window due before the deadline did not set it.
+                    "earlier-reset" => {
+                        old.windows[0].reset_at = Some(timestamp(
+                            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+                        ))
+                    }
+                    "stale" => new.updated_at = old.updated_at.clone(),
+                    "error" => new.error = Some("quota read failed".into()),
+                    "account" => new.account_id = "another-account".into(),
+                    _ => (),
+                }
+                service.insert_for_test(old).await;
+                let version = store.get(&account.id).await.unwrap().updated_at;
+                let version = if case == "newer-refusal" {
+                    "old-version"
+                } else {
+                    &version
+                };
+                service
+                    .apply_observation(&account.id, &new, None, version)
+                    .await
+                    .unwrap();
+                let after = store.get(&account.id).await.unwrap();
+                assert_eq!(
+                    after.cooldown_until, before.cooldown_until,
+                    "{reason}: {case}"
+                );
+                assert_eq!(after.last_error.as_deref(), Some(reason), "{case}");
+            }
+            service.insert_for_test(previous).await;
+            let version = store.get(&account.id).await.unwrap().updated_at;
+            service
+                .apply_observation(&account.id, &recovered, None, &version)
+                .await
+                .unwrap();
+            let after = AccountStore::open(directory.path())
+                .unwrap()
+                .get(&account.id)
+                .await
+                .unwrap();
+            assert!(
+                after.cooldown_until.is_none(),
+                "{reason}: reset must reopen"
+            );
+            assert!(after.last_error.is_none(), "{reason}");
+        }
     }
 
     #[tokio::test]
