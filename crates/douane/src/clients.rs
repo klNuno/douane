@@ -42,6 +42,12 @@ const RESET_TOLERANCE: i64 = 600;
 const NEW_WINDOW_DROP: f64 = 10.0;
 /// Sources may disagree by two points; a full reset must exceed that jitter.
 const ZERO_RESET_TOLERANCE: f64 = 2.0;
+/// Points of estimated, not yet read usage ignored before it counts: a
+/// reading is a whole percent, so up to a point always hides behind it.
+const UNSEEN_SLACK: f64 = 1.0;
+/// Points after which a learned rate halves its history, so it follows the
+/// account's recent calls rather than all of them.
+const RATE_HISTORY: f64 = 100.0;
 const MAX_CLIENTS: usize = 200;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -183,7 +189,40 @@ struct Usage {
     /// Calls running on a model family with its own weekly window, by
     /// (account, family kind) then client.
     running_family: BTreeMap<(String, &'static str), BTreeMap<String, u32>>,
+    /// Points each window rose for the token weight that explained it, by
+    /// (account, kind): what a unit of weight costs on that window.
+    rates: BTreeMap<(String, &'static str), (f64, f64)>,
     dirty: bool,
+}
+
+impl Usage {
+    /// Points each client has likely used on a window since its last rise,
+    /// from the weight of its finished calls and the window's learned rate,
+    /// minus the [`UNSEEN_SLACK`] a whole-percent reading always hides.
+    /// A provider can leave a reading stale for hours while calls go on (the
+    /// Fable week did so for a day): without this, shares would trust the
+    /// stale figure and let one client spend the others' part.
+    fn unseen(&self, account: &str, kind: &'static str) -> BTreeMap<String, f64> {
+        let key = (account.to_owned(), kind);
+        let (Some(pending), Some(&(points, weight))) =
+            (self.pending.get(&key), self.rates.get(&key))
+        else {
+            return BTreeMap::new();
+        };
+        if weight <= 0.0 || points <= 0.0 {
+            return BTreeMap::new();
+        }
+        let rate = points / weight;
+        let total: f64 = pending.values().sum::<f64>() * rate;
+        if !total.is_finite() || total <= UNSEEN_SLACK {
+            return BTreeMap::new();
+        }
+        let keep = (total - UNSEEN_SLACK) / total;
+        pending
+            .iter()
+            .map(|(client, w)| (client.clone(), w * rate * keep))
+            .collect()
+    }
 }
 
 /// Model families with a weekly window of their own, and its share kind.
@@ -776,7 +815,19 @@ impl Clients {
                 continue;
             }
             let weights: Vec<(String, f64)> = match usage.pending.remove(&key) {
-                Some(pending) if !pending.is_empty() => pending.into_iter().collect(),
+                Some(pending) if !pending.is_empty() => {
+                    let weight: f64 = pending.values().sum();
+                    if weight > 0.0 && weight.is_finite() {
+                        let rate = usage.rates.entry(key.clone()).or_default();
+                        rate.0 += delta;
+                        rate.1 += weight;
+                        if rate.0 > RATE_HISTORY {
+                            rate.0 /= 2.0;
+                            rate.1 /= 2.0;
+                        }
+                    }
+                    pending.into_iter().collect()
+                }
                 // A family's window only rises with calls to that family.
                 _ if kind_family(reading.kind).is_some() => usage
                     .running_family
@@ -863,14 +914,21 @@ impl Clients {
                 && w.kind == reading.kind
                 && (w.reset - reading.reset).abs() <= RESET_TOLERANCE
         });
+        // Calls the reading has not shown yet count as their estimate.
+        let unseen = if window.is_some() {
+            usage.unseen(account, reading.kind)
+        } else {
+            BTreeMap::new()
+        };
         let used_by = |id: &str| {
             window
                 .and_then(|w| w.clients.get(id))
                 .copied()
                 .unwrap_or(0.0)
+                + unseen.get(id).copied().unwrap_or(0.0)
         };
         let mine = used_by(me);
-        let physical = (100.0 - reading.used).max(0.0);
+        let physical = (100.0 - reading.used - unseen.values().sum::<f64>()).max(0.0);
         let overbooked = holders.iter().map(|(_, s)| s).sum::<f64>() > 100.0 + 1e-9;
         let cap = if reading.kind == "five-hour" || overbooked {
             holders
@@ -1661,6 +1719,85 @@ mod tests {
                 reset - 3600,
                 reserved,
                 "claude-fable-5-2"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stale_family_reading_still_holds_back_the_client_spending_it() {
+        let (_dir, clients) = clients();
+        let share = |name: &str| ClientPatch {
+            name: Some(name.into()),
+            shares: Some([("claude".to_owned(), 50.0)].into()),
+            ..ClientPatch::default()
+        };
+        let (moi, _) = clients.create(share("moi")).unwrap();
+        let (pote, _) = clients.create(share("pote")).unwrap();
+        let a = account("a");
+        let reset = NOW + 3 * 86_400;
+        let both = |week: f64, fable: f64| {
+            let mut s = snapshot("a", week, reset);
+            let mut w = s.windows[0].clone();
+            w.id = "seven-day-fable".into();
+            w.label = "Fable weekly".into();
+            w.remaining_percent = Some(100.0 - fable);
+            s.windows.push(w);
+            s
+        };
+        let reserved = Release {
+            before_reset: 0,
+            last_seventh: false,
+        };
+        clients.observe(&both(0.0, 0.0), NOW);
+        // While readings move, a unit of Fable weight costs one point.
+        for step in 1..=10 {
+            clients.call_ended_on("a", Some(&moi.id), 1.0, "claude-fable-5-2");
+            clients.call_ended_on("a", Some(&pote.id), 1.0, "claude-fable-5-2");
+            clients.observe(&both(step as f64, 2.0 * step as f64), NOW);
+        }
+        // Then the Fable reading freezes at 20 while moi keeps calling.
+        let frozen = both(30.0, 20.0);
+        let blocks = |c: &Client| {
+            clients.share_blocks_for(
+                Some(c),
+                &a,
+                Some(&frozen),
+                NOW,
+                reserved,
+                "claude-fable-5-2",
+            )
+        };
+        for _ in 0..30 {
+            clients.call_ended_on("a", Some(&moi.id), 1.0, "claude-fable-5-2");
+        }
+        clients.observe(&frozen, NOW);
+        // 10 seen and 29 estimated points: moi still has room, pote too.
+        assert_eq!(blocks(&moi), None);
+        for _ in 0..15 {
+            clients.call_ended_on("a", Some(&moi.id), 1.0, "claude-fable-5-2");
+        }
+        clients.observe(&frozen, NOW);
+        // Past its half by the estimate: moi waits, pote keeps its part.
+        assert_eq!(blocks(&moi), Some(reset));
+        assert_eq!(blocks(&pote), None);
+        let bar = clients.client_view(&moi, frozen.clone(), "claude", NOW, reserved);
+        assert_eq!(bar.windows[1].remaining_percent, Some(0.0));
+        // The reading catches up: the rise goes to moi and the estimate stops.
+        clients.observe(&both(30.0, 66.0), NOW);
+        let report = clients.usage_report(NOW);
+        let fable = report.iter().find(|w| w.kind == "weekly-fable").unwrap();
+        assert!((fable.clients[&moi.id] - 56.0).abs() < 1e-9);
+        assert!((fable.clients[&pote.id] - 10.0).abs() < 1e-9);
+        let caught_up = both(30.0, 66.0);
+        assert_eq!(
+            clients.share_blocks_for(
+                Some(&pote),
+                &a,
+                Some(&caught_up),
+                NOW,
+                reserved,
+                "claude-fable-5-2",
             ),
             None
         );
