@@ -1228,15 +1228,16 @@ impl QuotaService {
                     && snapshot.error.is_none()
                     && global.peek().is_some()
                     && global.all(|w| w.remaining_percent.is_some_and(|left| left > 0.0));
-                // A confirmed reset releases the refusal that was there when
-                // the read started, even if the account changed meanwhile:
+                // A confirmed Codex reset releases the refusal that was there
+                // when the read started, even if the account changed meanwhile:
                 // every account-wide refusal writes a new deadline, so a newer
-                // one stays.
+                // one stays. Claude keeps its stricter unchanged-account rule.
                 let fresh = account.updated_at == started.updated_at;
                 let reset = matches!(
                     account.last_error.as_deref(),
                     Some("upstream quota exceeded" | "websocket upstream quota exceeded")
-                ) && account.cooldown_until == started.cooldown_until
+                ) && (fresh || account.provider == SubscriptionProvider::Codex)
+                    && account.cooldown_until == started.cooldown_until
                     && account.cooldown_until.as_deref().is_some_and(|until| {
                         snapshot.confirms_reset(
                             previous.as_ref(),
