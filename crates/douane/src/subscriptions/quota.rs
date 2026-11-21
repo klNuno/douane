@@ -230,10 +230,13 @@ impl QuotaSnapshot {
 
     /// A full reset of the exhausted window that supplied this deadline
     /// supersedes its refusal. Positive quota alone cannot revoke Retry-After.
-    fn confirms_claude_reset(
+    /// The deadline is that window's reset, except an inferred Codex refusal:
+    /// its rest is capped at a day, so its window may reset later, never sooner.
+    fn confirms_reset(
         &self,
         previous: Option<&Self>,
         until: &str,
+        retry_after: bool,
         scope: Option<&QuotaScope>,
     ) -> bool {
         let Some(previous) = previous else {
@@ -242,8 +245,10 @@ impl QuotaSnapshot {
         let Some(deadline) = parse_timestamp(until) else {
             return false;
         };
-        if self.provider != SubscriptionProvider::Claude
-            || previous.provider != self.provider
+        if !matches!(
+            self.provider,
+            SubscriptionProvider::Claude | SubscriptionProvider::Codex
+        ) || previous.provider != self.provider
             || previous.account_id != self.account_id
             || self.error.is_some()
             || !parse_timestamp(&previous.updated_at)
@@ -282,7 +287,11 @@ impl QuotaSnapshot {
                     .reset_at
                     .as_deref()
                     .and_then(parse_timestamp)
-                    .is_some_and(|reset| (reset - deadline).abs() < time::Duration::seconds(2))
+                    .is_some_and(|reset| {
+                        let capped = self.provider == SubscriptionProvider::Codex && !retry_after;
+                        (reset - deadline).abs() < time::Duration::seconds(2)
+                            || capped && reset > deadline
+                    })
                 && self.windows.iter().any(|new| {
                     new.id == old.id
                         && new.remaining_percent == Some(100.0)
@@ -693,7 +702,7 @@ impl QuotaService {
             return;
         }
         if self
-            .apply_observation(id, &snapshot, None, &account.updated_at)
+            .apply_observation(id, &snapshot, None, &account)
             .await
             .is_ok()
         {
@@ -854,7 +863,7 @@ impl QuotaService {
                     verification_required: false,
                     verification_available: false,
                 };
-                self.apply_observation(id, &snapshot, observation.plan, &account.updated_at)
+                self.apply_observation(id, &snapshot, observation.plan, account)
                     .await?;
                 if let Some(organization_id) = observation.organization_id {
                     self.store
@@ -1185,9 +1194,12 @@ impl QuotaService {
         id: &str,
         snapshot: &QuotaSnapshot,
         plan: Option<String>,
-        account_version: &str,
+        started: &AccountCredential,
     ) -> Result<(), SubscriptionError> {
-        let previous = if snapshot.provider == SubscriptionProvider::Claude {
+        let previous = if matches!(
+            snapshot.provider,
+            SubscriptionProvider::Claude | SubscriptionProvider::Codex
+        ) {
             self.get(id).await
         } else {
             None
@@ -1216,20 +1228,37 @@ impl QuotaService {
                     && snapshot.error.is_none()
                     && global.peek().is_some()
                     && global.all(|w| w.remaining_percent.is_some_and(|left| left > 0.0));
-                let reset = account.last_error.as_deref() == Some("upstream quota exceeded")
+                // A confirmed Codex reset releases the refusal that was there
+                // when the read started, even if the account changed meanwhile:
+                // every account-wide refusal writes a new deadline, so a newer
+                // one stays. Claude keeps its stricter unchanged-account rule.
+                let fresh = account.updated_at == started.updated_at;
+                let reset = matches!(
+                    account.last_error.as_deref(),
+                    Some("upstream quota exceeded" | "websocket upstream quota exceeded")
+                ) && (fresh || account.provider == SubscriptionProvider::Codex)
+                    && account.cooldown_until == started.cooldown_until
                     && account.cooldown_until.as_deref().is_some_and(|until| {
-                        snapshot.confirms_claude_reset(previous.as_ref(), until, None)
+                        snapshot.confirms_reset(
+                            previous.as_ref(),
+                            until,
+                            account.cooldown_retry_after,
+                            None,
+                        )
                     });
-                if account.updated_at == account_version && (!cooling || revalidated || reset) {
+                if (fresh && (!cooling || revalidated)) || reset {
                     account.last_error = None;
                     account.cooldown_until = None;
                     account.cooldown_retry_after = false;
                 }
-                if account.updated_at == account_version {
+                // A scoped refusal keeps the later of two deadlines, so an
+                // unchanged deadline does not prove no newer refusal came.
+                if fresh {
                     account.scoped_cooldowns.retain(|cooldown| {
-                        !snapshot.confirms_claude_reset(
+                        !snapshot.confirms_reset(
                             previous.as_ref(),
                             &cooldown.until,
+                            cooldown.retry_after,
                             Some(&cooldown.scope),
                         )
                     });
@@ -3368,18 +3397,14 @@ mod tests {
                 _ => (),
             }
             service.insert_for_test(old.clone()).await;
-            let version = store.get(&account.id).await.unwrap().updated_at;
+            let mut started = store.get(&account.id).await.unwrap();
+            if case == "newer-refusal" {
+                started.updated_at = "old-version".into();
+                started.cooldown_until = Some("2020-01-01T00:00:00Z".into());
+                started.scoped_cooldowns.clear();
+            }
             service
-                .apply_observation(
-                    &account.id,
-                    &new,
-                    None,
-                    if case == "newer-refusal" {
-                        "old-version"
-                    } else {
-                        &version
-                    },
-                )
+                .apply_observation(&account.id, &new, None, &started)
                 .await
                 .unwrap();
             let after = store.get(&account.id).await.unwrap();
@@ -3397,9 +3422,9 @@ mod tests {
                 .unwrap();
             service.insert_for_test(previous.clone()).await;
         }
-        let version = store.get(&account.id).await.unwrap().updated_at;
+        let started = store.get(&account.id).await.unwrap();
         service
-            .apply_observation(&account.id, &recovered, None, &version)
+            .apply_observation(&account.id, &recovered, None, &started)
             .await
             .unwrap();
         let reloaded = AccountStore::open(directory.path()).unwrap();
@@ -3417,6 +3442,132 @@ mod tests {
             after.scoped_cooldowns[0].until,
             before.scoped_cooldowns[1].until
         );
+    }
+
+    /// A Codex weekly limit refused over the websocket rests the account for
+    /// at most a day, often before the window's own reset. When OpenAI resets
+    /// the window early, the next read showing it full reopens the account.
+    #[tokio::test]
+    async fn codex_confirmed_reset_releases_a_quota_cooldown() {
+        for reason in [
+            "websocket upstream quota exceeded",
+            "upstream quota exceeded",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+            let account = store
+                .import(
+                    json!({"type":"codex","access_token":"fixture","account_id":"a","name":"a"}),
+                    None,
+                )
+                .await
+                .unwrap();
+            let service = QuotaService::new(reqwest::Client::new(), store.clone());
+            store.cooldown(&account.id, 86_400, reason).await.unwrap();
+            let before = store.get(&account.id).await.unwrap();
+            let in_days = |days| {
+                Some(timestamp(
+                    time::OffsetDateTime::now_utc() + time::Duration::days(days),
+                ))
+            };
+            let window = |left: f64, reset_at| QuotaWindow {
+                id: "weekly".into(),
+                label: "Codex Weekly".into(),
+                remaining_percent: Some(left),
+                reset_at,
+                used: None,
+                limit: None,
+            };
+            // The window was due to reset in four days; the cooldown stops at one.
+            let previous = QuotaSnapshot {
+                account_id: account.id.clone(),
+                provider: SubscriptionProvider::Codex,
+                windows: vec![window(0.0, in_days(4))],
+                updated_at: timestamp(time::OffsetDateTime::now_utc() - time::Duration::minutes(1)),
+                error: None,
+                subscription: None,
+                credits: Vec::new(),
+                verification_required: false,
+                verification_available: false,
+            };
+            let mut recovered = previous.clone();
+            recovered.updated_at = now();
+            recovered.windows = vec![window(100.0, in_days(7))];
+            for case in [
+                "partial",
+                "not-exhausted",
+                "earlier-reset",
+                "retry-after",
+                "stale",
+                "error",
+                "account",
+                "newer-refusal",
+            ] {
+                let mut old = previous.clone();
+                let mut new = recovered.clone();
+                match case {
+                    "partial" => new.windows[0].remaining_percent = Some(99.0),
+                    "not-exhausted" => old.windows[0].remaining_percent = Some(1.0),
+                    // An exhausted window due before the deadline did not set it.
+                    "earlier-reset" => {
+                        old.windows[0].reset_at = Some(timestamp(
+                            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+                        ))
+                    }
+                    "stale" => new.updated_at = old.updated_at.clone(),
+                    "error" => new.error = Some("quota read failed".into()),
+                    "account" => new.account_id = "another-account".into(),
+                    _ => (),
+                }
+                // An explicit Retry-After is exact: a later window reset does
+                // not match it.
+                store
+                    .modify(&account.id, |a| {
+                        a.cooldown_retry_after = case == "retry-after"
+                    })
+                    .await
+                    .unwrap();
+                service.insert_for_test(old).await;
+                let mut started = store.get(&account.id).await.unwrap();
+                if case == "newer-refusal" {
+                    started.updated_at = "old-version".into();
+                    started.cooldown_until = None;
+                }
+                service
+                    .apply_observation(&account.id, &new, None, &started)
+                    .await
+                    .unwrap();
+                let after = store.get(&account.id).await.unwrap();
+                assert_eq!(
+                    after.cooldown_until, before.cooldown_until,
+                    "{reason}: {case}"
+                );
+                assert_eq!(after.last_error.as_deref(), Some(reason), "{case}");
+            }
+            store
+                .modify(&account.id, |a| a.cooldown_retry_after = false)
+                .await
+                .unwrap();
+            service.insert_for_test(previous).await;
+            // An unrelated change during the read, such as a renewed token,
+            // keeps the evidence of the reset.
+            let mut started = store.get(&account.id).await.unwrap();
+            started.updated_at = "renewed-during-read".into();
+            service
+                .apply_observation(&account.id, &recovered, None, &started)
+                .await
+                .unwrap();
+            let after = AccountStore::open(directory.path())
+                .unwrap()
+                .get(&account.id)
+                .await
+                .unwrap();
+            assert!(
+                after.cooldown_until.is_none(),
+                "{reason}: reset must reopen"
+            );
+            assert!(after.last_error.is_none(), "{reason}");
+        }
     }
 
     #[tokio::test]
@@ -3453,7 +3604,7 @@ mod tests {
             .unwrap();
         let before = store.get(&account.id).await.unwrap();
         service
-            .apply_observation(&account.id, &snapshot, None, &before.updated_at)
+            .apply_observation(&account.id, &snapshot, None, &before)
             .await
             .unwrap();
         let recovered = store.get(&account.id).await.unwrap();
@@ -3472,7 +3623,7 @@ mod tests {
             .unwrap();
         let before = store.get(&account.id).await.unwrap();
         service
-            .apply_observation(&account.id, &scoped, None, &before.updated_at)
+            .apply_observation(&account.id, &scoped, None, &before)
             .await
             .unwrap();
         let recovered = store.get(&account.id).await.unwrap();
@@ -3493,7 +3644,7 @@ mod tests {
         // A successful quota read may clear inferred global cooldowns, but
         // cannot shorten an explicit refusal for this model family.
         service
-            .apply_observation(&account.id, &snapshot, None, &before.updated_at)
+            .apply_observation(&account.id, &snapshot, None, &before)
             .await
             .unwrap();
         let after = store.get(&account.id).await.unwrap();
@@ -3532,14 +3683,14 @@ mod tests {
                 .await
                 .unwrap();
             let cooling = store.get(&account.id).await.unwrap();
-            let version = if case == "newer-refusal" {
+            let started = if case == "newer-refusal" {
                 assert_ne!(previous.updated_at, cooling.updated_at);
-                &previous.updated_at
+                &previous
             } else {
-                &cooling.updated_at
+                &cooling
             };
             service
-                .apply_observation(&account.id, &control, None, version)
+                .apply_observation(&account.id, &control, None, started)
                 .await
                 .unwrap();
             let after = store.get(&account.id).await.unwrap();
@@ -3578,7 +3729,7 @@ mod tests {
         let before = store.get(&account.id).await.unwrap();
         assert_eq!(before.summary().status, "error");
         service
-            .apply_observation(&account.id, &snapshot, None, &before.updated_at)
+            .apply_observation(&account.id, &snapshot, None, &before)
             .await
             .unwrap();
         let recovered = store.get(&account.id).await.unwrap();
@@ -3602,7 +3753,7 @@ mod tests {
             .unwrap();
         let cooling = store.get(&account.id).await.unwrap();
         service
-            .apply_observation(&account.id, &snapshot, None, &cooling.updated_at)
+            .apply_observation(&account.id, &snapshot, None, &cooling)
             .await
             .unwrap();
         let after = store.get(&account.id).await.unwrap();
@@ -3625,7 +3776,7 @@ mod tests {
         let expired = store.get(&account.id).await.unwrap();
         assert_eq!(expired.summary().status, "error");
         service
-            .apply_observation(&account.id, &snapshot, None, &expired.updated_at)
+            .apply_observation(&account.id, &snapshot, None, &expired)
             .await
             .unwrap();
         let recovered = store.get(&account.id).await.unwrap();
@@ -3645,7 +3796,7 @@ mod tests {
         let newer = store.get(&account.id).await.unwrap();
         assert_ne!(newer.updated_at, before.updated_at);
         service
-            .apply_observation(&account.id, &snapshot, None, &before.updated_at)
+            .apply_observation(&account.id, &snapshot, None, &before)
             .await
             .unwrap();
         assert_eq!(
@@ -3682,7 +3833,12 @@ mod tests {
             verification_available: false,
         };
         service
-            .apply_observation(&account.id, &snapshot, None, &account.updated_at)
+            .apply_observation(
+                &account.id,
+                &snapshot,
+                None,
+                &store.get(&account.id).await.unwrap(),
+            )
             .await
             .unwrap();
         assert!(
@@ -3700,7 +3856,12 @@ mod tests {
         );
         snapshot.windows[0].id = "five-hour".into();
         service
-            .apply_observation(&account.id, &snapshot, None, &account.updated_at)
+            .apply_observation(
+                &account.id,
+                &snapshot,
+                None,
+                &store.get(&account.id).await.unwrap(),
+            )
             .await
             .unwrap();
         assert!(
@@ -3771,7 +3932,12 @@ mod tests {
             assert_eq!(snapshot.credits_only(observed()), selectable, "{credits}");
             assert!(!snapshot.window_exhausted(later), "{credits}");
             service
-                .apply_observation(&account.id, &snapshot, None, &account.updated_at)
+                .apply_observation(
+                    &account.id,
+                    &snapshot,
+                    None,
+                    &store.get(&account.id).await.unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(eligible().await, usize::from(selectable), "{credits}");
