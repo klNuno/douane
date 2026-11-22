@@ -1,8 +1,5 @@
 //! Subscription routing, OAuth, quota accounting, and native streaming transports.
 pub mod affinity;
-mod antigravity_replay;
-mod antigravity_system;
-mod antigravity_thinking;
 mod chat_images;
 pub mod clients;
 pub mod endpoint_metadata;

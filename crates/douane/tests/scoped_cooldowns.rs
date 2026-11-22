@@ -119,7 +119,14 @@ async fn exercise(provider: &str, responses: bool, global: bool) {
     let gateway = tokio::spawn(axum::serve(listener, douane::router(state.clone())).into_future());
     let client = reqwest::Client::new();
     let request = |model: &str| {
-        let (path, body): (String, Value) = if google && responses {
+        let (path, body): (String, Value) = if provider == "antigravity" {
+            // Antigravity accounts answer only Antigravity's own agent, through
+            // the Gemini API.
+            (
+                format!("/v1beta/models/{model}:generateContent"),
+                json!({"contents":[{"role":"user","parts":[{"text":"fixture"}]}]}),
+            )
+        } else if google && responses {
             (
                 "/v1/responses".into(),
                 json!({"model":format!("{provider}/{model}"),"input":"fixture"}),
@@ -198,11 +205,10 @@ async fn fable_weekly_refusal_does_not_block_opus() {
 
 #[tokio::test]
 async fn argon_weekly_refusal_does_not_block_other_google_models() {
-    for provider in ["gemini", "antigravity"] {
-        for responses in [false, true] {
-            exercise(provider, responses, false).await;
-        }
+    for responses in [false, true] {
+        exercise("gemini", responses, false).await;
     }
+    exercise("antigravity", false, false).await;
 }
 
 #[tokio::test]

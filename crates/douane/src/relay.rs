@@ -1,5 +1,4 @@
 use crate::{
-    antigravity_replay::{Recorder, Scope},
     ledger::{Call, Ledger},
     state::AppState,
     subscriptions::{AccountCredential, SubscriptionProvider, antigravity_user_agent},
@@ -14,16 +13,19 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
 
-/// 429 when shares hold the client back, so it waits; 503 otherwise.
+/// 429 when shares hold the client back, so it waits; 400 for an
+/// Antigravity model outside the Gemini API, which no retry changes; 503
+/// otherwise.
 pub(crate) fn refusal_status(message: &str) -> StatusCode {
     if message.starts_with(crate::clients::SHARE_USED_UP) {
         StatusCode::TOO_MANY_REQUESTS
+    } else if message == crate::state::ANTIGRAVITY_GEMINI_ONLY {
+        StatusCode::BAD_REQUEST
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
@@ -456,73 +458,17 @@ pub(crate) fn upstream_headers(account: &AccountCredential, incoming: &HeaderMap
     out
 }
 
-fn replay_session(session: &str, history: &Value) -> String {
-    let system = serde_json::to_vec(&history["systemInstruction"]).unwrap_or_default();
-    format!("{session}:{}", hex::encode(Sha256::digest(system)))
-}
-
-fn replay_rate_limit(seconds: u64) -> Response {
+/// A signed Gemini turn whose owner rests: the client waits for that account.
+fn owner_rate_limit(seconds: u64) -> Response {
     let mut response = error(
         StatusCode::TOO_MANY_REQUESTS,
-        "the recorded Antigravity account is temporarily unavailable; retry this conversation after Retry-After",
+        "the Antigravity account that signed this conversation is temporarily unavailable; retry after Retry-After",
     );
     response.headers_mut().insert(
         header::RETRY_AFTER,
         seconds.max(1).to_string().parse().unwrap(),
     );
     response
-}
-
-/// Account selection may rotate new sessions, but native history cannot move
-/// between subscriptions. Lookup does not authorize or refresh the owner.
-async fn replay_owner(
-    state: &AppState,
-    body: &Value,
-    headers: &HeaderMap,
-    from: Dialect,
-    provider_hint: Option<&str>,
-) -> Result<Option<String>, String> {
-    let Some(session) = crate::affinity::session_key(headers, body) else {
-        return Ok(None);
-    };
-    let Some(requested) = body["model"].as_str() else {
-        return Ok(None);
-    };
-    let model = if let Some(model) = requested.strip_prefix("antigravity/") {
-        model
-    } else {
-        if let Some((prefix, _)) = requested.split_once('/') {
-            if SubscriptionProvider::parse(prefix).is_some()
-                || state.accounts.routes().await.contains(prefix)
-            {
-                return Ok(None);
-            }
-        }
-        let config = state.config.read().await;
-        let provider = provider_hint.or(config.settings.default_provider.as_deref());
-        if provider.is_some_and(|provider| {
-            SubscriptionProvider::parse(provider) != Some(SubscriptionProvider::Antigravity)
-        }) {
-            return Ok(None);
-        }
-        requested
-    };
-    if !state
-        .antigravity_replay
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .has_session(model, &session)
-    {
-        return Ok(None);
-    }
-    let mut history = translate::antigravity_history(body, from)?;
-    crate::antigravity_system::normalize_system(&mut history);
-    let session = replay_session(&session, &history);
-    state
-        .antigravity_replay
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .owner(model, &session, &history)
 }
 
 pub(crate) fn uses_codex_catalog(headers: &HeaderMap) -> bool {
@@ -562,16 +508,29 @@ pub(crate) async fn choose(
     advance_rotation: bool,
 ) -> Result<(String, Vec<AccountCredential>, Option<String>), String> {
     let hint = provider_hint(state, body, headers, client).await;
-    choose_for_replay(state, body, headers, client, hint, None, advance_rotation).await
+    choose_with_owner(
+        state,
+        body,
+        headers,
+        client,
+        hint,
+        None,
+        false,
+        advance_rotation,
+    )
+    .await
 }
 
-async fn choose_for_replay(
+/// `gemini` for a Gemini API request, the only one Antigravity accounts serve.
+#[allow(clippy::too_many_arguments)]
+async fn choose_with_owner(
     state: &AppState,
     body: &Value,
     headers: &HeaderMap,
     client: Option<&crate::clients::Client>,
     provider_hint: Option<&str>,
     owner: Option<&str>,
+    gemini: bool,
     advance_rotation: bool,
 ) -> Result<(String, Vec<AccountCredential>, Option<String>), String> {
     let model = body["model"]
@@ -580,12 +539,13 @@ async fn choose_for_replay(
         .ok_or("model is required")?;
     let session = crate::affinity::session_key(headers, body);
     let (upstream, accounts) = state
-        .candidates_for_replay(
+        .candidates_with_owner(
             model,
             provider_hint,
             session.as_deref(),
             client,
             owner,
+            gemini,
             advance_rotation,
         )
         .await?;
@@ -658,22 +618,22 @@ pub async fn forward(
     }
     let stream = value["stream"].as_bool().unwrap_or(false);
     let hint = provider_hint(&state, &value, &headers, client.as_ref()).await;
-    // A native Gemini client keeps its own signed history.
-    let owner = if from == Dialect::Gemini {
+    // A native Gemini client keeps its own signed history. Only this route
+    // reaches Antigravity accounts.
+    let gemini = from == Dialect::Gemini;
+    let owner = if gemini {
         gemini_owner(&state, &headers, &value)
     } else {
-        match replay_owner(&state, &value, &headers, from, hint).await {
-            Ok(owner) => owner,
-            Err(e) => return error(StatusCode::BAD_REQUEST, &e),
-        }
+        None
     };
-    let (model, candidates, session) = match choose_for_replay(
+    let (model, candidates, session) = match choose_with_owner(
         &state,
         &value,
         &headers,
         client.as_ref(),
         hint,
         owner.as_deref(),
+        gemini,
         true,
     )
     .await
@@ -700,7 +660,7 @@ pub async fn forward(
             if let Some(until) = candidate.retry_at(&model) {
                 let remaining = until - time::OffsetDateTime::now_utc();
                 if remaining.is_positive() {
-                    return replay_rate_limit(remaining.whole_seconds() as u64 + 1);
+                    return owner_rate_limit(remaining.whole_seconds() as u64 + 1);
                 }
             }
         }
@@ -805,141 +765,6 @@ pub async fn forward(
                 .collect();
             crate::endpoint_metadata::merge(&mut translated, &metadata);
         }
-        if account.provider == SubscriptionProvider::Antigravity {
-            crate::antigravity_system::normalize_system(&mut translated);
-        }
-        // A native Gemini client sends its own thinking settings and signed
-        // parts: nothing to configure or replay for it.
-        let mut replay = if account.provider == SubscriptionProvider::Antigravity
-            && from != Dialect::Gemini
-        {
-            let mut history = match translate::antigravity_history(&value, from) {
-                Ok(history) => history,
-                Err(e) => return error(StatusCode::BAD_REQUEST, &e),
-            };
-            crate::antigravity_system::normalize_system(&mut history);
-            let (capabilities, output_limit) = state
-                .models
-                .read()
-                .await
-                .iter()
-                .find(|m| m.provider == account.provider && m.upstream_id == model)
-                .map(|m| (m.thinking.clone(), m.max_output_tokens))
-                .unwrap_or_default();
-            if translated
-                .pointer("/generationConfig/maxOutputTokens")
-                .is_none()
-            {
-                if let Some(limit) = output_limit.filter(|limit| *limit > 0) {
-                    translated["generationConfig"]["maxOutputTokens"] = json!(limit);
-                }
-            }
-            if let Err(e) = crate::antigravity_thinking::configure(
-                &mut translated,
-                &value,
-                from,
-                &model,
-                capabilities.as_ref(),
-            ) {
-                return error(StatusCode::BAD_REQUEST, &e);
-            }
-            let scope = Scope {
-                account: account.id.clone(),
-                model: model.clone(),
-                // Bind the root instructions to the session. Inline instructions
-                // remain client-owned context and may change during compaction.
-                session: session
-                    .as_ref()
-                    .map(|session| replay_session(session, &history))
-                    .unwrap_or_default(),
-            };
-            // Future context identity follows the client projection, whose
-            // tool IDs differ from the original provider IDs restored below.
-            let client_contents = history["contents"].as_array().cloned().unwrap_or_default();
-            let started = match state
-                .antigravity_replay
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .begin(&scope, &mut history)
-            {
-                Ok(started) => started,
-                Err(e) => return error(StatusCode::BAD_REQUEST, &e),
-            };
-            let native_replay = NativeReplay {
-                state: state.clone(),
-                scope: scope.clone(),
-                pinned: started.pinned,
-                recorder: Some(Recorder::new(scope, client_contents).with_parent(started.parent)),
-                terminal_output: None,
-            };
-            // Only model parts cross from the chronological cache projection
-            // into the provider request. Instructions retain their system role.
-            let mut restored_models = history["contents"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|content| content["role"] == "model");
-            if let Some(contents) = translated["contents"].as_array_mut() {
-                for content in contents
-                    .iter_mut()
-                    .filter(|content| content["role"] == "model")
-                {
-                    let Some(restored) = restored_models.next() else {
-                        return error(
-                            StatusCode::BAD_REQUEST,
-                            "signed-history model projection does not match native contents",
-                        );
-                    };
-                    content["parts"] = restored["parts"].clone();
-                }
-            }
-            if restored_models.next().is_some() {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "signed-history model projection does not match native contents",
-                );
-            }
-            // Only tool-result IDs cross from the restored user projection;
-            // preserve every client result value, text and instruction.
-            let mut restored_responses = history["contents"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|content| content["parts"].as_array())
-                .flatten()
-                .filter_map(|part| part.get("functionResponse"));
-            if let Some(contents) = translated["contents"].as_array_mut() {
-                for response in contents
-                    .iter_mut()
-                    .filter_map(|content| content["parts"].as_array_mut())
-                    .flatten()
-                    .filter_map(|part| part.get_mut("functionResponse"))
-                {
-                    let Some(restored) = restored_responses.next() else {
-                        return error(
-                            StatusCode::BAD_REQUEST,
-                            "signed-history tool-result projection does not match native contents",
-                        );
-                    };
-                    if let Some(object) = response.as_object_mut() {
-                        if let Some(id) = restored.get("id") {
-                            object.insert("id".into(), id.clone());
-                        } else {
-                            object.remove("id");
-                        }
-                    }
-                }
-            }
-            if restored_responses.next().is_some() {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "signed-history tool-result projection does not match native contents",
-                );
-            }
-            Some(native_replay)
-        } else {
-            None
-        };
         if account.provider == SubscriptionProvider::Meta {
             crate::subscriptions::meta::prepare_request(&mut translated);
         }
@@ -1210,7 +1035,7 @@ pub async fn forward(
                         .await;
                 }
                 if owner.is_some() && last_status == StatusCode::TOO_MANY_REQUESTS {
-                    return replay_rate_limit(wait);
+                    return owner_rate_limit(wait);
                 }
                 if refusal.is_none() {
                     if let Some(excerpt) = &excerpt {
@@ -1274,22 +1099,13 @@ pub async fn forward(
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("text/event-stream"));
         if stream && is_sse {
-            let mut streamed = stream_response(
-                response,
-                from,
-                to,
-                model,
-                call,
-                idle,
-                custom,
-                replay,
-                state.clone(),
-            );
+            let mut streamed =
+                stream_response(response, from, to, model, call, idle, custom, state.clone());
             streamed.headers_mut().extend(passed);
             return streamed;
         }
         let result = if is_sse {
-            collect_response(response, to, &mut call, idle, &mut replay, &state).await
+            collect_response(response, to, &mut call, idle, &state).await
         } else {
             match read_bounded(response, 32 * 1024 * 1024, idle).await {
                 Ok(b) => serde_json::from_slice::<Value>(&b)
@@ -1297,18 +1113,13 @@ pub async fn forward(
                 Err(e) => Err(e),
             }
         };
-        let mut result = match result {
+        let result = match result {
             Ok(v) => v,
             Err(e) => {
                 call.fail(&e);
                 return error(StatusCode::BAD_GATEWAY, &e);
             }
         };
-        if !is_sse {
-            if let Some(replay) = &mut replay {
-                replay.observe(&mut result);
-            }
-        }
         let refusal = if to == Dialect::Gemini {
             translate::gemini_refusal(&result)
         } else {
@@ -1350,12 +1161,6 @@ pub async fn forward(
         if from == Dialect::Gemini {
             result = unwrap_gemini(result);
         }
-        if let Some(replay) = &mut replay {
-            if let Err(e) = replay.commit() {
-                call.fail(&e);
-                return error(StatusCode::BAD_GATEWAY, &e);
-            }
-        }
         call.complete = true;
         let mut answer = Json(result).into_response();
         answer.headers_mut().extend(passed);
@@ -1375,68 +1180,6 @@ pub async fn forward(
             last_status,
             "all accounts for this provider are unavailable; check their quotas and connection status",
         ),
-    }
-}
-
-/// Keep opaque native parts in bounded memory only after a clean completion.
-struct NativeReplay {
-    state: Arc<AppState>,
-    scope: Scope,
-    pinned: bool,
-    recorder: Option<Recorder>,
-    terminal_output: Option<String>,
-}
-impl NativeReplay {
-    fn observe(&mut self, event: &mut Value) {
-        if let Some(recorder) = &mut self.recorder {
-            recorder.observe(event);
-        }
-    }
-    fn commit(&mut self) -> Result<(), String> {
-        self.recorder
-            .as_ref()
-            .ok_or("native Gemini history recording was already finalized")?
-            .validate_completion()
-            .map_err(|failure| failure.to_string())?;
-        // Anonymous first calls retain their existing behavior; subsequent
-        // unsigned history requires a stable session and fails at restore.
-        if self.scope.session.trim().is_empty() {
-            self.recorder.take();
-            return Ok(());
-        }
-        let turn = self
-            .recorder
-            .take()
-            .ok_or("native Gemini history recording was already finalized")?
-            .finish()
-            .map_err(|failure| failure.to_string())?;
-        // A completion the cache cannot keep is still delivered: the next
-        // request replays this turn from the client's projection instead.
-        if !self
-            .state
-            .antigravity_replay
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .record(turn)
-        {
-            tracing::warn!(
-                model = %self.scope.model,
-                "signed Gemini history cache is full; this turn will replay without its native parts"
-            );
-        }
-        Ok(())
-    }
-}
-impl Drop for NativeReplay {
-    fn drop(&mut self) {
-        if !self.pinned {
-            return;
-        }
-        self.state
-            .antigravity_replay
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .release(&self.scope);
     }
 }
 
@@ -1735,7 +1478,6 @@ async fn collect_response(
     to: Dialect,
     call: &mut CallGuard,
     idle: Duration,
-    replay: &mut Option<NativeReplay>,
     quota_state: &Arc<AppState>,
 ) -> Result<Value, String> {
     let mut decoder = Frames::default();
@@ -1743,16 +1485,13 @@ async fn collect_response(
     let mut collected = Collected::default();
     let mut meta_complete = false;
     while let Some(chunk) = next_chunk(&mut upstream, idle, "upstream stream interrupted").await {
-        for mut frame in decoder.feed(&chunk?)? {
+        for frame in decoder.feed(&chunk?)? {
             if call.call.provider == "meta" {
                 quota_state
                     .quotas
                     .observe_meta_event(&call.call.account_id, &frame)
                     .await;
                 quota_state.observe_usage(&call.call.account_id).await;
-            }
-            if let Some(replay) = replay {
-                replay.observe(&mut frame);
             }
             collected.frame(&frame, to, call)?;
         }
@@ -1772,16 +1511,13 @@ async fn collect_response(
     } else {
         decoder.finish()?
     };
-    for mut frame in tail {
+    for frame in tail {
         if call.call.provider == "meta" {
             quota_state
                 .quotas
                 .observe_meta_event(&call.call.account_id, &frame)
                 .await;
             quota_state.observe_usage(&call.call.account_id).await;
-        }
-        if let Some(replay) = replay {
-            replay.observe(&mut frame);
         }
         collected.frame(&frame, to, call)?;
     }
@@ -1879,7 +1615,6 @@ fn stream_response(
     call: CallGuard,
     idle: Duration,
     custom: std::collections::BTreeSet<String>,
-    replay: Option<NativeReplay>,
     quota_state: Arc<AppState>,
 ) -> Response {
     let meta = call.call.provider == "meta";
@@ -1896,20 +1631,11 @@ fn stream_response(
         bridge,
         call,
         false,
-        replay,
         quota_state,
     );
     let stream = futures_util::stream::unfold(
         state,
-        move |(
-            mut upstream,
-            mut frames,
-            mut bridge,
-            mut call,
-            mut done,
-            mut replay,
-            quota_state,
-        )| async move {
+        move |(mut upstream, mut frames, mut bridge, mut call, mut done, quota_state)| async move {
             if done {
                 return None;
             }
@@ -1942,9 +1668,6 @@ fn stream_response(
                                     translated
                                         .push_str(&format!("event: {kind}\ndata: {event}\n\n"));
                                 }
-                                if let Some(replay) = &mut replay {
-                                    replay.observe(&mut event);
-                                }
                                 call.observe(&event);
                                 if envelope {
                                     if let Some(message) = translate::gemini_refusal(&event) {
@@ -1955,26 +1678,8 @@ fn stream_response(
                                     let answer = unwrap_gemini(event.clone());
                                     translated.push_str(&format!("data: {answer}\r\n\r\n"));
                                 }
-                                let defer = replay.as_ref().is_some_and(|replay| {
-                                    gemini_finished(&event) || replay.terminal_output.is_some()
-                                });
                                 if let Some(b) = bridge.as_mut() {
                                     match b.feed(event) {
-                                        Ok(s) if defer => {
-                                            let held = replay
-                                                .as_mut()
-                                                .unwrap()
-                                                .terminal_output
-                                                .get_or_insert_default();
-                                            if held.len().saturating_add(s.len()) > 32 * 1024 * 1024
-                                            {
-                                                failure = Some(
-                                                    "upstream response exceeds size limit".into(),
-                                                );
-                                                break;
-                                            }
-                                            held.push_str(&s);
-                                        }
                                         Ok(s) => translated.push_str(&s),
                                         Err(e) => {
                                             failure = Some(e);
@@ -2020,13 +1725,6 @@ fn stream_response(
                             }
                             let tail = (|| -> Result<String, String> {
                                 let mut output = String::new();
-                                // Completion stays private until decoding and
-                                // native-history storage have both succeeded.
-                                if let Some(replay) = &mut replay {
-                                    output.push_str(
-                                        &replay.terminal_output.take().unwrap_or_default(),
-                                    );
-                                }
                                 for mut event in ending? {
                                     if meta
                                         && crate::subscriptions::meta::subscription_event(&event)
@@ -2038,18 +1736,10 @@ fn stream_response(
                                             &mut event,
                                         );
                                     }
-                                    if let Some(replay) = &mut replay {
-                                        replay.observe(&mut event);
-                                    }
                                     call.observe(&event);
                                     output.push_str(&b.feed(event)?);
                                 }
                                 output.push_str(&b.finish()?);
-                                if call.call.error.is_none() {
-                                    if let Some(replay) = &mut replay {
-                                        replay.commit()?;
-                                    }
-                                }
                                 Ok(output)
                             })();
                             match tail {
@@ -2114,7 +1804,7 @@ fn stream_response(
                     Ok(Some(bytes)) => {
                         return Some((
                             Ok::<Bytes, std::io::Error>(bytes),
-                            (upstream, frames, bridge, call, done, replay, quota_state),
+                            (upstream, frames, bridge, call, done, quota_state),
                         ));
                     }
                     Ok(None) if done => return None,
@@ -2126,7 +1816,7 @@ fn stream_response(
                             json!({"type":"error","error":{"type":"upstream_error","message":e}});
                         return Some((
                             Ok(Bytes::from(format!("event: error\ndata: {body}\n\n"))),
-                            (upstream, frames, bridge, call, done, replay, quota_state),
+                            (upstream, frames, bridge, call, done, quota_state),
                         ));
                     }
                 }

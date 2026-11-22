@@ -364,7 +364,6 @@ pub async fn restore(State(state): State<Arc<AppState>>, Json(body): Json<Value>
                 );
             }
         }
-        state.configure_replay(&config.settings);
         *state.config.write().await = config;
     }
     // Clients are checked before anything changes, and stored after the
@@ -775,7 +774,7 @@ pub async fn public_models(
     Query(query): Query<Params>,
 ) -> Response {
     match state.clients.authenticate(&headers) {
-        Ok(client) => Json(list_models(&state, &query, Some(&client)).await).into_response(),
+        Ok(client) => Json(list_models(&state, &query, Some(&client), false).await).into_response(),
         Err(refusal) => error(StatusCode::UNAUTHORIZED, refusal.message()),
     }
 }
@@ -827,7 +826,7 @@ pub async fn gemini_models(
         ids: Some("upstream".into()),
         ..Default::default()
     };
-    let listed = list_models(&state, &query, Some(&client)).await;
+    let listed = list_models(&state, &query, Some(&client), true).await;
     let models: Vec<Value> = listed["data"]
         .as_array()
         .into_iter()
@@ -849,12 +848,16 @@ pub async fn management_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<Params>,
 ) -> Json<Value> {
-    Json(list_models(&state, &query, None).await)
+    Json(list_models(&state, &query, None, false).await)
 }
+/// Antigravity models are listed only for the Gemini API (`antigravity`),
+/// the one route that serves them: Google bans an account used outside
+/// Antigravity's own agent.
 async fn list_models(
     state: &AppState,
     query: &Params,
     client: Option<&crate::clients::Client>,
+    antigravity: bool,
 ) -> Value {
     // A pool is a provider, or one custom endpoint route. A model shows
     // when an enabled account the client may use serves it.
@@ -886,6 +889,7 @@ async fn list_models(
         .filter(|m| {
             let pool = m.route.as_deref().unwrap_or(m.provider.as_str());
             m.enabled
+                && (antigravity || m.provider != SubscriptionProvider::Antigravity)
                 && serves(pool, &m.upstream_id)
                 && query
                     .provider
@@ -1206,7 +1210,6 @@ pub async fn update_settings(
             );
         }
     }
-    state.configure_replay(&settings);
     *state.config.write().await = config;
     Json(json!(settings)).into_response()
 }

@@ -487,3 +487,140 @@ async fn a_signed_turn_waits_for_the_account_that_signed_it() {
     let tokens = fixture.mock.tokens.lock().unwrap();
     assert!(tokens.iter().all(|t| *t == signer), "{tokens:?}");
 }
+
+async fn post_v1(
+    fixture: &Fixture,
+    path: &str,
+    body: Value,
+    provider: Option<&str>,
+) -> (StatusCode, String) {
+    let mut request = fixture
+        .client
+        .post(format!("{}/v1/{path}", fixture.url))
+        .bearer_auth(&fixture.key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body);
+    if let Some(provider) = provider {
+        request = request.header("x-douane-provider", provider);
+    }
+    let response = request.send().await.unwrap();
+    (response.status(), response.text().await.unwrap())
+}
+
+fn chat(model: &str) -> Value {
+    json!({"model":model,"max_tokens":64,"messages":[{"role":"user","content":"say pong"}]})
+}
+
+fn responses(model: &str) -> Value {
+    json!({"model":model,"input":"say pong"})
+}
+
+#[tokio::test]
+async fn chat_messages_and_responses_never_reach_an_antigravity_account() {
+    let fixture = Fixture::new().await;
+    let cases = [
+        // A prefix, a bare id only Antigravity lists, and a header naming it.
+        ("chat/completions", chat("antigravity/synthetic-pro"), None),
+        ("chat/completions", chat("synthetic-flash-low"), None),
+        (
+            "chat/completions",
+            chat("synthetic-pro"),
+            Some("antigravity"),
+        ),
+        ("messages", chat("antigravity/synthetic-pro"), None),
+        ("messages", chat("synthetic-flash-low"), None),
+        (
+            "messages/count_tokens",
+            chat("antigravity/synthetic-pro"),
+            None,
+        ),
+        ("responses", responses("antigravity/synthetic-pro"), None),
+        ("responses", responses("synthetic-flash-high"), None),
+        (
+            "responses/compact",
+            responses("antigravity/synthetic-pro"),
+            None,
+        ),
+    ];
+    for (path, body, provider) in cases {
+        let model = body["model"].clone();
+        let (status, text) = post_v1(&fixture, path, body, provider).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {model}: {text}");
+        assert!(
+            text.contains("Antigravity accounts serve only Antigravity's own agent"),
+            "{path} {model}: {text}"
+        );
+    }
+    assert!(fixture.mock.tokens.lock().unwrap().is_empty());
+    assert!(fixture.mock.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_model_antigravity_shares_goes_to_the_other_provider_from_chat() {
+    // Both pools serve synthetic-pro; the Antigravity pool has two accounts.
+    let fixture = Fixture::with(&["synthetic-pro"], 2).await;
+    for _ in 0..3 {
+        let (status, text) =
+            post_v1(&fixture, "chat/completions", chat("synthetic-pro"), None).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+    }
+    let tokens = fixture.mock.tokens.lock().unwrap();
+    assert_eq!(tokens.len(), 3, "{tokens:?}");
+    assert!(
+        tokens.iter().all(|t| t == "Bearer synthetic-gemini-access"),
+        "{tokens:?}"
+    );
+}
+
+#[tokio::test]
+async fn client_model_lists_leave_antigravity_to_the_gemini_api() {
+    let fixture = Fixture::new().await;
+    for query in [
+        "",
+        "?provider=antigravity",
+        "?provider=antigravity,gemini",
+        "?ids=upstream",
+        "?provider=antigravity&ids=upstream",
+    ] {
+        let listed: Value = fixture
+            .client
+            .get(format!("{}/v1/models{query}", fixture.url))
+            .bearer_auth(&fixture.key)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let rows = listed["data"].as_array().unwrap();
+        assert!(
+            rows.iter().all(|m| m["owned_by"] != "antigravity"
+                && !m["id"].as_str().unwrap().starts_with("antigravity/")),
+            "{query}: {listed}"
+        );
+        if !query.contains("provider=antigravity&") && query != "?provider=antigravity" {
+            assert!(
+                rows.iter().any(|m| m["owned_by"] == "gemini"),
+                "{query}: {listed}"
+            );
+        }
+    }
+    let gemini: Value = fixture
+        .client
+        .get(format!("{}/v1beta/models", fixture.url))
+        .bearer_auth(&fixture.key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        gemini["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "models/synthetic-flash-low"),
+        "{gemini}"
+    );
+}
