@@ -9,7 +9,7 @@
 
 One self-hosted endpoint for every AI subscription you pay for.
 
-douane connects your Claude, ChatGPT (Codex), Antigravity, Muse Code, Grok, GitHub Copilot and OpenCode Go subscriptions, plus any API key you hold, then serves them to any coding tool through OpenAI- and Anthropic-compatible APIs. It watches each account's quota, picks the account that should serve the next conversation, and keeps a conversation on the same account so the provider's prompt cache stays warm. A single Rust binary with an embedded dashboard; no Node.js, Docker or external database at runtime.
+douane connects your Claude, ChatGPT (Codex), Antigravity, Muse Code, Grok, GitHub Copilot and OpenCode Go subscriptions, plus any API key you hold, then serves them to any coding tool through OpenAI- and Anthropic-compatible APIs. Antigravity accounts are the exception: they serve only Antigravity's own agent, through the Gemini API. It watches each account's quota, picks the account that should serve the next conversation, and keeps a conversation on the same account so the provider's prompt cache stays warm. A single Rust binary with an embedded dashboard; no Node.js, Docker or external database at runtime.
 
 ![Quotas page: accounts grouped by provider, with five-hour and weekly windows, resets and extra credits](docs/images/quotas.png)
 
@@ -33,7 +33,7 @@ douane connects your Claude, ChatGPT (Codex), Antigravity, Muse Code, Grok, GitH
 | Claude (Pro, Max) | OAuth in the dashboard, or credential import | Five-hour, weekly and weekly Opus windows, extra usage, banked resets |
 | Codex (ChatGPT plans) | OAuth in the dashboard, or credential import | Five-hour and weekly windows, credits, banked resets |
 | Muse Code (Meta subscription) | Meta device code in the dashboard, or credential import | Subscription windows observed in inference responses |
-| Antigravity | Google OAuth once a client is configured, or import | Per-model quotas |
+| Antigravity (for Antigravity's own agent only) | Google OAuth once a client is configured, or import | Per-model quotas |
 | Grok (SuperGrok) | Device code in the dashboard | Weekly or monthly credit windows |
 | OpenCode Go | Subscription key in the manual form | Five-hour, weekly and monthly windows |
 | Gemini CLI, Kimi | Credential import | Read from the provider |
@@ -131,7 +131,7 @@ If clients reach the API at a different address than the dashboard (a reverse pr
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /health` | Service health |
-| `GET /v1/models` | Available models; `?provider=xai,claude` filters, `&ids=upstream` lists provider-native ids in the provider's order |
+| `GET /v1/models` | Available models, Antigravity's left out; `?provider=xai,claude` filters, `&ids=upstream` lists provider-native ids in the provider's order |
 | `GET /v1/quotas` | Quotas per provider, per account or averaged, for client status bars |
 | `POST /v1/chat/completions` | Chat Completions, streaming included |
 | `POST /v1/messages` | Anthropic Messages, streaming included |
@@ -145,51 +145,15 @@ If clients reach the API at a different address than the dashboard (a reverse pr
 
 Translation between the three dialects covers text, tools and images; provider-specific extensions do not all have an equivalent. A failed request moves to another account only before its first byte reaches the client: started output is never replayed. A same-dialect request returns the provider's own rate-limit headers and request id, and client errors such as an oversized prompt come back as the provider wrote them. Every refusal keeps the first 300 characters of the provider's reply, with tokens redacted, in the call log and the service log; Google refusals keep only their reason code.
 
-### Antigravity clients
+### Antigravity
 
-Use an advertised `antigravity/<model>` ID through Chat Completions, Messages or
-Responses. Send a stable conversation ID, such as `x-opencode-session-id`,
-`X-Session-Id`, `session_id` or `prompt_cache_key`. OpenCode's custom provider
-sends its own session ID. `/v1/models` includes thinking capabilities and
-context/output limits; explicit thinking controls follow those capabilities.
-
-Only outgoing Antigravity system text is normalized: Anthropic billing lines
-are removed, and the exact Claude Agent SDK and Codex self-identification
-phrases receive one zero-width space. Other instructions, user messages, tools
-and other providers are preserved. This follows the compatibility approach in
-[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/tree/bf9341629ef2300ac9d846a2e80fe2756f63a671/internal/translator/antigravity).
-Google can still refuse a request; its sanitized reason and retry delay remain
-visible.
-
-Native signed model parts are kept in memory and restored after tool results.
-Replay is scoped to the account, model, session and normalized root
-instructions. Complete visible model output and its recorded lineage must
-match; a client may compact its prefix or edit its own results and inline
-reminders. Hidden reasoning and opaque signatures never enter the ledger or
-disk. Chat Completions exposes returned thought text as `reasoning_content`;
-other dialects do not fabricate signed thinking blocks.
-
-The replay cache has a 64 MiB budget and a one-hour idle lifetime by default
-(`antigravity_replay_mib`, `antigravity_replay_idle_minutes`), with a 256 KiB
-native-turn limit and no independent turn-count limit. Interrupted, invalid or
-oversized turns are not recorded. A turn missing from the cache (evicted,
-expired, lost at a restart or never recorded) is sent as the client's text, its
-first tool call marked with Gemini's `skip_thought_signature_validator`
-placeholder, so the conversation continues without that turn's hidden
-reasoning. Ambiguous, reordered or cross-scope model history is refused
-locally. Provider refusals and empty completions produce explicit errors.
-See [signed history](docs/antigravity-replay.md) for retention and compaction
-rules. Acceptance by a live Google account remains separate from offline tests.
-
-Each Antigravity account lists its own models (`fetchAvailableModels`), and
-plans differ: Claude Opus and Sonnet 5.5 are offered to some Google AI Pro
-accounts and not to trial or partner ones. The catalog is the union of every
-account's list, and a request goes only to the accounts whose own list names its
-model. An account that still answers `NOT_FOUND` for a model is skipped for it
-for 24 hours or until a restart, the next account is tried, and the account
-stays usable.
-
-### Antigravity's own clients
+Antigravity accounts serve only Google's Antigravity agent: Google bans an
+account it sees used from another tool. Chat Completions, Messages and
+Responses never reach them; a model only Antigravity serves (an
+`antigravity/...` id, `x-douane-provider: antigravity`, or a bare id no other
+provider lists) is refused with a 400 before any upstream call, and a model
+another provider also serves goes to that provider. `/v1/models` does not list
+Antigravity models.
 
 Google's Antigravity ACP server (`agy_acp_server`, the agent Boite and other
 ACP hosts start) reaches its models through a custom gateway that speaks the
@@ -205,13 +169,22 @@ AGY_LLM_GATEWAY_URL=http://127.0.0.1:8787
 AGY_LLM_GATEWAY_API_KEY=<douane client key>
 ```
 
-The model picker lists the Antigravity models the key may use, by their
-provider ids. The client names a leveled model by its family and sends the
-level (`gemini-3.8-flash` with `thinkingLevel: low`); douane sends it to
-`gemini-3.8-flash-low` when the catalog lists that id. Requests and answers
-cross unchanged apart from Cloud Code's envelope and the system text
-normalization above; the client keeps its own signed history, so no replay
-cache is used.
+The model picker (`/v1beta/models`) lists the Antigravity models the key may
+use, by their provider ids. The client names a leveled model by its family and
+sends the level (`gemini-3.8-flash` with `thinkingLevel: low`); douane sends it
+to `gemini-3.8-flash-low` when the catalog lists that id. Requests and answers
+cross unchanged apart from Cloud Code's envelope. The client keeps its own
+signed history: a session that carries signed turns stays on the account that
+signed them, and while that account rests the client gets a 429 with
+`Retry-After` rather than another account.
+
+Each Antigravity account lists its own models (`fetchAvailableModels`), and
+plans differ: Claude Opus and Sonnet 5.5 are offered to some Google AI Pro
+accounts and not to trial or partner ones. The catalog is the union of every
+account's list, and a request goes only to the accounts whose own list names its
+model. An account that still answers `NOT_FOUND` for a model is skipped for it
+for 24 hours or until a restart, the next account is tried, and the account
+stays usable.
 
 ### Muse Code subscription
 
