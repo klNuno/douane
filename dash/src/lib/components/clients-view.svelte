@@ -138,6 +138,7 @@
 						{#each access.whole as item (item.id)}<span class="tag"><ProviderMark provider={item.provider} size={17}/>{item.name}</span>{/each}
 						{#each access.single as account (account.id)}<span class="tag"><ProviderMark provider={account.provider} size={17}/>{privateLabel(account.name)}</span>{/each}
 						{#each access.missing as id (id)}<span class="tag muted">{t('activity.unknownAccount')}</span>{/each}
+						{#each Object.keys(client.borrows ?? {}) as lent (lent)}{@const lender = accounts.find(account => account.id === lent)}{#if lender}<span class="tag" title={t('clients.borrowInfo')}><ProviderMark provider={lender.provider} size={17}/>{t('clients.borrowTag', { name: privateLabel(lender.name) })}</span>{/if}{/each}
 						{#if !access.whole.length && !access.single.length && !access.missing.length}<span class="tag muted">{t('clients.noAccess')}</span>{/if}
 					{/if}
 					{#each shares as [id, share] (id)}{@const item = pool(id)}<span class="share-chip" title={t('clients.shareOf', { pool: item.name })}><ChartPie size={15}/>{item.name}<strong>{percent(share)}</strong></span>{/each}
