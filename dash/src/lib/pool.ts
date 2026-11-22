@@ -16,22 +16,25 @@ export type Sample = { t: number; v: number };
 
 const subscriptionOf = (account: Account, quotas: Quota[]) => quotas.find(q => q.account_id === account.id)?.subscription ?? account.subscription ?? null;
 
-/** The weight a plan carries before normalisation: the user's choice, else the plan multiplier, else 1. */
+const positive = (value: number | null | undefined) => value != null && value > 0 ? value : undefined;
+
+/**
+ * The weight a plan carries before normalisation: the user's choice, else the
+ * provider's multiplier, else the published ratio douane knows (Codex Pro 20x
+ * Plus), else 1. Same order as the server's `Settings::plan_weight`.
+ */
 export function rawWeight(provider: string, subscription: Subscription | null | undefined, planWeights?: PlanWeights) {
 	const chosen = subscription?.id ? planWeights?.[provider]?.[subscription.id] : undefined;
-	return chosen && chosen > 0 ? chosen : subscription?.multiplier && subscription.multiplier > 0 ? subscription.multiplier : 1;
+	return positive(chosen) ?? positive(subscription?.multiplier) ?? positive(subscription?.default_weight) ?? 1;
 }
 
 /**
- * Normalised weight per enabled account: raw weights divided by the most
- * common one (ties go to the larger), so the usual plan counts 1x.
+ * Normalised weight per enabled account: raw weights divided by the largest,
+ * so the highest plan of the provider is 100% and smaller ones a fraction.
  */
 export function accountWeights(accounts: Account[], quotas: Quota[], planWeights?: PlanWeights) {
 	const raw = new Map(accounts.filter(a => a.enabled).map(a => [a.id, rawWeight(a.provider, subscriptionOf(a, quotas), planWeights)]));
-	const counts = new Map<number, number>();
-	for (const weight of raw.values()) counts.set(weight, (counts.get(weight) ?? 0) + 1);
-	let base = 1, best = 0;
-	for (const [weight, count] of counts) if (count > best || (count === best && weight > base)) { base = weight; best = count; }
+	const base = Math.max(0, ...raw.values()) || 1;
 	return new Map([...raw].map(([id, weight]) => [id, weight / base]));
 }
 

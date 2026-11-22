@@ -87,6 +87,7 @@ pub(crate) fn apply_minted(
             id,
             label,
             multiplier: None,
+            default_weight: None,
             source: "provider_profile".into(),
         });
     account.expires_at = None;
