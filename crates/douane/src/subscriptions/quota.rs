@@ -1709,10 +1709,17 @@ fn load_snapshots(path: &std::path::Path) -> BTreeMap<String, QuotaSnapshot> {
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return BTreeMap::new();
     }
-    std::fs::read(path)
+    let mut snapshots: BTreeMap<String, QuotaSnapshot> = std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    for snapshot in snapshots.values_mut() {
+        snapshot.subscription = snapshot
+            .subscription
+            .take()
+            .map(|tier| tier.with_default_weight(snapshot.provider));
+    }
+    snapshots
 }
 
 /// Replaces `path` atomically with an owner-only file.
@@ -2766,6 +2773,20 @@ mod tests {
         store.delete(id).await.unwrap();
         assert!(service.due(interval, now + interval).await.is_empty());
         assert!(service.failures.read().await.is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_saved_before_plan_weights_loads_with_them() {
+        // Written by a douane without default_weight: the pool must not count
+        // this Codex Pro like a Plus until the next successful read.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quota-snapshots.json");
+        std::fs::write(&path, serde_json::to_vec(&json!({"pro":{"account_id":"pro","provider":"codex","windows":[],"updated_at":"2026-11-21T12:00:00Z","error":null,"subscription":{"id":"pro","label":"Codex Pro","multiplier":null,"source":"provider_usage"}}})).unwrap()).unwrap();
+        let loaded = load_snapshots(&path);
+        assert_eq!(
+            loaded["pro"].subscription.as_ref().unwrap().default_weight,
+            Some(20)
+        );
     }
 
     #[tokio::test]

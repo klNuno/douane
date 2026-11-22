@@ -94,6 +94,13 @@ pub(crate) fn default_plan_weight(provider: SubscriptionProvider, id: &str) -> O
 }
 
 impl SubscriptionTier {
+    /// Sets the published ratio from the current table, so a tier saved
+    /// before it (an account file, a snapshot from a previous run) carries it.
+    pub(crate) fn with_default_weight(mut self, provider: SubscriptionProvider) -> Self {
+        self.default_weight = default_plan_weight(provider, &self.id);
+        self
+    }
+
     /// The weight of one account of this plan before normalisation: the
     /// provider's multiplier, else the published ratio, else 1.
     pub fn weight(&self, provider: SubscriptionProvider) -> f64 {
@@ -493,9 +500,18 @@ impl AccountCredential {
             provider: self.provider,
             email: self.email.clone(),
             plan: self.plan.clone(),
-            subscription: self.subscription.clone().or_else(|| {
-                SubscriptionTier::detect(self.provider, self.plan.as_deref(), None, "credential")
-            }),
+            subscription: self
+                .subscription
+                .clone()
+                .map(|tier| tier.with_default_weight(self.provider))
+                .or_else(|| {
+                    SubscriptionTier::detect(
+                        self.provider,
+                        self.plan.as_deref(),
+                        None,
+                        "credential",
+                    )
+                }),
             enabled: self.enabled,
             status: status.into(),
             last_error: self.last_error.clone(),
@@ -569,8 +585,12 @@ impl AccountStore {
                 return Err(SubscriptionError::Storage);
             }
             let bytes = fs::read(&path).map_err(|_| SubscriptionError::Storage)?;
-            let account: AccountCredential =
+            let mut account: AccountCredential =
                 serde_json::from_slice(&bytes).map_err(|_| SubscriptionError::Storage)?;
+            account.subscription = account
+                .subscription
+                .take()
+                .map(|tier| tier.with_default_weight(account.provider));
             if !valid_id(&account.id)
                 || path.file_stem().and_then(|v| v.to_str()) != Some(&account.id)
             {
@@ -1739,6 +1759,17 @@ mod tests {
         .unwrap();
         assert_eq!(codex.label, "Codex Pro");
         assert_eq!(codex.multiplier, None);
+        // An account file saved before default_weight existed gets it back.
+        let mut stored =
+            parse_import(json!({"type":"codex","access_token":"fixture"}), None).unwrap();
+        stored.subscription = Some(SubscriptionTier {
+            default_weight: None,
+            ..codex.clone()
+        });
+        assert_eq!(
+            stored.summary().subscription.unwrap().default_weight,
+            Some(20)
+        );
         // OpenAI publishes Pro at 20x Plus: the pool weight, never the label.
         assert_eq!(codex.default_weight, Some(20));
         assert_eq!(codex.weight(SubscriptionProvider::Codex), 20.0);
@@ -1783,6 +1814,29 @@ mod tests {
             "X Premium+"
         );
         assert!(subscription_from_value(SubscriptionProvider::Claude, &json!({"organization":{"organization_type":"unknown-fixture","rate_limit_tier":"unknown-private-value"}}), "provider_profile").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_account_file_saved_before_plan_weights_loads_with_them() {
+        // Quota snapshots copy the stored tier as is, so the account file
+        // itself must come back with the published ratio.
+        let directory = tempfile::tempdir().unwrap();
+        let store = AccountStore::open(directory.path()).unwrap();
+        let imported = store
+            .import(
+                json!({"type":"codex","access_token":"fixture-private"}),
+                None,
+            )
+            .await
+            .unwrap();
+        let path = directory.path().join(format!("{}.json", imported.id));
+        let mut saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        saved["subscription"] =
+            json!({"id":"pro","label":"Codex Pro","multiplier":null,"source":"provider_usage"});
+        fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let reopened = AccountStore::open(directory.path()).unwrap();
+        let account = reopened.get(&imported.id).await.unwrap();
+        assert_eq!(account.subscription.unwrap().default_weight, Some(20));
     }
 
     #[tokio::test]

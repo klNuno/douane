@@ -34,7 +34,7 @@ export function rawWeight(provider: string, subscription: Subscription | null | 
  */
 export function accountWeights(accounts: Account[], quotas: Quota[], planWeights?: PlanWeights) {
 	const raw = new Map(accounts.filter(a => a.enabled).map(a => [a.id, rawWeight(a.provider, subscriptionOf(a, quotas), planWeights)]));
-	const base = Math.max(1e-9, ...raw.values());
+	const base = Math.max(0, ...raw.values()) || 1;
 	return new Map([...raw].map(([id, weight]) => [id, weight / base]));
 }
 

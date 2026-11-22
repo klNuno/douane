@@ -23,6 +23,8 @@ test('the highest plan of a provider is 100%, smaller plans a fraction', () => {
 	// A user weight overrides the multiplier; a disabled account stays out.
 	const custom = accountWeights([account('a', ultra), account('d', pro), account('x', ultra, false)], [], { claude: { pro: 10 } });
 	assert.deepEqual([...custom], [['a', 1], ['d', 0.5]]);
+	// A single account at a tiny user weight is still the whole pool.
+	assert.deepEqual([...accountWeights([account('d', pro)], [], { claude: { pro: 1e-10 } })], [['d', 1]]);
 });
 
 test('a Codex Plus beside a Codex Pro counts a twentieth, not a second Pro', () => {
