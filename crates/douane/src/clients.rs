@@ -67,6 +67,26 @@ pub struct Client {
     /// Per-account percentages, overriding the pool's share without granting access.
     #[serde(default)]
     pub account_shares: BTreeMap<String, f64>,
+    /// Accounts outside its access it may borrow a model family's week from
+    /// (Fable) once its own account's family week holds it back, by account
+    /// id. What it spends there counts against its share of the home week.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub borrows: BTreeMap<String, Borrow>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Borrow {
+    /// The account whose weekly share pays for the borrowed calls.
+    pub home: String,
+    /// Home-week points per point of the borrowed account's week: the ratio
+    /// of their plans, set from the accounts' tiers.
+    #[serde(default = "one")]
+    pub scale: f64,
+}
+
+fn one() -> f64 {
+    1.0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -115,6 +135,23 @@ impl Access {
 }
 
 impl Client {
+    /// Its access allows the account, or it may borrow from it.
+    pub fn may_use(&self, account: &AccountCredential) -> bool {
+        self.access.allows(account) || self.borrows.contains_key(&account.id)
+    }
+
+    pub fn may_use_summary(&self, account: &crate::subscriptions::AccountSummary) -> bool {
+        self.access.allows_summary(account) || self.borrows.contains_key(&account.id)
+    }
+
+    /// The home account when this account is reached only by borrowing.
+    pub fn borrowed_home(&self, account: &AccountCredential) -> Option<&str> {
+        if self.access.allows(account) {
+            return None;
+        }
+        self.borrows.get(&account.id).map(|b| b.home.as_str())
+    }
+
     pub fn share_for(&self, pool: &str, account_id: &str) -> Option<f64> {
         self.account_shares
             .get(account_id)
@@ -125,10 +162,34 @@ impl Client {
     /// Drops the shares its access no longer reaches: an account share on an
     /// account it may not use, a pool share on a pool none of its accounts is
     /// in. `pools` maps each connected account to its pool. True when one went.
-    fn drop_unreachable_shares(&mut self, pools: &BTreeMap<String, String>) -> bool {
+    fn drop_unreachable_shares(&mut self, accounts: &BTreeMap<String, (String, f64)>) -> bool {
+        let pools: BTreeMap<String, String> = accounts
+            .iter()
+            .map(|(id, (pool, _))| (id.clone(), pool.clone()))
+            .collect();
+        let access = &self.access;
+        // A borrow needs both accounts and the access to its home; its scale
+        // follows their plans.
+        let borrows = self.borrows.clone();
+        self.borrows.retain(|id, borrow| {
+            *id != borrow.home
+                && accounts.contains_key(id)
+                && pools
+                    .get(&borrow.home)
+                    .is_some_and(|pool| access.allows_in(pool, &borrow.home))
+        });
+        for (id, borrow) in &mut self.borrows {
+            if let (Some((_, lent)), Some((_, home))) = (accounts.get(id), accounts.get(&borrow.home))
+            {
+                if *home > 0.0 {
+                    borrow.scale = lent / home;
+                }
+            }
+        }
+        let borrows_changed = borrows != self.borrows;
         let access = &self.access;
         if access.all {
-            return false;
+            return borrows_changed;
         }
         let before = self.shares.len() + self.account_shares.len();
         self.account_shares.retain(|id, _| {
@@ -141,7 +202,7 @@ impl Client {
             access.pools.contains(pool)
                 || access.accounts.iter().any(|id| pools.get(id) == Some(pool))
         });
-        before != self.shares.len() + self.account_shares.len()
+        borrows_changed || before != self.shares.len() + self.account_shares.len()
     }
 
     /// The listing shown to the dashboard: everything but the key hash.
@@ -154,6 +215,7 @@ impl Client {
             "access": self.access,
             "shares": self.shares,
             "account_shares": self.account_shares,
+            "borrows": self.borrows,
         })
     }
 }
@@ -174,6 +236,10 @@ pub struct WindowUsage {
     /// Percent points no call through douane explains.
     #[serde(default)]
     pub outside: f64,
+    /// Points charged to each client for what it borrowed on other accounts
+    /// (see [`Client::borrows`]): part of its use, not of the reading.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub charged: BTreeMap<String, f64>,
     /// Snapshot timestamp, persisted so delayed readings cannot undo a reset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
@@ -359,6 +425,7 @@ pub struct ClientPatch {
     pub access: Option<Access>,
     pub shares: Option<BTreeMap<String, f64>>,
     pub account_shares: Option<BTreeMap<String, f64>>,
+    pub borrows: Option<BTreeMap<String, Borrow>>,
     /// Replace the key; the new one is returned once.
     #[serde(default)]
     pub rotate_key: bool,
@@ -421,6 +488,31 @@ fn check_shares(shares: &BTreeMap<String, f64>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn check_borrows(borrows: &BTreeMap<String, Borrow>) -> Result<(), String> {
+    if borrows.len() > 16 {
+        return Err("at most 16 borrowed accounts".into());
+    }
+    for (id, borrow) in borrows {
+        if id.is_empty() || id.len() > 128 || borrow.home.is_empty() || borrow.home.len() > 128 {
+            return Err("a borrow names two accounts".into());
+        }
+        if *id == borrow.home {
+            return Err("an account cannot lend to itself".into());
+        }
+        if !borrow.scale.is_finite() || borrow.scale <= 0.0 || borrow.scale > 100.0 {
+            return Err("a borrow's scale must be above 0 and at most 100".into());
+        }
+    }
+    Ok(())
+}
+
+/// Whether the account's own week (not a family's) is used up.
+pub fn account_week_spent(snapshot: &QuotaSnapshot, now: i64) -> bool {
+    readings(snapshot)
+        .iter()
+        .any(|r| r.kind == "weekly" && r.reset > now && r.used >= 100.0 - 1e-9)
 }
 
 impl Clients {
@@ -505,6 +597,8 @@ impl Clients {
         check_shares(&shares)?;
         let account_shares = patch.account_shares.unwrap_or_default();
         check_shares(&account_shares)?;
+        let borrows = patch.borrows.unwrap_or_default();
+        check_borrows(&borrows)?;
         let key = new_key();
         let client = self.change(|list| {
             if list.len() >= MAX_CLIENTS {
@@ -525,6 +619,7 @@ impl Clients {
                 access: patch.access.unwrap_or_default(),
                 shares,
                 account_shares,
+                borrows,
             };
             list.push(client.clone());
             Ok(client)
@@ -540,6 +635,9 @@ impl Clients {
         }
         if let Some(shares) = &patch.account_shares {
             check_shares(shares)?;
+        }
+        if let Some(borrows) = &patch.borrows {
+            check_borrows(borrows)?;
         }
         let key = patch.rotate_key.then(new_key);
         let client = self.change(|list| {
@@ -559,6 +657,9 @@ impl Clients {
             if let Some(shares) = patch.account_shares {
                 client.account_shares = shares;
             }
+            if let Some(borrows) = patch.borrows {
+                client.borrows = borrows;
+            }
             if let Some(key) = &key {
                 client.key_hash = key_hash(key);
                 client.key_hint = hint(key);
@@ -571,14 +672,18 @@ impl Clients {
     /// Drops every share a client's access no longer reaches, so a share never
     /// outlives the access it came with. Writes only when one went.
     pub fn drop_unreachable_shares(&self, accounts: &[AccountSummary]) -> Result<(), String> {
-        let pools: BTreeMap<String, String> = accounts
+        let pools: BTreeMap<String, (String, f64)> = accounts
             .iter()
             .map(|a| {
                 let pool = a
                     .route
                     .clone()
                     .unwrap_or_else(|| a.provider.as_str().to_owned());
-                (a.id.clone(), pool)
+                let weight = a
+                    .subscription
+                    .as_ref()
+                    .map_or(1.0, |tier| tier.weight(a.provider));
+                (a.id.clone(), (pool, weight))
             })
             .collect();
         if !self
@@ -624,6 +729,7 @@ impl Clients {
             check_name(&client.name)?;
             check_shares(&client.shares)?;
             check_shares(&client.account_shares)?;
+            check_borrows(&client.borrows)?;
             if client.id.is_empty() || client.key_hash.len() != 64 {
                 return Err("a restored client lacks its id or key hash".into());
             }
@@ -639,6 +745,13 @@ impl Clients {
                 }
             }
             client.account_shares = account_shares;
+            client.borrows = std::mem::take(&mut client.borrows)
+                .into_iter()
+                .map(|(id, mut borrow)| {
+                    borrow.home = accounts.get(&borrow.home).cloned().unwrap_or(borrow.home);
+                    (accounts.get(&id).cloned().unwrap_or(id), borrow)
+                })
+                .collect();
         }
         let count = restored.len();
         let merge = move |list: &mut Vec<Client>| {
@@ -748,6 +861,19 @@ impl Clients {
         }
         let observed_at = parse_timestamp(&snapshot.updated_at);
         let account = snapshot.account_id.as_str();
+        // Clients that reach this account only by borrowing: their share of a
+        // weekly rise is charged to their home account's week.
+        let borrowers: BTreeMap<String, (String, f64)> = self
+            .read()
+            .iter()
+            .filter(|c| !c.access.allows_in(snapshot.provider.as_str(), account))
+            .filter_map(|c| {
+                c.borrows
+                    .get(account)
+                    .map(|b| (c.id.clone(), (b.home.clone(), b.scale)))
+            })
+            .collect();
+        let mut charges: Vec<(String, String, f64)> = vec![];
         let mut usage = self.usage();
         let usage = &mut *usage;
         let running: Vec<(String, f64)> = usage
@@ -771,6 +897,7 @@ impl Clients {
                         reset: reading.reset,
                         used: reading.used,
                         clients: BTreeMap::new(),
+                        charged: BTreeMap::new(),
                         outside: 0.0,
                         observed_at: observed_at.map(|_| snapshot.updated_at.clone()),
                     });
@@ -805,6 +932,7 @@ impl Clients {
                 window.reset = reading.reset;
                 window.used = 0.0;
                 window.clients.clear();
+                window.charged.clear();
                 window.outside = 0.0;
                 usage.dirty = true;
             }
@@ -840,12 +968,27 @@ impl Clients {
             if total > 0.0 {
                 for (client, weight) in &weights {
                     *window.clients.entry(client.clone()).or_default() += delta * weight / total;
+                    if reading.kind == "weekly" {
+                        if let Some((home, scale)) = borrowers.get(client) {
+                            charges.push((home.clone(), client.clone(), delta * weight / total * scale));
+                        }
+                    }
                 }
             } else {
                 window.outside += delta;
             }
             window.used = reading.used;
             usage.dirty = true;
+        }
+        for (home, client, points) in charges {
+            if let Some(window) = usage
+                .windows
+                .iter_mut()
+                .find(|w| w.account_id == home && w.kind == "weekly" && w.reset > now)
+            {
+                *window.charged.entry(client).or_default() += points;
+                usage.dirty = true;
+            }
         }
         // Windows that ended a day ago have nothing left to tell.
         let before = usage.windows.len();
@@ -908,6 +1051,20 @@ impl Clients {
         now: i64,
         last_seventh: bool,
     ) -> (f64, f64, bool) {
+        // Borrowed accounts charge their borrowers on this account's week.
+        let lent: Vec<(String, String, f64)> = if reading.kind == "weekly" {
+            self.read()
+                .iter()
+                .flat_map(|c| {
+                    c.borrows
+                        .iter()
+                        .filter(|(_, b)| b.home == account)
+                        .map(|(id, b)| (c.id.clone(), id.clone(), b.scale))
+                })
+                .collect()
+        } else {
+            vec![]
+        };
         let usage = self.usage();
         let window = usage.windows.iter().find(|w| {
             w.account_id == account
@@ -920,17 +1077,38 @@ impl Clients {
         } else {
             BTreeMap::new()
         };
+        let charged_by = |id: &str| {
+            let Some(window) = window else {
+                return 0.0;
+            };
+            window.charged.get(id).copied().unwrap_or(0.0)
+                + lent
+                    .iter()
+                    .filter(|(client, _, _)| client == id)
+                    .map(|(_, borrowed, scale)| {
+                        usage
+                            .unseen(borrowed, "weekly")
+                            .get(id)
+                            .copied()
+                            .unwrap_or(0.0)
+                            * scale
+                    })
+                    .sum::<f64>()
+        };
         let used_by = |id: &str| {
             window
                 .and_then(|w| w.clients.get(id))
                 .copied()
                 .unwrap_or(0.0)
                 + unseen.get(id).copied().unwrap_or(0.0)
+                + charged_by(id)
         };
         let mine = used_by(me);
         let physical = (100.0 - reading.used - unseen.values().sum::<f64>()).max(0.0);
         let overbooked = holders.iter().map(|(_, s)| s).sum::<f64>() > 100.0 + 1e-9;
-        let cap = if reading.kind == "five-hour" || overbooked {
+        // A borrower is held to its own share: the home week it was charged
+        // for stays free for the other holders.
+        let cap = if reading.kind == "five-hour" || overbooked || charged_by(me) > 1e-9 {
             holders
                 .iter()
                 .find(|(id, _)| id == me)
@@ -1722,6 +1900,96 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn borrowed_weekly_use_is_charged_to_the_home_share_and_frees_it_for_the_others() {
+        let (_dir, clients) = clients();
+        let (moi, _) = clients
+            .create(ClientPatch {
+                name: Some("moi".into()),
+                account_shares: Some([("x5".to_owned(), 50.0)].into()),
+                ..ClientPatch::default()
+            })
+            .unwrap();
+        let (pote, _) = clients
+            .create(ClientPatch {
+                name: Some("pote".into()),
+                access: Some(Access {
+                    all: false,
+                    pools: BTreeSet::new(),
+                    accounts: ["x5".to_owned()].into(),
+                }),
+                account_shares: Some([("x5".to_owned(), 50.0)].into()),
+                borrows: Some(
+                    [(
+                        "magali".to_owned(),
+                        Borrow {
+                            home: "x5".into(),
+                            scale: 1.0,
+                        },
+                    )]
+                    .into(),
+                ),
+                ..ClientPatch::default()
+            })
+            .unwrap();
+        let x5 = account("x5");
+        let reset = NOW + 3 * 86_400;
+        let reserved = Release {
+            before_reset: 0,
+            last_seventh: false,
+        };
+        clients.observe(&snapshot("x5", 0.0, reset), NOW);
+        clients.observe(&snapshot("magali", 0.0, reset + 7 * 3600), NOW);
+        // Each spends 30 points of the x5 week.
+        clients.call_ended("x5", Some(&moi.id), 1.0);
+        clients.call_ended("x5", Some(&pote.id), 1.0);
+        clients.observe(&snapshot("x5", 60.0, reset), NOW);
+        // Pote borrows 15 points of Magali's week.
+        clients.call_ended("magali", Some(&pote.id), 1.0);
+        clients.observe(&snapshot("magali", 15.0, reset + 7 * 3600), NOW);
+        let x5_week = clients
+            .usage_report(NOW)
+            .into_iter()
+            .find(|w| w.account_id == "x5" && w.kind == "weekly")
+            .unwrap();
+        assert_eq!(x5_week.charged[&pote.id], 15.0);
+        let full = snapshot("x5", 60.0, reset);
+        let blocks = |c: &Client| clients.share_blocks_for(Some(c), &x5, Some(&full), NOW, reserved, "");
+        let bar = |c: &Client| {
+            clients
+                .client_view(c, full.clone(), "claude", NOW, reserved)
+                .windows[0]
+                .remaining_percent
+                .unwrap()
+        };
+        // Pote used 30 + 15 of its 50: 5 left. Moi may take 35 of the 40.
+        assert!((bar(&pote) - 10.0).abs() < 1e-9);
+        assert!((bar(&moi) - 100.0 * 35.0 / 65.0).abs() < 1e-9);
+        assert_eq!(blocks(&pote), None);
+        // Once moi has taken them, pote still has its 5; then it is held back.
+        clients.call_ended("x5", Some(&moi.id), 1.0);
+        clients.observe(&snapshot("x5", 95.0, reset), NOW);
+        let full = snapshot("x5", 95.0, reset);
+        let blocks = |c: &Client| clients.share_blocks_for(Some(c), &x5, Some(&full), NOW, reserved, "");
+        assert_eq!(blocks(&moi), Some(reset));
+        assert_eq!(blocks(&pote), None);
+        clients.call_ended("x5", Some(&pote.id), 1.0);
+        clients.observe(&snapshot("x5", 100.0, reset), NOW);
+        let full = snapshot("x5", 100.0, reset);
+        assert_eq!(
+            clients.share_blocks_for(Some(&pote), &x5, Some(&full), NOW, reserved, ""),
+            Some(reset)
+        );
+        // A new home week forgets the charges.
+        clients.observe(&snapshot("x5", 0.0, reset + 7 * 86_400), NOW);
+        let x5_week = clients
+            .usage_report(NOW)
+            .into_iter()
+            .find(|w| w.account_id == "x5" && w.kind == "weekly")
+            .unwrap();
+        assert!(x5_week.charged.is_empty());
     }
 
     #[test]

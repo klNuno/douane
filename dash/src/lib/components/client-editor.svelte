@@ -15,6 +15,8 @@
 	let chosenAccounts = $state<string[]>([...(initial?.access.accounts ?? [])]);
 	let shares = $state<Record<string, string>>(Object.fromEntries(Object.entries(initial?.shares ?? {}).map(([pool, value]) => [pool, String(value)])));
 	let accountShares = $state<Record<string, string>>(Object.fromEntries(Object.entries(initial?.account_shares ?? {}).map(([id, value]) => [id, String(value)])));
+	// Home account id to the account lending it its Fable week.
+	let borrows = $state<Record<string, string>>(Object.fromEntries(Object.entries(initial?.borrows ?? {}).map(([lent, borrow]) => [borrow.home, lent])));
 	let saving = $state(false);
 	let failure = $state('');
 	let pools = $derived(poolsOf(accounts));
@@ -41,7 +43,8 @@
 		if (!all && !poolIds.length && !accountIds.length) { failure = t('clients.pickAccess'); return; }
 		const nextShares = parseShares(shares), nextAccountShares = parseShares(accountShares);
 		if (!nextShares || !nextAccountShares) { failure = t('clients.shareInvalid'); return; }
-		const patch = { name: name.trim(), access: { all, pools: poolIds, accounts: accountIds }, shares: nextShares, account_shares: nextAccountShares };
+		const lending = all ? {} : Object.fromEntries(accounts.filter(account => allowed(account) && borrows[account.id] && !allowed(accounts.find(other => other.id === borrows[account.id]) ?? account)).map(account => [borrows[account.id], { home: account.id }]));
+		const patch = { name: name.trim(), access: { all, pools: poolIds, accounts: accountIds }, shares: nextShares, account_shares: nextAccountShares, borrows: lending };
 		saving = true;
 		try { saved(initial ? await management.updateClient(initial.id, patch) : await management.createClient(patch), !initial); }
 		catch (error) { failure = (error as Error).message; }
@@ -77,11 +80,22 @@
 							{#each pool.accounts.filter(allowed) as account (account.id)}
 								{@const total = assigned(account)}
 								{@const competing = total > 100 + 1e-9}
+								{@const lenders = all ? [] : pool.accounts.filter(other => !allowed(other))}
 								<div class="share-row account-share">
 									<span class="share-account" title={privateLabel(account.name)}>{privateLabel(account.name)}</span>
 									<label class="share-input"><input bind:value={accountShares[account.id]} inputmode="decimal" placeholder={draftShare(shares[pool.id]) ? String(draftShare(shares[pool.id])) : '0'} title={t('clients.accountInherit')} aria-label={t('clients.accountShareOf', { name: privateLabel(account.name) })}/>%</label>
 									<span class={['share-common', competing && 'over']} title={competing ? t('clients.overbookedInfo') : t('clients.accountInherit')}>{competing ? t('clients.overbooked', { value: formatDecimal(total) }) : t('clients.common', { value: formatDecimal(Math.max(0, 100 - total)) })}</span>
 								</div>
+								{#if pool.provider === 'claude' && lenders.length}
+									<div class="share-row borrow-row">
+										<span class="share-account" title={t('clients.borrowInfo')}>{t('clients.borrow')}</span>
+										<select bind:value={borrows[account.id]} aria-label={t('clients.borrowOf', { name: privateLabel(account.name) })} title={t('clients.borrowInfo')}>
+											<option value="">{t('clients.borrowNone')}</option>
+											{#each lenders as lender (lender.id)}<option value={lender.id}>{privateLabel(lender.name)}</option>{/each}
+										</select>
+										<span></span>
+									</div>
+								{/if}
 							{/each}
 						</div>
 					{/each}
@@ -120,6 +134,8 @@
 	.share-group + .share-group { border-top: 1px solid var(--border); }
 	.pool-default { background: #5478f608; }
 	.account-share { padding-left: 46px; }
+	.borrow-row { padding-left: 62px; padding-top: 0; }
+	.borrow-row select { height: 34px; background: var(--surface); }
 	.share-account { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 14px; }
 	.share-pool { display: flex; align-items: center; gap: 10px; min-width: 0; font-size: 15px; font-weight: 550; }
 	.share-input { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 15px; }
