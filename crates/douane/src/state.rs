@@ -1066,8 +1066,16 @@ impl AppState {
                     if owner.is_some_and(|owner| a.id != owner) {
                         continue;
                     }
-                    if client.is_some_and(|c| !c.access.allows(&a)) {
+                    if client.is_some_and(|c| !c.may_use(&a)) {
                         continue;
+                    }
+                    if let Some(c) = client {
+                        if !self
+                            .borrow_open(c, &a, model, now.unix_timestamp(), config.settings.release())
+                            .await
+                        {
+                            continue;
+                        }
                     }
                     if !self.serves(&a.id, model, a.provider) {
                         continue;
@@ -1259,10 +1267,16 @@ impl AppState {
         account: &AccountCredential,
         model: &str,
     ) -> bool {
-        if client.is_some_and(|c| !c.access.allows(account)) {
+        if client.is_some_and(|c| !c.may_use(account)) {
             return true;
         }
         let release = self.config.read().await.settings.release();
+        if let Some(c) = client {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            if !self.borrow_open(c, account, model, now, release).await {
+                return true;
+            }
+        }
         let snapshot = self.quotas.get(&account.id).await;
         self.clients
             .share_blocks_for(
@@ -1274,6 +1288,51 @@ impl AppState {
                 model,
             )
             .is_some()
+    }
+
+    /// Whether `client` may call `model` on `account` as far as borrowing
+    /// goes: always on an account its access allows; on a borrowed one only
+    /// for a model family whose week its home account holds back, while the
+    /// home account's own week still leaves it room.
+    async fn borrow_open(
+        &self,
+        client: &crate::clients::Client,
+        account: &AccountCredential,
+        model: &str,
+        now: i64,
+        release: crate::clients::Release,
+    ) -> bool {
+        let Some(home) = client.borrowed_home(account) else {
+            return true;
+        };
+        let Some(family) = ["fable", "opus", "sonnet"]
+            .into_iter()
+            .find(|family| model.contains(family))
+        else {
+            return false;
+        };
+        let Some(home) = self.accounts.get(home).await else {
+            return false;
+        };
+        if !client.access.allows(&home) {
+            return false;
+        }
+        let Some(quota) = self.quotas.get(&home.id).await else {
+            return false;
+        };
+        if crate::clients::account_week_spent(&quota, now)
+            || self
+                .clients
+                .share_blocks_for(Some(client), &home, Some(&quota), now, release, "")
+                .is_some()
+        {
+            return false;
+        }
+        quota.family_week_spent(family, now)
+            || self
+                .clients
+                .share_blocks_for(Some(client), &home, Some(&quota), now, release, model)
+                .is_some()
     }
 
     pub async fn reserve_excludes(&self, account: &AccountCredential) -> bool {
@@ -1984,6 +2043,89 @@ mod tests {
         assert_eq!(order(&state, "claude-fable-5-2").await, unlisted_last);
         unlisted_last.rotate_right(1);
         assert_eq!(order(&state, "claude-opus-5-5").await, unlisted_last);
+    }
+
+    #[tokio::test]
+    async fn a_borrowed_account_serves_only_the_family_its_home_week_holds_back() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let mut ids = vec![];
+        for name in ["x5", "magali"] {
+            let account = state
+                .accounts
+                .import(
+                    json!({"type":"claude","access_token":"fixture","account_id":name,"name":name}),
+                    None,
+                )
+                .await
+                .unwrap();
+            ids.push(account.id);
+        }
+        let (home, lent) = (ids[0].clone(), ids[1].clone());
+        let (pote, _) = state
+            .clients
+            .create(crate::clients::ClientPatch {
+                name: Some("pote".into()),
+                access: Some(crate::clients::Access {
+                    all: false,
+                    pools: Default::default(),
+                    accounts: [home.clone()].into(),
+                }),
+                borrows: Some(
+                    [(
+                        lent.clone(),
+                        crate::clients::Borrow {
+                            home: home.clone(),
+                            scale: 1.0,
+                        },
+                    )]
+                    .into(),
+                ),
+                ..Default::default()
+            })
+            .unwrap();
+        let quota = |id: &str, week_left: f64, fable_left: f64| {
+            let mut quota = weekly(id, "2099-01-01T00:00:00Z");
+            quota.provider = SubscriptionProvider::Claude;
+            quota.windows[0].id = "seven-day".into();
+            quota.windows[0].remaining_percent = Some(week_left);
+            quota.windows.push(QuotaWindow {
+                id: "seven-day-fable".into(),
+                label: "Fable".into(),
+                remaining_percent: Some(fable_left),
+                reset_at: Some("2099-01-01T00:00:00Z".into()),
+                used: None,
+                limit: None,
+            });
+            quota
+        };
+        state.quotas.insert_for_test(quota(&lent, 90.0, 90.0)).await;
+        let routes = |model: &'static str| {
+            let state = state.clone();
+            let pote = pote.clone();
+            async move {
+                let (_, accounts) = state
+                    .candidates_for(model, Some("claude"), None, Some(&pote))
+                    .await
+                    .unwrap_or_default();
+                accounts.into_iter().map(|a| a.id).collect::<Vec<_>>()
+            }
+        };
+        // Its own Fable week still has room: no borrowing.
+        state.quotas.insert_for_test(quota(&home, 40.0, 10.0)).await;
+        assert_eq!(routes("claude-fable-5-2").await, [home.clone()]);
+        // Spent: Fable may go to the borrowed account, Opus may not.
+        state.quotas.insert_for_test(quota(&home, 40.0, 0.0)).await;
+        assert!(routes("claude-fable-5-2").await.contains(&lent));
+        assert_eq!(routes("claude-opus-5-5").await, [home.clone()]);
+        assert!(!state.client_excludes(Some(&pote), &state.accounts.get(&lent).await.unwrap(), "claude-fable-5-2").await);
+        assert!(state.client_excludes(Some(&pote), &state.accounts.get(&lent).await.unwrap(), "claude-opus-5-5").await);
+        // Without room in the home week, nothing is borrowed.
+        state.quotas.insert_for_test(quota(&home, 0.0, 0.0)).await;
+        assert!(!routes("claude-fable-5-2").await.contains(&lent));
     }
 
     #[tokio::test]

@@ -866,7 +866,7 @@ async fn list_models(
         .list()
         .await
         .into_iter()
-        .filter(|a| a.enabled && client.is_none_or(|c| c.access.allows_summary(a)))
+        .filter(|a| a.enabled && client.is_none_or(|c| c.may_use_summary(a)))
         .map(|a| {
             (
                 a.route.unwrap_or_else(|| a.provider.as_str().to_owned()),
@@ -1003,7 +1003,7 @@ pub async fn public_quotas(
     // A client sees its accounts, each window as the part of what it may
     // use that it has used.
     if let Some(client) = &client {
-        accounts.retain(|a| client.access.allows_summary(a));
+        accounts.retain(|a| client.may_use_summary(a));
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         snapshots = snapshots
             .into_iter()
