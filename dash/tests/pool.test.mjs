@@ -11,18 +11,29 @@ const quota = (id, windows) => ({ account_id: id, windows, updated_at: iso(now) 
 const ultra = sub('ultra', 'Claude Ultra', 20), pro = sub('pro', 'Claude Pro');
 const s = seconds => Math.floor(seconds / 1000);
 
-test('weights normalise by the most common plan, ties going to the larger', () => {
+test('the highest plan of a provider is 100%, smaller plans a fraction', () => {
 	const accounts = [account('a', ultra), account('b', ultra), account('c', ultra), account('d', pro)];
 	const weights = accountWeights(accounts, [], undefined);
 	assert.deepEqual([...weights.values()], [1, 1, 1, 0.05]);
 	const series = poolSeries(accounts, accounts.map(a => quota(a.id, [weekly(100, 3 * DAY)])), [], weights, now);
 	assert.equal(Math.round(capacity(series)), 305);
 	assert.deepEqual(weightNotes(accounts, [], weights), [{ label: 'Claude Pro', weight: 0.05 }]);
-	// One Ultra and one Pro: a tie, the larger (Ultra) is the unit.
-	assert.deepEqual([...accountWeights([account('a', ultra), account('d', pro)], []).values()], [1, 0.05]);
+	// Mostly Pro accounts: the single Ultra still sets 100%.
+	assert.deepEqual([...accountWeights([account('a', ultra), account('d', pro), account('e', pro)], []).values()], [1, 0.05, 0.05]);
 	// A user weight overrides the multiplier; a disabled account stays out.
 	const custom = accountWeights([account('a', ultra), account('d', pro), account('x', ultra, false)], [], { claude: { pro: 10 } });
 	assert.deepEqual([...custom], [['a', 1], ['d', 0.5]]);
+});
+
+test('a Codex Plus beside a Codex Pro counts a twentieth, not a second Pro', () => {
+	// The 2026-11-22 capture: Pro + Plus showed 40% of 200%.
+	const codex = (id, plan, weight) => ({ ...account(id, { id: plan, label: `Codex ${plan}`, multiplier: null, default_weight: weight, source: 'provider_usage' }), provider: 'codex' });
+	const accounts = [codex('pro', 'pro', 20), codex('plus', 'plus', 1)];
+	const weights = accountWeights(accounts, [], undefined);
+	assert.deepEqual([...weights], [['pro', 1], ['plus', 0.05]]);
+	const series = poolSeries(accounts, [quota('pro', [weekly(40, 3 * DAY)]), quota('plus', [weekly(0, 3 * DAY)])], [], weights, now);
+	assert.equal(Math.round(capacity(series)), 105);
+	assert.equal(Math.round(poolValue(series, now)), 40);
 });
 
 test('an account with two buckets of its longest length gives two half-weight series; shorter windows stay out', () => {

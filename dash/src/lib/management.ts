@@ -24,7 +24,7 @@ export function usageFamily(kind: UsageKind) { const family = kind.startsWith('w
 export function usageKindLabel(kind: UsageKind) { return usageFamily(kind) || reserveWindowLabel(kind as ReserveWindow); }
 export function reserveWindow(id: string): ReserveWindow | null { return ({ 'five-hour': 'five-hour', daily: 'daily', weekly: 'weekly', 'seven-day': 'weekly', seven_day: 'weekly', monthly: 'monthly' } as Record<string, ReserveWindow>)[id] ?? null; }
 export type QuotaWindow = { id: string; label: string; remaining_percent: number | null; reset_at?: string | null };
-export type Subscription = { id: string; label: string; multiplier?: number | null; source: string };
+export type Subscription = { id: string; label: string; multiplier?: number | null; default_weight?: number | null; source: string };
 export type CreditUsage = { id: string; label: string; used?: number | null; limit?: number | null; remaining?: number | null; unit: string; reset_at?: string | null; unlimited?: boolean | null; enabled?: boolean | null };
 export type Quota = { account_id: string; windows: QuotaWindow[]; subscription?: Subscription | null; credits?: CreditUsage[]; updated_at?: string | null; error?: string | null; verification_required?: boolean; verification_available?: boolean };
 /** `[unix seconds, remaining percent, reset unix seconds or null]`, ascending. */
@@ -59,7 +59,7 @@ export type Strategy = 'round-robin' | 'fill-first' | 'reset-first' | 'manual' |
 export type QuotaDisplay = 'accounts' | 'average';
 export type QuotaWindowChoice = { hidden?: string[]; primary?: string | null };
 export type Settings = { strategy: Strategy; quota_refresh_seconds: number; request_timeout_seconds: number; default_provider: string | null; provider_strategies?: Record<string, Strategy>; account_order?: Record<string, string[]>; keep_fable?: boolean; quota_display?: Record<string, QuotaDisplay>; quota_windows?: Record<string, QuotaWindowChoice>; show_provider_pace?: boolean; free_before_reset_hours?: number; share_release?: ShareRelease; plan_weights?: PlanWeights };
-/** Pool weight per provider id, then per subscription id, in (0, 1000]; absent means the plan multiplier or 1. */
+/** Pool weight per provider id, then per subscription id, in (0, 1000]; absent means the plan multiplier, its published ratio, or 1. */
 export type PlanWeights = Record<string, Record<string, number>>;
 /** When unused client shares stop being reserved: the last seventh of a window, or only `free_before_reset_hours` before the weekly reset. */
 export type ShareRelease = 'last-seventh' | 'before-reset';

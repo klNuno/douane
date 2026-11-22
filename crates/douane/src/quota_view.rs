@@ -82,7 +82,7 @@ pub fn overview(
                     .iter()
                     .map(|(account, snapshot)| account_entry(account, *snapshot))
                     .collect(),
-                QuotaDisplay::Average => vec![average_entry(provider, &members)],
+                QuotaDisplay::Average => vec![average_entry(provider, &members, settings)],
             };
             if let Some(choice) = settings.quota_windows(provider) {
                 for entry in &mut entries {
@@ -110,7 +110,7 @@ fn account_entry(account: &AccountSummary, snapshot: Option<&QuotaSnapshot>) -> 
     })
 }
 
-fn average_entry(provider: SubscriptionProvider, members: &[Member]) -> Value {
+fn average_entry(provider: SubscriptionProvider, members: &[Member], settings: &Settings) -> Value {
     let count = members.len();
     let statuses: Vec<_> = members.iter().map(|(account, _)| status(account)).collect();
     let overall = if statuses.contains(&"ready") {
@@ -142,13 +142,22 @@ fn average_entry(provider: SubscriptionProvider, members: &[Member]) -> Value {
             .iter()
             .all(|plan| plan.as_deref() == Some(first.as_str()))
     });
+    // Each account counts by its plan, so a Plus beside a Pro moves the
+    // average by its own size, not as much as the Pro.
     let snapshots: Vec<_> = members
         .iter()
-        .filter_map(|(_, snapshot)| *snapshot)
+        .filter_map(|(account, snapshot)| {
+            snapshot.map(|s| {
+                let tier = s.subscription.as_ref().or(account.subscription.as_ref());
+                (s, settings.plan_weight(provider, tier))
+            })
+        })
         .collect();
     let updated_at = snapshots
         .iter()
-        .filter_map(|s| parse_timestamp(&s.updated_at).map(|time| (time, s.updated_at.as_str())))
+        .filter_map(|(s, _)| {
+            parse_timestamp(&s.updated_at).map(|time| (time, s.updated_at.as_str()))
+        })
         .min()
         .map(|(_, value)| value);
     json!({
@@ -160,21 +169,25 @@ fn average_entry(provider: SubscriptionProvider, members: &[Member]) -> Value {
         "error": error,
         "updated_at": timestamp(updated_at),
         "windows": merge_windows(&snapshots),
-        "credits": merge_credits(&snapshots),
+        "credits": merge_credits(&snapshots.iter().map(|(s, _)| *s).collect::<Vec<_>>()),
     })
 }
 
 /// Windows merge by id. Accounts with a known percentage contribute to the
-/// mean and the earliest reset; the label comes from the first account.
-fn merge_windows(snapshots: &[&QuotaSnapshot]) -> Vec<Value> {
+/// mean, weighted by plan, and the earliest reset; the label comes from the
+/// first account.
+fn merge_windows(snapshots: &[(&QuotaSnapshot, f64)]) -> Vec<Value> {
     struct Merge<'a> {
         first: &'a QuotaWindow,
-        remaining: Vec<f64>,
+        remaining: Vec<(f64, f64)>,
         resets: Vec<&'a str>,
         other_resets: Vec<&'a str>,
     }
     let mut merged: Vec<Merge> = vec![];
-    for window in snapshots.iter().flat_map(|s| &s.windows) {
+    for (window, weight) in snapshots
+        .iter()
+        .flat_map(|(s, weight)| s.windows.iter().map(move |w| (w, *weight)))
+    {
         let index = match merged.iter().position(|m| m.first.id == window.id) {
             Some(index) => index,
             None => {
@@ -190,7 +203,7 @@ fn merge_windows(snapshots: &[&QuotaSnapshot]) -> Vec<Value> {
         let entry = &mut merged[index];
         let reset = window.reset_at.as_deref();
         if let Some(remaining) = percent(window.remaining_percent) {
-            entry.remaining.push(remaining);
+            entry.remaining.push((remaining, weight));
             entry.resets.extend(reset);
         } else {
             entry.other_resets.extend(reset);
@@ -199,8 +212,14 @@ fn merge_windows(snapshots: &[&QuotaSnapshot]) -> Vec<Value> {
     merged
         .into_iter()
         .map(|m| {
-            let remaining = (!m.remaining.is_empty())
-                .then(|| m.remaining.iter().sum::<f64>() / m.remaining.len() as f64);
+            let total: f64 = m.remaining.iter().map(|(_, weight)| weight).sum();
+            let remaining = (!m.remaining.is_empty() && total > 0.0).then(|| {
+                m.remaining
+                    .iter()
+                    .map(|(v, weight)| v * weight)
+                    .sum::<f64>()
+                    / total
+            });
             let resets = if m.remaining.is_empty() {
                 m.other_resets
             } else {
@@ -727,6 +746,52 @@ mod tests {
             entry["credits"],
             json!([{"id":"codex-credits","label":"Credits","unit":"credits","remaining":15.5,"limit":null,"used":null}])
         );
+    }
+
+    #[test]
+    fn average_weighs_each_account_by_its_plan() {
+        // A Codex Pro counts 20 Plus: Pro at 40% and Plus at 100% average
+        // to (20 * 40 + 100) / 21, not to the plain mean of 70.
+        let accounts = vec![
+            summary("pro", SubscriptionProvider::Codex, "ready"),
+            summary("plus", SubscriptionProvider::Codex, "ready"),
+        ];
+        let tier = |plan| {
+            crate::subscriptions::SubscriptionTier::detect(
+                SubscriptionProvider::Codex,
+                Some(plan),
+                None,
+                "provider_usage",
+            )
+        };
+        let mut pro = snapshot(
+            "pro",
+            vec![quota_window("weekly", Some(40.0), None)],
+            vec![],
+        );
+        pro.subscription = tier("pro");
+        let mut plus = snapshot(
+            "plus",
+            vec![quota_window("weekly", Some(100.0), None)],
+            vec![],
+        );
+        plus.subscription = tier("plus");
+        let mut settings = average(SubscriptionProvider::Codex);
+        let read = |settings: &Settings| {
+            overview(
+                accounts.clone(),
+                vec![pro.clone(), plus.clone()],
+                settings,
+                "2026-10-04T12:00:00Z".into(),
+            )["providers"][0]["entries"][0]["windows"][0]["remaining_percent"]
+                .clone()
+        };
+        assert_eq!(read(&settings), 43.0);
+        // A weight the user sets wins over the published ratio.
+        settings
+            .plan_weights
+            .insert("codex".into(), BTreeMap::from([("pro".into(), 1.0)]));
+        assert_eq!(read(&settings), 70.0);
     }
 
     #[test]

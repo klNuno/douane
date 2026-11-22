@@ -17,7 +17,7 @@ const account = (id, provider, name, extra = {}) => ({
 	last_error: null, reserve_percent: null, reserve_windows: [], reserve_measured: true, reserve_reached: false,
 	created_at: ago(60 * 24 * 20), updated_at: ago(30), ...extra
 });
-const tier = (id, label, multiplier = null) => ({ id, label, multiplier, source: 'provider_usage' });
+const tier = (id, label, multiplier = null, default_weight = null) => ({ id, label, multiplier, ...(default_weight ? { default_weight } : {}), source: 'provider_usage' });
 const accounts = [
 	account('acc-claude-home', 'claude', 'Home', { email: 'alex@example.com', subscription: tier('ultra', 'Claude Ultra', 20), reserve_percent: 5 }),
 	account('acc-claude-work', 'claude', 'Work', { email: 'alex.work@example.com', subscription: tier('ultra', 'Claude Ultra', 20) }),
@@ -26,7 +26,8 @@ const accounts = [
 	// Off the Quotas page: one the provider revoked, one the user hid.
 	account('acc-claude-old', 'claude', 'Old', { email: 'old@example.com', subscription: tier('pro', 'Claude Pro'), enabled: false, status: 'disabled', last_error: "the provider revoked this account's session; reconnect the account" }),
 	account('acc-claude-spare', 'claude', 'Spare', { email: 'spare@example.com', subscription: tier('ultra', 'Claude Ultra', 20), hidden: true }),
-	account('acc-codex', 'codex', 'ChatGPT', { email: 'alex@example.com', subscription: tier('pro', 'Codex Pro') }),
+	account('acc-codex', 'codex', 'ChatGPT', { email: 'alex@example.com', subscription: tier('pro', 'Codex Pro', null, 20) }),
+	account('acc-codex-plus', 'codex', 'Plus', { email: 'plus@example.com', subscription: tier('plus', 'Codex Plus', null, 1) }),
 	account('acc-grok', 'xai', 'SuperGrok', { subscription: tier('supergrok', 'SuperGrok') }),
 	account('acc-copilot', 'copilot', 'GitHub', { subscription: tier('pro', 'Copilot Pro') }),
 	account('acc-go', 'opencode_go', 'OpenCode Go', { subscription: tier('go', 'OpenCode Go') }),
@@ -50,6 +51,7 @@ const quotas = [
 	quota('acc-codex', [window('five-hour', '5 hours', 92, 3.9), window('weekly', 'Weekly', 77, 85)], {
 		credits: [{ id: 'credits', label: 'Codex credits', used: null, limit: null, remaining: 1250, unit: 'credits', reset_at: null, unlimited: false, enabled: true }]
 	}),
+	quota('acc-codex-plus', [window('five-hour', '5 hours', 100, 4.5), window('weekly', 'Weekly', 10, 40)]),
 	quota('acc-grok', [window('weekly', 'Weekly', 58, 132)]),
 	quota('acc-copilot', [window('premium', 'Premium requests', 81, 24 * 15)]),
 	quota('acc-go', [window('five-hour', '5 hours', 100, 5), window('weekly', 'Weekly', 88, 70), window('monthly', 'Monthly', 61, 24 * 15)])

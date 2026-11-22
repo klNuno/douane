@@ -51,7 +51,7 @@ export const fr: Record<StringKey, string> = {
 	'pool.duration.minutes': '{m} min',
 	'pool.historyError': 'Historique indisponible, affichage des quotas actuels : {error}',
 	'settings.planWeights': 'Poids des offres',
-	'settings.planWeightsDescription': 'Combien compte un compte de chaque offre dans le pool et le rythme de son fournisseur. Vide : le multiplicateur de l’offre, ou 1. L’offre la plus courante d’un fournisseur compte 1x.',
+	'settings.planWeightsDescription': 'Combien compte un compte de chaque offre dans le pool, le rythme et la moyenne de son fournisseur. Vide : le multiplicateur de l’offre ou son ratio publié (Codex Pro 20x Plus), sinon 1. L’offre la plus haute d’un fournisseur vaut 100 %.',
 	'settings.noPlans': 'Aucune offre d’abonnement remontée pour l’instant.',
 	'settings.planWeight': 'Poids de {plan}',
 	'common.save': 'Enregistrer',

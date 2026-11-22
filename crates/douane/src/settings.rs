@@ -53,7 +53,8 @@ pub struct Settings {
     pub show_provider_pace: bool,
     /// How much each plan counts in the dashboard's pool and pace, by
     /// provider then subscription id (`claude.ultra = 10`). A plan left out
-    /// counts its provider-reported multiplier, else 1.
+    /// counts its provider-reported multiplier, else its published ratio
+    /// (Codex Pro 20, Plus 1), else 1. The highest plan of a provider is 100%.
     pub plan_weights: BTreeMap<String, BTreeMap<String, f64>>,
     /// Hours before an account's weekly reset (monthly when its longest
     /// window is a month) when its reserve and client shares stop applying,
@@ -285,6 +286,24 @@ impl Settings {
             .get(provider.as_str())
             .copied()
             .unwrap_or_default()
+    }
+
+    /// How much one account of `tier` counts in its provider's pool and
+    /// average: the user's weight, else the plan's own weight, else 1.
+    pub fn plan_weight(
+        &self,
+        provider: crate::subscriptions::SubscriptionProvider,
+        tier: Option<&crate::subscriptions::SubscriptionTier>,
+    ) -> f64 {
+        tier.and_then(|tier| {
+            self.plan_weights
+                .get(provider.as_str())
+                .and_then(|plans| plans.get(&tier.id))
+                .copied()
+                .filter(|weight| weight.is_finite() && *weight > 0.0)
+        })
+        .or_else(|| tier.map(|tier| tier.weight(provider)))
+        .unwrap_or(1.0)
     }
 }
 impl Config {

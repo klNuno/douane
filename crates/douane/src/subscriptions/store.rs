@@ -74,10 +74,35 @@ pub struct SubscriptionTier {
     pub id: String,
     pub label: String,
     pub multiplier: Option<u32>,
+    /// How much this plan counts against the provider's smallest paid plan
+    /// when the provider states no multiplier: the provider's published
+    /// ratio, never a guess. The pool and the average weigh accounts by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_weight: Option<u32>,
     pub source: String,
 }
 
+/// Published allowance ratios of plans the provider reports without a
+/// multiplier. Codex: Pro is 20x Plus and Pro Lite 5x (OpenAI pricing, 2026-04).
+pub(crate) fn default_plan_weight(provider: SubscriptionProvider, id: &str) -> Option<u32> {
+    match (provider, id) {
+        (SubscriptionProvider::Codex, "pro") => Some(20),
+        (SubscriptionProvider::Codex, "prolite") => Some(5),
+        (SubscriptionProvider::Codex, "plus") => Some(1),
+        _ => None,
+    }
+}
+
 impl SubscriptionTier {
+    /// The weight of one account of this plan before normalisation: the
+    /// provider's multiplier, else the published ratio, else 1.
+    pub fn weight(&self, provider: SubscriptionProvider) -> f64 {
+        self.multiplier
+            .filter(|m| *m > 0)
+            .or_else(|| default_plan_weight(provider, &self.id))
+            .unwrap_or(1) as f64
+    }
+
     pub(crate) fn detect(
         provider: SubscriptionProvider,
         plan: Option<&str>,
@@ -145,6 +170,7 @@ impl SubscriptionTier {
                 .map(|multiple| format!("{label} x{multiple}"))
                 .unwrap_or_else(|| label.into()),
             multiplier,
+            default_weight: default_plan_weight(provider, id),
             source: source.into(),
         })
     }
@@ -1618,6 +1644,7 @@ pub(crate) fn subscription_from_value(
             id: text(value, &["subs_tier_id"])?,
             label: text(value, &["subs_tier_name"])?,
             multiplier: None,
+            default_weight: None,
             source: source.into(),
         });
     }
@@ -1712,6 +1739,9 @@ mod tests {
         .unwrap();
         assert_eq!(codex.label, "Codex Pro");
         assert_eq!(codex.multiplier, None);
+        // OpenAI publishes Pro at 20x Plus: the pool weight, never the label.
+        assert_eq!(codex.default_weight, Some(20));
+        assert_eq!(codex.weight(SubscriptionProvider::Codex), 20.0);
         assert_eq!(
             subscription_from_value(
                 SubscriptionProvider::Codex,

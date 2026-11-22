@@ -49,7 +49,7 @@ export const en = {
 	'pool.duration.minutes': '{m} min',
 	'pool.historyError': 'History unavailable, showing the current quotas: {error}',
 	'settings.planWeights': 'Plan weights',
-	'settings.planWeightsDescription': 'How much one account of each plan counts in its provider pool and pace. Empty uses the plan multiplier, or 1. The most common plan of a provider counts 1x.',
+	'settings.planWeightsDescription': 'How much one account of each plan counts in its provider pool, pace and average. Empty uses the plan multiplier or its published ratio (Codex Pro 20x Plus), else 1. The highest plan of a provider is 100%.',
 	'settings.noPlans': 'No subscription plan reported yet.',
 	'settings.planWeight': 'Weight of {plan}',
 	'common.save': 'Save',
