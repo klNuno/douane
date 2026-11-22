@@ -843,7 +843,7 @@ pub async fn gemini_models(
         .collect();
     Json(json!({ "models": models })).into_response()
 }
-/// The management listing of client models: every model, as without keys.
+/// The unscoped management view of the `/v1/models` catalog.
 pub async fn management_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<Params>,

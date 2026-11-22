@@ -9,12 +9,17 @@ use axum::{
     routing::post,
 };
 use douane::{settings::Config, state::AppState};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{net::TcpListener, task::JoinHandle};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message, client::IntoClientRequest},
+};
 
 #[derive(Default)]
 struct Mock {
@@ -553,6 +558,43 @@ async fn chat_messages_and_responses_never_reach_an_antigravity_account() {
             "{path} {model}: {text}"
         );
     }
+    assert!(fixture.mock.tokens.lock().unwrap().is_empty());
+    assert!(fixture.mock.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn responses_websocket_never_reaches_an_antigravity_account() {
+    let fixture = Fixture::new().await;
+    let url = format!(
+        "{}/v1/responses",
+        fixture.url.replacen("http://", "ws://", 1)
+    );
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", fixture.key).parse().unwrap(),
+    );
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    let mut body = responses("antigravity/synthetic-pro");
+    body["type"] = json!("response.create");
+    socket
+        .send(Message::Text(body.to_string().into()))
+        .await
+        .unwrap();
+
+    let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the gateway must answer the request")
+        .unwrap()
+        .unwrap();
+    let reply: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+    assert_eq!(reply["type"], "error", "{reply}");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Antigravity accounts serve only")),
+        "{reply}"
+    );
     assert!(fixture.mock.tokens.lock().unwrap().is_empty());
     assert!(fixture.mock.received.lock().unwrap().is_empty());
 }
