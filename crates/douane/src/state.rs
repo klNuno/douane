@@ -981,10 +981,18 @@ impl AppState {
             .unwrap_or((None, requested));
         let explicit = match prefix {
             Some(pool) => Some(pool),
-            None => match provider_hint.or(config.settings.default_provider.as_deref()) {
-                Some(name) => Some(pool_of(name).ok_or("unknown provider")?),
-                None => None,
-            },
+            // A saved Antigravity default names no pool outside the Gemini
+            // API: a bare id there goes to whichever other pool serves it.
+            None => {
+                match provider_hint.or(config.settings.default_provider.as_deref().filter(|name| {
+                    gemini
+                        || SubscriptionProvider::parse(name)
+                            != Some(SubscriptionProvider::Antigravity)
+                })) {
+                    Some(name) => Some(pool_of(name).ok_or("unknown provider")?),
+                    None => None,
+                }
+            }
         };
         let all_models = self.models.read().await;
         let pools: Vec<(SubscriptionProvider, Option<String>)> = if let Some(pool) = explicit {

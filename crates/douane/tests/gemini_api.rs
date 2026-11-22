@@ -48,6 +48,7 @@ impl Mock {
 
 struct Fixture {
     mock: Arc<Mock>,
+    state: Arc<AppState>,
     url: String,
     key: String,
     client: reqwest::Client,
@@ -200,6 +201,7 @@ impl Fixture {
         let (url, gate_task) = serve(douane::router(state.clone())).await;
         Self {
             mock,
+            state,
             url,
             key,
             client: reqwest::Client::builder()
@@ -570,6 +572,16 @@ async fn a_model_antigravity_shares_goes_to_the_other_provider_from_chat() {
         tokens.iter().all(|t| t == "Bearer synthetic-gemini-access"),
         "{tokens:?}"
     );
+}
+
+#[tokio::test]
+async fn a_saved_antigravity_default_provider_leaves_bare_ids_to_the_other_pools() {
+    let fixture = Fixture::with(&["synthetic-pro"], 2).await;
+    fixture.state.config.write().await.settings.default_provider = Some("antigravity".into());
+    let (status, text) = post_v1(&fixture, "chat/completions", chat("synthetic-pro"), None).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let tokens = fixture.mock.tokens.lock().unwrap();
+    assert_eq!(*tokens, ["Bearer synthetic-gemini-access"], "{tokens:?}");
 }
 
 #[tokio::test]

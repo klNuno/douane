@@ -147,8 +147,10 @@ Translation between the three dialects covers text, tools and images; provider-s
 
 ### Antigravity
 
-Antigravity accounts serve only Google's Antigravity agent: Google bans an
-account it sees used from another tool. Chat Completions, Messages and
+Antigravity accounts serve only the Gemini API route Google's Antigravity
+agent uses: Google bans an account it sees used from another tool. douane
+checks the client key and the route, not which program calls it. Chat
+Completions, Messages and
 Responses never reach them; a model only Antigravity serves (an
 `antigravity/...` id, `x-douane-provider: antigravity`, or a bare id no other
 provider lists) is refused with a 400 before any upstream call, and a model
