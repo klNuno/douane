@@ -141,12 +141,12 @@ pub struct AppState {
     reasoning_levels: Mutex<BTreeMap<(String, String), Vec<String>>>,
 }
 
-/// How long a refusal hides a model from an account: a plan change shows up
-/// the next day, or at once after a restart.
 /// The refusal of an Antigravity model outside the Gemini API route.
 pub const ANTIGRAVITY_GEMINI_ONLY: &str =
     "Antigravity accounts serve only Antigravity's own agent, through the Gemini API (/v1beta)";
 
+/// How long a refusal hides a model from an account: a plan change shows up
+/// the next day, or at once after a restart.
 const REFUSAL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 impl AppState {
