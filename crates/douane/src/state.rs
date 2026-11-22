@@ -124,7 +124,6 @@ pub struct AppState {
     pub socket_heartbeat_ms: std::sync::atomic::AtomicU64,
     pub scheduler: Mutex<Scheduler>,
     pub affinity: Mutex<crate::affinity::Affinity>,
-    pub(crate) antigravity_replay: Mutex<crate::antigravity_replay::ReplayCache>,
     pub management_token: Option<String>,
     pub config_write: tokio::sync::Mutex<()>,
     /// Which quota readings go to the pool chart history.
@@ -141,6 +140,10 @@ pub struct AppState {
     /// answered without a list.
     reasoning_levels: Mutex<BTreeMap<(String, String), Vec<String>>>,
 }
+
+/// The refusal of an Antigravity model outside the Gemini API route.
+pub const ANTIGRAVITY_GEMINI_ONLY: &str =
+    "Antigravity accounts serve only Antigravity's own agent, through the Gemini API (/v1beta)";
 
 /// How long a refusal hides a model from an account: a plan change shows up
 /// the next day, or at once after a restart.
@@ -177,8 +180,6 @@ impl AppState {
         let resets = Arc::new(ResetManager::new(accounts.clone(), oauth.clone())?);
         let ledger = Ledger::open(&config.server.database)?;
         let clients = Arc::new(crate::clients::Clients::open(&config.server.auth_dir)?);
-        let antigravity_replay =
-            crate::antigravity_replay::ReplayCache::for_settings(&config.settings);
         Ok(Arc::new(Self {
             config: RwLock::new(config),
             config_path,
@@ -195,7 +196,6 @@ impl AppState {
             socket_heartbeat_ms: std::sync::atomic::AtomicU64::new(25_000),
             scheduler: Mutex::new(Scheduler::default()),
             affinity: Mutex::new(crate::affinity::Affinity::default()),
-            antigravity_replay: Mutex::new(antigravity_replay),
             management_token,
             config_write: tokio::sync::Mutex::new(()),
             quota_sampler: Default::default(),
@@ -210,14 +210,6 @@ impl AppState {
     pub async fn sample_quotas(&self) {
         let due = self.quota_sampler.due(&self.quotas.list().await);
         self.ledger.record_samples(due);
-    }
-
-    /// Apply the replay cache's limits from changed settings.
-    pub fn configure_replay(&self, settings: &crate::settings::Settings) {
-        self.antigravity_replay
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .configure(settings);
     }
 
     fn refuses(&self, account: &str, model: &str) -> bool {
@@ -943,17 +935,25 @@ impl AppState {
         session: Option<&str>,
         client: Option<&crate::clients::Client>,
     ) -> Result<(String, Vec<AccountCredential>), String> {
-        self.candidates_for_replay(requested, provider_hint, session, client, None, true)
+        self.candidates_with_owner(requested, provider_hint, session, client, None, false, true)
             .await
     }
 
-    pub(crate) async fn candidates_for_replay(
+    /// The candidates for a request, `gemini` when it came through the Gemini
+    /// API. Only that route reaches Antigravity accounts: Google bans an
+    /// account used outside Antigravity, so another dialect goes to another
+    /// provider of the model or is refused with [`ANTIGRAVITY_GEMINI_ONLY`].
+    /// An `owner` (the account that signed a Gemini history) is the only
+    /// candidate, even while it rests.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn candidates_with_owner(
         &self,
         requested: &str,
         provider_hint: Option<&str>,
         session: Option<&str>,
         client: Option<&crate::clients::Client>,
         owner: Option<&str>,
+        gemini: bool,
         advance_rotation: bool,
     ) -> Result<(String, Vec<AccountCredential>), String> {
         let config = self.config.read().await.clone();
@@ -981,10 +981,18 @@ impl AppState {
             .unwrap_or((None, requested));
         let explicit = match prefix {
             Some(pool) => Some(pool),
-            None => match provider_hint.or(config.settings.default_provider.as_deref()) {
-                Some(name) => Some(pool_of(name).ok_or("unknown provider")?),
-                None => None,
-            },
+            // A saved Antigravity default names no pool outside the Gemini
+            // API: a bare id there goes to whichever other pool serves it.
+            None => {
+                match provider_hint.or(config.settings.default_provider.as_deref().filter(|name| {
+                    gemini
+                        || SubscriptionProvider::parse(name)
+                            != Some(SubscriptionProvider::Antigravity)
+                })) {
+                    Some(name) => Some(pool_of(name).ok_or("unknown provider")?),
+                    None => None,
+                }
+            }
         };
         let all_models = self.models.read().await;
         let pools: Vec<(SubscriptionProvider, Option<String>)> = if let Some(pool) = explicit {
@@ -1010,6 +1018,19 @@ impl AppState {
             pools
         };
         drop(all_models);
+        let pools = if gemini {
+            pools
+        } else {
+            let served = !pools.is_empty();
+            let pools: Vec<_> = pools
+                .into_iter()
+                .filter(|(provider, _)| *provider != SubscriptionProvider::Antigravity)
+                .collect();
+            if served && pools.is_empty() {
+                return Err(ANTIGRAVITY_GEMINI_ONLY.into());
+            }
+            pools
+        };
         let mut ordered = vec![];
         // The earliest reset among accounts only shares held back.
         let mut held_back: Option<(String, i64)> = None;
@@ -1037,7 +1058,7 @@ impl AppState {
                 && !model.contains("fable");
             let mut pool_accounts = self
                 .accounts
-                .eligible_in_for_replay(provider, route.as_deref(), Some(model), owner)
+                .eligible_in_with_owner(provider, route.as_deref(), Some(model), owner)
                 .await;
             let mut resting = false;
             loop {
@@ -2410,7 +2431,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn replay_owner_in_cooldown_still_obeys_reserves_and_disabled_models() {
+    async fn gemini_owner_in_cooldown_still_obeys_reserves_and_disabled_models() {
         let directory = tempfile::TempDir::new().unwrap();
         let mut config = Config::default();
         config.server.auth_dir = directory.path().join("auth");
@@ -2423,12 +2444,13 @@ mod tests {
             .await
             .unwrap();
         let pick = || {
-            state.candidates_for_replay(
+            state.candidates_with_owner(
                 "antigravity/synthetic",
                 None,
                 None,
                 None,
                 Some(&owner.id),
+                true,
                 true,
             )
         };

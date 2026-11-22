@@ -212,13 +212,17 @@ impl Pool {
         }
     }
 
+    /// Antigravity accounts answer only the Gemini API, as Antigravity's own
+    /// agent calls it.
     async fn ask(&self, model: &str) -> (u16, String) {
         let response = self
             .client
-            .post(format!("{}/v1/messages", self.url))
+            .post(format!(
+                "{}/v1beta/models/{model}:generateContent",
+                self.url
+            ))
             .header("user-agent", "unrelated-client/1.0")
-            .json(&json!({"model":model,"max_tokens":64,
-                "messages":[{"role":"user","content":"Reply OK"}]}))
+            .json(&json!({"contents":[{"role":"user","parts":[{"text":"Reply OK"}]}]}))
             .send()
             .await
             .unwrap();
@@ -245,7 +249,7 @@ async fn argon_is_discovered_and_relayed_with_the_current_client_identity() {
     .await;
     let response = pool
         .client
-        .get(format!("{}/v1/models", pool.url))
+        .get(format!("{}/v1beta/models", pool.url))
         .send()
         .await
         .unwrap();
@@ -253,13 +257,14 @@ async fn argon_is_discovered_and_relayed_with_the_current_client_identity() {
     let catalog: Value = response.json().await.unwrap();
     for model in argon {
         let id = format!("antigravity/{model}");
+        let name = format!("models/{model}");
         assert!(
-            catalog["data"]
+            catalog["models"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|entry| entry["id"] == id),
-            "missing {id}: {catalog}"
+                .any(|entry| entry["name"] == name),
+            "missing {name}: {catalog}"
         );
         let (status, body) = pool.ask(&id).await;
         assert_eq!(status, 200, "{body}");

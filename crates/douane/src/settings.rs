@@ -63,11 +63,14 @@ pub struct Settings {
     /// When the unused part of client shares becomes common on day, week and
     /// month windows. Five-hour shares always keep their reservations.
     pub share_release: ShareRelease,
-    /// Memory for Antigravity's signed Gemini history, every conversation
-    /// together. A conversation squeezed out replays without its native parts.
-    pub antigravity_replay_mib: u32,
-    /// Minutes an idle conversation keeps its signed Gemini history.
-    pub antigravity_replay_idle_minutes: u32,
+    /// Retired with the Antigravity replay cache: a saved file holding them
+    /// still loads, and the next save drops them.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
+    pub antigravity_replay_mib: Option<serde::de::IgnoredAny>,
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
+    pub antigravity_replay_idle_minutes: Option<serde::de::IgnoredAny>,
 }
 
 /// When a share nobody uses stops being reserved for its holder.
@@ -136,8 +139,8 @@ impl Default for Settings {
             plan_weights: BTreeMap::new(),
             free_before_reset_hours: 6,
             share_release: ShareRelease::default(),
-            antigravity_replay_mib: 64,
-            antigravity_replay_idle_minutes: 60,
+            antigravity_replay_mib: None,
+            antigravity_replay_idle_minutes: None,
         }
     }
 }
@@ -203,12 +206,6 @@ impl Settings {
         if self.free_before_reset_hours > 168 {
             bail!("free_before_reset_hours must be between 0 and 168");
         }
-        if !(1..=4096).contains(&self.antigravity_replay_mib) {
-            bail!("antigravity_replay_mib must be between 1 and 4096");
-        }
-        if !(1..=1440).contains(&self.antigravity_replay_idle_minutes) {
-            bail!("antigravity_replay_idle_minutes must be between 1 and 1440");
-        }
         if let Some(p) = &self.default_provider {
             if crate::subscriptions::SubscriptionProvider::parse(p).is_none() {
                 bail!("unknown default provider");
@@ -249,14 +246,6 @@ impl Settings {
             );
         }
         Ok(())
-    }
-
-    pub fn antigravity_replay_bytes(&self) -> usize {
-        self.antigravity_replay_mib as usize * 1024 * 1024
-    }
-
-    pub fn antigravity_replay_idle(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(u64::from(self.antigravity_replay_idle_minutes) * 60)
     }
 
     pub fn free_before_reset_seconds(&self) -> i64 {
@@ -334,6 +323,30 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retired_replay_settings_still_load_and_leave_on_the_next_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subscriptions.toml");
+        std::fs::write(
+            &path,
+            "[settings]
+keep_fable = true
+antigravity_replay_mib = 64
+antigravity_replay_idle_minutes = 60
+",
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        assert!(config.settings.keep_fable);
+        config.save(&path).await.unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("antigravity_replay"), "{saved}");
+        assert!(Config::load(&path).unwrap().settings.keep_fable);
+        let json = serde_json::to_value(&config.settings).unwrap();
+        assert!(json.get("antigravity_replay_mib").is_none());
+        assert!(json.get("antigravity_replay_idle_minutes").is_none());
+    }
 
     #[test]
     fn share_release_reads_both_choices_and_defaults_to_the_last_seventh() {
