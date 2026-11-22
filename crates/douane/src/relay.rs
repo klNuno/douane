@@ -58,6 +58,27 @@ fn configured_dialect(value: &str) -> Option<Dialect> {
     }
 }
 
+fn prepare_mistral_chat(url: &str, body: &mut Value) {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return;
+    };
+    if url.host_str() != Some("api.mistral.ai") {
+        return;
+    }
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    // Mistral rejects the empty reasoning_content sent in tool-call history.
+    for message in messages {
+        if message["role"] == "assistant"
+            && message["reasoning_content"].as_str() == Some("")
+            && let Some(message) = message.as_object_mut()
+        {
+            message.remove("reasoning_content");
+        }
+    }
+}
+
 /// A Gemini API call, `/v1beta/models/{model}:{method}`, as Antigravity's own
 /// clients send it to a custom gateway: the model and whether a stream was
 /// asked for.
@@ -740,6 +761,7 @@ pub async fn forward(
         // Mistral refuses a Chat request past 20 images with a 503 no retry
         // can fix: the oldest images give way to a placeholder instead.
         if account.provider == SubscriptionProvider::OpenaiCompatible && to == Dialect::Chat {
+            prepare_mistral_chat(&url, &mut translated);
             let limit = account.image_limit();
             let omitted = crate::chat_images::cap(&mut translated, limit);
             if omitted > 0 {
