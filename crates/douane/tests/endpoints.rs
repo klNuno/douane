@@ -171,11 +171,21 @@ struct Gateway {
 
 impl Gateway {
     async fn new(accounts: &[Value]) -> Self {
+        Self::with_upstream_client(accounts, None).await
+    }
+
+    async fn with_upstream_client(
+        accounts: &[Value],
+        upstream_client: Option<reqwest::Client>,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.server.auth_dir = directory.path().join("accounts");
         config.server.database = directory.path().join("calls.sqlite");
-        let state = AppState::new(config, None).unwrap();
+        let mut state = AppState::new(config, None).unwrap();
+        if let Some(client) = upstream_client {
+            Arc::get_mut(&mut state).unwrap().client = client;
+        }
         let (_, key) = state
             .clients
             .create(douane::clients::ClientPatch {
@@ -262,6 +272,89 @@ fn endpoint(route: &str, base: &str, key: &str) -> Value {
 
 fn chat(model: &str) -> Value {
     json!({"model":model,"messages":[{"role":"user","content":"hi"}]})
+}
+
+#[tokio::test]
+async fn mistral_chat_omits_empty_reasoning_after_a_tool_call() {
+    let seen = Arc::new(Upstream::default());
+    let mistral = serve(
+        Router::new()
+            .route(
+                "/v1/models",
+                get(|| async { Json(json!({"data":[{"id":"deepseek-v4-1-flash-1017"}]})) }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(async |state, uri, headers, body: Bytes| {
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    if request["messages"][2].get("reasoning_content") == Some(&json!("")) {
+                        return (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            Json(json!({"detail":[{"type":"extra_forbidden",
+                                "loc":["body","messages",2,"assistant","reasoning_content"],
+                                "msg":"Extra inputs are not permitted","input":""}]})),
+                        )
+                            .into_response();
+                    }
+                    answer(state, uri, headers, body).await
+                }),
+            )
+            .with_state(seen.clone()),
+    )
+    .await;
+    // Resolve the provider hostname only in this client, to the mock listener.
+    let address = mistral
+        .url
+        .trim_start_matches("http://")
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("api.mistral.ai", address)
+        .build()
+        .unwrap();
+    let (other, other_seen) = api(&["deepseek-v4-1-flash-1017"]).await;
+    let gateway = Gateway::with_upstream_client(
+        &[
+            endpoint(
+                "mistral",
+                &format!("http://api.mistral.ai:{}", address.port()),
+                "test-mistral",
+            ),
+            endpoint("other", &other.url, "test-other"),
+        ],
+        Some(client),
+    )
+    .await;
+    let mut body = json!({
+        "model":"mistral/deepseek-v4-1-flash-1017",
+        "messages":[
+            {"role":"system","content":"Use the tools provided."},
+            {"role":"user","content":"Check the result."},
+            {"role":"assistant","content":"Checking.","reasoning_content":"",
+                "tool_calls":[{"id":"call1","type":"function","function":{"name":"check","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"call1","content":"ok"}
+        ]
+    });
+    let (status, response) = gateway.post("/v1/chat/completions", body.clone()).await;
+    assert_eq!(status, 200, "{response}");
+    body["model"] = json!("other/deepseek-v4-1-flash-1017");
+    assert_eq!(
+        gateway.post("/v1/chat/completions", body.clone()).await.0,
+        200
+    );
+    assert_eq!(
+        other_seen.seen.lock().unwrap().last().unwrap().body["messages"],
+        body["messages"]
+    );
+    body["messages"][2]
+        .as_object_mut()
+        .unwrap()
+        .remove("reasoning_content");
+    assert_eq!(
+        seen.seen.lock().unwrap().last().unwrap().body["messages"],
+        body["messages"]
+    );
 }
 
 #[tokio::test]
