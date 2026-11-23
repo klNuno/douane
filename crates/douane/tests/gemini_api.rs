@@ -490,8 +490,23 @@ async fn a_signed_turn_waits_for_the_account_that_signed_it() {
     ]);
     let refused = generate_on(&fixture, "synthetic-pro", &body).await;
     assert_eq!(refused.status(), 429);
-    assert!(refused.headers().contains_key("retry-after"));
+    let first_delay = refused.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!((29..=30).contains(&first_delay));
+    let sent = fixture.mock.tokens.lock().unwrap().len();
+    let local = generate_on(&fixture, "synthetic-pro", &body).await;
+    assert_eq!(local.status(), 429);
+    let local_delay = local.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(local_delay <= first_delay && local_delay >= 28);
     let tokens = fixture.mock.tokens.lock().unwrap();
+    assert_eq!(tokens.len(), sent);
     assert!(tokens.iter().all(|t| *t == signer), "{tokens:?}");
 }
 

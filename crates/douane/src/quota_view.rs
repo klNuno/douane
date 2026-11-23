@@ -104,6 +104,9 @@ fn account_entry(account: &AccountSummary, snapshot: Option<&QuotaSnapshot>) -> 
         "accounts": 1,
         "status": status,
         "error": error(account, snapshot, status),
+        "read_error": snapshot.and_then(|s| s.error.as_deref()),
+        "status_reason": account.status_reason,
+        "retry_at": account.retry_at,
         "updated_at": timestamp(snapshot.map(|s| s.updated_at.as_str())),
         "windows": snapshot.map(|s| s.windows.iter().map(window).collect::<Vec<_>>()).unwrap_or_default(),
         "credits": snapshot.map(|s| s.credits.iter().map(credit).collect::<Vec<_>>()).unwrap_or_default(),
@@ -126,6 +129,9 @@ fn average_entry(provider: SubscriptionProvider, members: &[Member], settings: &
         snapshot
             .is_some_and(|s| s.error.is_none() || !s.windows.is_empty() || !s.credits.is_empty())
     });
+    let read_error = members
+        .iter()
+        .find_map(|(_, snapshot)| snapshot.and_then(|s| s.error.as_deref()));
     let error = if produced {
         None
     } else {
@@ -167,6 +173,13 @@ fn average_entry(provider: SubscriptionProvider, members: &[Member], settings: &
         "accounts": count,
         "status": overall,
         "error": error,
+        "read_error": read_error,
+        "status_reason": members.iter().find_map(|(account, _)| {
+            (status(account) == overall).then_some(account.status_reason.as_ref()).flatten()
+        }),
+        "retry_at": members.iter().filter(|(account, _)| status(account) == overall)
+            .filter_map(|(account, _)| account.retry_at.as_deref())
+            .filter_map(|at| parse_timestamp(at).map(|key| (key, at))).min().map(|(_, at)| at),
         "updated_at": timestamp(updated_at),
         "windows": merge_windows(&snapshots),
         "credits": merge_credits(&snapshots.iter().map(|(s, _)| *s).collect::<Vec<_>>()),
@@ -328,7 +341,7 @@ fn error(
     status: &str,
 ) -> Option<String> {
     snapshot.and_then(|s| s.error.clone()).or_else(|| {
-        (status != "ready")
+        (status == "error")
             .then(|| account.last_error.clone())
             .flatten()
     })
@@ -399,6 +412,9 @@ mod tests {
             enabled: status != "disabled",
             status: status.into(),
             last_error: (status == "error").then(|| "provider request failed".into()),
+            refusals: vec![],
+            status_reason: None,
+            retry_at: None,
             reserve_percent: None,
             reserve_windows: vec![],
             hidden: false,
@@ -427,6 +443,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn active_quota_refusal_is_a_status_reason_not_a_read_error() {
+        let mut account = summary("a", SubscriptionProvider::Claude, "cooldown");
+        account.last_error = Some("upstream quota exceeded".into());
+        account.status_reason = account.last_error.clone();
+        let mut snapshot = snapshot("a", vec![], vec![]);
+        let entry = account_entry(&account, Some(&snapshot));
+        assert!(entry["error"].is_null());
+        assert_eq!(entry["status_reason"], "upstream quota exceeded");
+        assert_eq!(entry.get("read_error"), Some(&Value::Null));
+        assert_eq!(entry.get("retry_at"), Some(&Value::Null));
+        snapshot.error = Some("quota read failed".into());
+        let entry = account_entry(&account, Some(&snapshot));
+        assert_eq!(entry["error"], "quota read failed");
+        assert_eq!(entry["read_error"], "quota read failed");
+    }
+
+    #[test]
+    fn inference_errors_do_not_report_a_failed_quota_read() {
+        let provider = SubscriptionProvider::Claude;
+        let account = summary("fixture", provider, "error");
+        let snapshot = snapshot("fixture", vec![], vec![]);
+        let entry = account_entry(&account, Some(&snapshot));
+        assert_eq!(entry["error"], "provider request failed");
+        assert_eq!(entry["read_error"], Value::Null);
+        let entry = average_entry(
+            provider,
+            &[(&account, Some(&snapshot))],
+            &Settings::default(),
+        );
+        assert_eq!(entry["read_error"], Value::Null);
+        let entry = average_entry(provider, &[(&account, None)], &Settings::default());
+        assert_eq!(entry["error"], "provider request failed");
+        assert_eq!(entry["read_error"], Value::Null);
+        let failed = QuotaSnapshot {
+            error: Some("quota read failed".into()),
+            ..snapshot.clone()
+        };
+        let second = summary("second", provider, "ready");
+        let entry = average_entry(
+            provider,
+            &[(&account, Some(&snapshot)), (&second, Some(&failed))],
+            &Settings::default(),
+        );
+        assert_eq!(entry["read_error"], "quota read failed");
+    }
     fn quota_window(id: &str, remaining: Option<f64>, reset: Option<&str>) -> QuotaWindow {
         QuotaWindow {
             id: id.into(),
@@ -839,7 +901,68 @@ mod tests {
         );
         let entry = &value["providers"][0]["entries"][0];
         assert_eq!(entry["error"], Value::Null);
+        assert_eq!(
+            entry["read_error"],
+            "upstream authentication or quota request failed (HTTP 401)"
+        );
         assert_eq!(entry["updated_at"], "2026-10-04T11:58:00Z");
+    }
+
+    #[tokio::test]
+    async fn a_successful_poll_at_zero_has_a_status_reason_and_no_read_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let reset = time::OffsetDateTime::now_utc().unix_timestamp() + 18_000;
+        let upstream = axum::Router::new().route(
+            "/usage",
+            axum::routing::get(move || async move {
+                axum::Json(json!({"rate_limit":{"primary_window":{
+                    "used_percent":100, "limit_window_seconds":18000, "reset_at":reset
+                }}}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let usage_url = format!("http://{}/usage", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let mut state = AppState::new(config, None).unwrap();
+        let service = &mut std::sync::Arc::get_mut(&mut state).unwrap().quotas;
+        std::sync::Arc::get_mut(service).unwrap().codex_usage_url = usage_url;
+        let account = state
+            .accounts
+            .import(json!({"type":"codex","access_token":"fixture"}), None)
+            .await
+            .unwrap();
+        state.quotas.refresh(&account.id).await.unwrap();
+        let (_, key) = state
+            .clients
+            .create(crate::clients::ClientPatch {
+                name: Some("quota test".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let response = crate::router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/quotas")
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let entry = &value["providers"][0]["entries"][0];
+        assert_eq!(entry["status"], "cooldown");
+        assert_eq!(entry["windows"][0]["remaining_percent"], 0.0);
+        assert_eq!(entry["status_reason"], "subscription quota exhausted");
+        assert_eq!(entry["retry_at"], entry["windows"][0]["reset_at"]);
+        assert_eq!(entry.get("error"), Some(&Value::Null));
+        assert_eq!(entry.get("read_error"), Some(&Value::Null));
+        server.abort();
     }
 
     #[tokio::test]

@@ -4,103 +4,28 @@ use crate::{
     settings::Config,
     subscriptions::{
         AccountCredential, AccountStore, AccountSummary, OAuthManager, QuotaService, ResetManager,
-        SubscriptionProvider, antigravity_user_agent,
+        SubscriptionProvider,
     },
 };
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
 use tokio::sync::RwLock;
 
-type AccountListing = BTreeMap<String, Option<Value>>;
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Model {
-    pub id: String,
-    pub provider: SubscriptionProvider,
-    pub name: String,
-    #[serde(default)]
-    pub context_length: Option<u64>,
-    #[serde(default)]
-    pub max_output_tokens: Option<u64>,
-    #[serde(default = "yes")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub upstream_id: String,
-    #[serde(default)]
-    pub thinking: Option<Value>,
-    /// The custom endpoint route serving this model, absent for providers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub route: Option<String>,
-    /// Upstream paths the model accepts, when its provider says so
-    /// (`/v1/messages`, `/responses`, `/chat/completions`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub endpoints: Vec<String>,
-    /// Native provider catalog fields required by its own client.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<Value>,
-}
-fn yes() -> bool {
-    true
-}
-
-/// The last catalog read of one pool.
-#[derive(Clone, Serialize)]
-pub struct ModelListing {
-    pub refreshed_at: String,
-    /// The live listing failed, so the pool shows the previous catalog.
-    pub stale: bool,
-}
-
-/// Whether `model` belongs to `pool`, whose name prefixes its id.
-fn in_pool(model: &Model, pool: &str) -> bool {
-    model
-        .id
-        .strip_prefix(pool)
-        .is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// A blank enabled row; constructors name the fields they know.
-impl Default for Model {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            provider: SubscriptionProvider::OpenaiCompatible,
-            name: String::new(),
-            context_length: None,
-            max_output_tokens: None,
-            enabled: true,
-            upstream_id: String::new(),
-            thinking: None,
-            route: None,
-            endpoints: vec![],
-            metadata: None,
-        }
-    }
-}
-
-/// The bundled catalog, each provider's models in that provider's own order.
-pub(crate) fn catalog() -> &'static [Model] {
-    static CATALOG: std::sync::OnceLock<Vec<Model>> = std::sync::OnceLock::new();
-    CATALOG.get_or_init(|| {
-        serde_json::from_str(include_str!("../data/models.json")).unwrap_or_default()
-    })
-}
-
-/// A model's place in its provider's own list, the provider's default first.
-/// A model the catalog does not name comes after the ones it does.
-pub(crate) fn catalog_rank(provider: SubscriptionProvider, upstream_id: &str) -> usize {
-    catalog()
-        .iter()
-        .filter(|model| model.provider == provider)
-        .position(|model| model.id == upstream_id)
-        .unwrap_or(usize::MAX)
-}
+mod models;
+mod quotas;
+mod routing;
+use models::AccountListing;
+#[cfg(test)]
+use models::antigravity_catalog;
+#[cfg(test)]
+pub(crate) use models::catalog;
+pub(crate) use models::{CodexEntry, catalog_rank, tier_id};
+pub use models::{Model, ModelCapabilities, ModelListing, SpeedCapability, SpeedOption};
+pub use quotas::reserve_reached_in;
 
 pub struct AppState {
     pub config: RwLock<Config>,
@@ -144,10 +69,6 @@ pub struct AppState {
 /// The refusal of an Antigravity model outside the Gemini API route.
 pub const ANTIGRAVITY_GEMINI_ONLY: &str =
     "Antigravity accounts serve only Antigravity's own agent, through the Gemini API (/v1beta)";
-
-/// How long a refusal hides a model from an account: a plan change shows up
-/// the next day, or at once after a restart.
-const REFUSAL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 impl AppState {
     pub fn new(mut config: Config, config_path: Option<PathBuf>) -> Result<Arc<Self>> {
@@ -211,1410 +132,6 @@ impl AppState {
         let due = self.quota_sampler.due(&self.quotas.list().await);
         self.ledger.record_samples(due);
     }
-
-    fn refuses(&self, account: &str, model: &str) -> bool {
-        self.refused
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(account.to_owned(), model.to_owned()))
-            .is_some_and(|at| at.elapsed() < REFUSAL)
-    }
-
-    /// Whether `account` can be sent `model`: it did not refuse it lately,
-    /// and its own last live listing, when it has one, names it.
-    fn serves(&self, account: &str, model: &str, provider: SubscriptionProvider) -> bool {
-        !self.refuses(account, model)
-            && self
-                .listed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(account)
-                .map_or(provider != SubscriptionProvider::Meta, |ids| {
-                    ids.contains_key(model)
-                })
-    }
-
-    /// A catalog can list models an account's plan cannot use (Copilot), or
-    /// that only another account of the pool offers (Antigravity); the first
-    /// refusal skips the account for that model, and the model leaves the
-    /// list once no account of the provider serves it.
-    pub(crate) async fn model_refused(
-        &self,
-        provider: SubscriptionProvider,
-        account: &str,
-        model: &str,
-    ) {
-        self.refused
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                (account.to_owned(), model.to_owned()),
-                std::time::Instant::now(),
-            );
-        let served = self
-            .accounts
-            .eligible_in(provider, None, Some(model))
-            .await
-            .iter()
-            .any(|other| self.serves(&other.id, model, other.provider));
-        if !served {
-            self.models
-                .write()
-                .await
-                .retain(|m| !(m.provider == provider && m.upstream_id == model));
-        }
-    }
-
-    pub async fn refresh_models(&self) {
-        self.refresh_models_in(None).await;
-    }
-
-    /// Pools whose last live listing failed.
-    pub fn stale_pools(&self) -> Vec<String> {
-        self.model_listings
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|(_, listing)| listing.stale)
-            .map(|(pool, _)| pool.clone())
-            .collect()
-    }
-
-    /// Rereads the catalog of one pool, or of every pool; the other pools
-    /// keep their rows untouched.
-    pub async fn refresh_models_in(&self, only: Option<&str>) {
-        let _refresh = self.model_refresh.lock().await;
-        let bundled = catalog();
-        let previous = self.models.read().await.clone();
-        let mut read: BTreeSet<String> = BTreeSet::new();
-        let mut failed: BTreeSet<String> = BTreeSet::new();
-        let mut models: BTreeMap<String, Model> = BTreeMap::new();
-        if let Some(pool) = only {
-            for model in previous.iter().filter(|m| !in_pool(m, pool)) {
-                models.insert(model.id.clone(), model.clone());
-            }
-        }
-        for summary in self.accounts.list().await {
-            let Some(account) = self.accounts.get(&summary.id).await else {
-                continue;
-            };
-            if only.is_some_and(|pool| pool != account.pool()) {
-                continue;
-            }
-            let pool = account.pool();
-            read.insert(pool.to_owned());
-            // What the last refresh read for this account, within its own
-            // model list, for when a live listing fails.
-            let kept: Vec<Model> = previous
-                .iter()
-                .filter(|m| {
-                    m.provider == account.provider
-                        && in_pool(m, pool)
-                        && (account.models.is_empty() || account.models.contains(&m.upstream_id))
-                })
-                .map(|m| Model {
-                    id: m.upstream_id.clone(),
-                    ..m.clone()
-                })
-                .collect();
-            let mut available: Vec<Model> = if account.models.is_empty() {
-                bundled
-                    .iter()
-                    .filter(|m| m.provider == account.provider)
-                    .cloned()
-                    .collect()
-            } else {
-                account
-                    .models
-                    .iter()
-                    .map(|id| Model {
-                        id: id.clone(),
-                        provider: account.provider,
-                        name: id.clone(),
-                        enabled: true,
-                        upstream_id: id.clone(),
-                        ..Model::default()
-                    })
-                    .collect()
-            };
-            if matches!(
-                account.provider,
-                SubscriptionProvider::Meta
-                    | SubscriptionProvider::OpencodeGo
-                    | SubscriptionProvider::OpenaiCompatible
-                    | SubscriptionProvider::Qwen
-            ) {
-                let base = account
-                    .base_url
-                    .as_deref()
-                    .unwrap_or(match account.provider {
-                        SubscriptionProvider::Meta => crate::subscriptions::meta::API,
-                        SubscriptionProvider::OpencodeGo => "https://opencode.ai/zen/go/v1",
-                        SubscriptionProvider::Qwen => "https://portal.qwen.ai/v1",
-                        _ => "",
-                    });
-                if !base.is_empty() {
-                    let root = base.trim_end_matches('/');
-                    let url = if account.provider == SubscriptionProvider::Meta {
-                        format!(
-                            "{}/muse-code/models",
-                            root.strip_suffix("/v1").unwrap_or(root)
-                        )
-                    } else if root.ends_with("/v1") {
-                        format!("{root}/models")
-                    } else {
-                        format!("{root}/v1/models")
-                    };
-                    let credential = if account.provider == SubscriptionProvider::Meta {
-                        self.oauth.credential(&account.id).await.ok()
-                    } else {
-                        Some(account.clone())
-                    };
-                    let listing = self
-                        .client
-                        .get(url)
-                        .headers(
-                            credential
-                                .as_ref()
-                                .map(|a| {
-                                    crate::relay::upstream_headers(a, &axum::http::HeaderMap::new())
-                                })
-                                .unwrap_or_default(),
-                        )
-                        .header("Accept", "application/json")
-                        .timeout(std::time::Duration::from_secs(15))
-                        .send()
-                        .await
-                        .ok()
-                        .filter(|response| response.status().is_success());
-                    let data = match listing {
-                        Some(response) => response.json::<Value>().await.ok(),
-                        None => None,
-                    };
-                    if let Some(data) = data.as_ref().and_then(|v| v["data"].as_array()) {
-                        if account.provider == SubscriptionProvider::Meta {
-                            let ids = data
-                                .iter()
-                                .filter_map(|m| Some((m["id"].as_str()?.to_owned(), None)))
-                                .collect();
-                            self.listed
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .insert(account.id.clone(), ids);
-                        }
-                        available = data
-                            .iter()
-                            .filter_map(|m| {
-                                let native = (account.provider == SubscriptionProvider::Meta)
-                                    .then(|| &m["metadata"]["muse-code"])
-                                    .filter(|v| v.is_object());
-                                Some(Model {
-                                    id: m["id"].as_str()?.into(),
-                                    name: m["name"].as_str().or_else(|| m["id"].as_str())?.into(),
-                                    provider: account.provider,
-                                    context_length: m["context_length"]
-                                        .as_u64()
-                                        .or_else(|| m["context_window"].as_u64())
-                                        .or_else(|| m["max_context_length"].as_u64())
-                                        .or_else(|| {
-                                            native.and_then(|v| v["limit"]["context"].as_u64())
-                                        }),
-                                    max_output_tokens: native
-                                        .and_then(|v| v["limit"]["output"].as_u64()),
-                                    enabled: true,
-                                    upstream_id: String::new(),
-                                    thinking: m.get("thinking").cloned(),
-                                    metadata: native.map(|v| json!({"muse-code":v})),
-                                    ..Model::default()
-                                })
-                            })
-                            .filter(|m| account.models.is_empty() || account.models.contains(&m.id))
-                            .collect();
-                        // Only a Chat endpoint is probed: its requests are the
-                        // ones that carry `reasoning_effort`.
-                        if account.provider == SubscriptionProvider::OpenaiCompatible
-                            && account.dialect.as_deref() == Some("chat")
-                        {
-                            let probe: BTreeSet<&str> = data
-                                .iter()
-                                .filter(|m| crate::openai_reasoning::needs_probe(m))
-                                .filter_map(|m| m["id"].as_str())
-                                .collect();
-                            self.reasoning_levels_for(&account, base, &probe, &mut available)
-                                .await;
-                        }
-                    } else {
-                        // A listing that times out or errors once must not
-                        // empty the pool until the next restart: keep what
-                        // the last refresh read, within the account's own
-                        // model list. An account that names its models keeps
-                        // them without a listing, so only one that names
-                        // none is retried in the background.
-                        tracing::warn!(pool = %pool, "model listing unavailable, keeping the previous catalog");
-                        if account.models.is_empty() {
-                            available = kept.clone();
-                        } else {
-                            // Every named model stays, with what the last
-                            // listing said about it when it said something.
-                            for model in &mut available {
-                                if let Some(known) =
-                                    kept.iter().find(|k| k.upstream_id == model.upstream_id)
-                                {
-                                    *model = known.clone();
-                                }
-                            }
-                        }
-                        if account.models.is_empty() {
-                            failed.insert(pool.to_owned());
-                        }
-                    }
-                }
-            }
-            // A failed live read keeps the previous rows, or the bundled
-            // ones on a first read, and is retried like a failed listing.
-            if account.provider == SubscriptionProvider::Antigravity && account.models.is_empty() {
-                match self.antigravity_models(&account).await {
-                    Some(mut live) => {
-                        self.remember_listing(&account.id, &mut live);
-                        available = live
-                            .into_iter()
-                            .filter(|m| !self.refuses(&account.id, &m.id))
-                            .collect();
-                    }
-                    None => {
-                        if !kept.is_empty() {
-                            available = kept.clone();
-                        }
-                        failed.insert(pool.to_owned());
-                    }
-                }
-            }
-            if matches!(
-                account.provider,
-                SubscriptionProvider::Codex | SubscriptionProvider::Copilot
-            ) {
-                let live = if account.provider == SubscriptionProvider::Codex {
-                    self.codex_models(&account).await
-                } else {
-                    self.copilot_models(&account).await
-                };
-                match live {
-                    Some(mut live) => {
-                        self.remember_listing(&account.id, &mut live);
-                        available = live
-                            .into_iter()
-                            .filter(|m| account.models.is_empty() || account.models.contains(&m.id))
-                            .filter(|m| !self.refuses(&account.id, &m.id))
-                            .collect();
-                    }
-                    None => {
-                        if !kept.is_empty() {
-                            available = kept
-                                .iter()
-                                .filter(|m| !self.refuses(&account.id, &m.id))
-                                .cloned()
-                                .collect();
-                        }
-                        failed.insert(pool.to_owned());
-                    }
-                }
-            }
-            for mut model in available {
-                model.upstream_id = model.id.clone();
-                model.route = account.route.clone();
-                model.id = format!("{}/{}", account.pool(), model.upstream_id);
-                models.insert(model.id.clone(), model);
-            }
-        }
-        // A model switched while the listings were read must keep its new
-        // state: read the disabled list once the catalog is locked.
-        let mut published = self.models.write().await;
-        let disabled = self.config.read().await.disabled_models.clone();
-        *published = models
-            .into_values()
-            .map(|mut model| {
-                model.enabled =
-                    !disabled.contains(&model.id) && !disabled.contains(&model.upstream_id);
-                model
-            })
-            .collect();
-        drop(published);
-        let now = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default();
-        let mut listings = self
-            .model_listings
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        match only {
-            Some(pool) => {
-                listings.remove(pool);
-            }
-            None => listings.clear(),
-        }
-        for pool in read {
-            let stale = failed.contains(&pool);
-            listings.insert(
-                pool,
-                ModelListing {
-                    refreshed_at: now.clone(),
-                    stale,
-                },
-            );
-        }
-    }
-
-    /// Copilot's own catalog: the models this account's plan enables, with
-    /// the upstream paths each one accepts.
-    async fn copilot_models(&self, account: &AccountCredential) -> Option<Vec<Model>> {
-        let base = account
-            .base_url
-            .as_deref()
-            .unwrap_or(crate::relay::COPILOT_API);
-        let response = self
-            .client
-            .get(crate::relay::endpoint(base, "/models"))
-            .bearer_auth(&account.access_token)
-            .header("User-Agent", crate::relay::COPILOT_USER_AGENT)
-            .header("X-GitHub-Api-Version", crate::relay::COPILOT_API_VERSION)
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await
-            .ok()?;
-        if !response.status().is_success() {
-            return None;
-        }
-        let value = response.json::<Value>().await.ok()?;
-        let models = copilot_catalog(&value);
-        (!models.is_empty()).then_some(models)
-    }
-
-    /// Codex's native list carries newly released models and their current
-    /// context/reasoning metadata, independently of the bundled fallback.
-    async fn codex_models(&self, stored: &AccountCredential) -> Option<Vec<Model>> {
-        const VERSION: &str = "0.170.0";
-        let account = self.oauth.credential(&stored.id).await.ok()?;
-        let base = account
-            .base_url
-            .as_deref()
-            .unwrap_or("https://chatgpt.com/backend-api/codex");
-        let mut request = self
-            .client
-            .get(crate::relay::endpoint(base, "/models"))
-            .query(&[("client_version", VERSION)])
-            .bearer_auth(&account.access_token)
-            .header("originator", "codex_cli_rs")
-            .header("user-agent", format!("codex_cli_rs/{VERSION}"))
-            .timeout(std::time::Duration::from_secs(15));
-        if let Some(id) = &account.account_id {
-            request = request.header("chatgpt-account-id", id);
-        }
-        let response = request.send().await.ok()?;
-        if !response.status().is_success() {
-            return None;
-        }
-        let value: Value = response.json().await.ok()?;
-        let rows = value.get("models")?.as_array()?;
-        let mut models = Vec::new();
-        for row in rows {
-            let Some(id) = row
-                .get("slug")
-                .and_then(Value::as_str)
-                .filter(|id| !id.trim().is_empty())
-            else {
-                continue;
-            };
-            // `supported_in_api` describes API-key access. This native listing
-            // belongs to a ChatGPT subscription and may include models without it.
-            let known = catalog()
-                .iter()
-                .find(|m| m.provider == SubscriptionProvider::Codex && m.id == id);
-            let levels: Vec<&str> = row
-                .get("supported_reasoning_levels")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|level| level.get("effort").and_then(Value::as_str))
-                .collect();
-            models.push(Model {
-                id: id.to_owned(),
-                upstream_id: id.to_owned(),
-                provider: SubscriptionProvider::Codex,
-                name: row
-                    .get("display_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or(id)
-                    .to_owned(),
-                context_length: row
-                    .get("context_window")
-                    .and_then(Value::as_u64)
-                    .or_else(|| known.and_then(|m| m.context_length)),
-                max_output_tokens: row
-                    .get("max_output_tokens")
-                    .and_then(Value::as_u64)
-                    .or_else(|| known.and_then(|m| m.max_output_tokens)),
-                thinking: if levels.is_empty() {
-                    known.and_then(|m| m.thinking.clone())
-                } else {
-                    Some(json!({"levels":levels}))
-                },
-                metadata: Some(row.clone()),
-                ..Model::default()
-            });
-        }
-        Some(models)
-    }
-
-    /// Fills the effort levels of `available` rows named in `probe`, asking
-    /// the endpoint only for the models this account has not answered yet.
-    async fn reasoning_levels_for(
-        &self,
-        account: &AccountCredential,
-        base: &str,
-        probe: &BTreeSet<&str>,
-        available: &mut [Model],
-    ) {
-        use futures_util::StreamExt;
-        let known = |model: &str| {
-            self.reasoning_levels
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&(account.id.clone(), model.to_owned()))
-                .cloned()
-        };
-        let missing: Vec<String> = available
-            .iter()
-            .filter(|m| probe.contains(m.id.as_str()) && known(&m.id).is_none())
-            .map(|m| m.id.clone())
-            .collect();
-        if !missing.is_empty() {
-            let url = crate::relay::endpoint(base, "/v1/chat/completions");
-            let headers = crate::relay::upstream_headers(account, &axum::http::HeaderMap::new());
-            let answers: Vec<(String, crate::openai_reasoning::Probe)> =
-                futures_util::stream::iter(missing)
-                    .map(|model| {
-                        let (url, headers) = (url.clone(), headers.clone());
-                        async move {
-                            let answer =
-                                crate::openai_reasoning::probe(&self.client, &url, headers, &model)
-                                    .await;
-                            (model, answer)
-                        }
-                    })
-                    .buffer_unordered(crate::openai_reasoning::PROBE_CONCURRENCY)
-                    .collect()
-                    .await;
-            let mut cache = self
-                .reasoning_levels
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for (model, answer) in answers {
-                let levels = match answer {
-                    crate::openai_reasoning::Probe::Levels(levels) => levels,
-                    crate::openai_reasoning::Probe::Silent => vec![],
-                    crate::openai_reasoning::Probe::Retry => continue,
-                };
-                cache.insert((account.id.clone(), model), levels);
-            }
-        }
-        for model in available
-            .iter_mut()
-            .filter(|m| probe.contains(m.id.as_str()))
-        {
-            if let Some(levels) = known(&model.id).filter(|levels| !levels.is_empty()) {
-                model.thinking = Some(json!({ "levels": levels }));
-            }
-        }
-    }
-
-    /// What an account's own live listing named, for routing its requests.
-    fn remember_listing(&self, account: &str, live: &mut [Model]) {
-        self.listed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                account.to_owned(),
-                live.iter_mut()
-                    .map(|m| {
-                        let native = if m.provider == SubscriptionProvider::Codex {
-                            m.metadata.take()
-                        } else {
-                            None
-                        };
-                        (m.id.clone(), native)
-                    })
-                    .collect(),
-            );
-    }
-
-    async fn codex_catalog_accounts(
-        &self,
-        client: &crate::clients::Client,
-    ) -> Vec<AccountCredential> {
-        self.accounts
-            .enabled_subscriptions(SubscriptionProvider::Codex)
-            .await
-            .into_iter()
-            .filter(|a| client.access.allows(a))
-            .collect()
-    }
-
-    fn codex_catalog_source<'a>(
-        &self,
-        listed: &'a BTreeMap<String, AccountListing>,
-        account: &AccountCredential,
-        id: &str,
-    ) -> Option<Option<&'a Value>> {
-        if (!account.models.is_empty() && !account.models.iter().any(|model| model == id))
-            || self.refuses(&account.id, id)
-        {
-            return None;
-        }
-        // An unlisted account may still serve the model, with unknown tiers.
-        match listed.get(&account.id) {
-            Some(catalog) => catalog.get(id).map(Option::as_ref),
-            None => Some(None),
-        }
-    }
-
-    fn codex_catalog_model_enabled(model: &Model, disabled: &BTreeSet<String>) -> bool {
-        model.provider == SubscriptionProvider::Codex
-            && model.enabled
-            && !disabled.contains(&model.id)
-            && !disabled.contains(&model.upstream_id)
-    }
-
-    pub(crate) async fn codex_catalog_contains(
-        &self,
-        client: &crate::clients::Client,
-        id: &str,
-    ) -> bool {
-        let accounts = self.codex_catalog_accounts(client).await;
-        if accounts.is_empty() {
-            return false;
-        }
-        let disabled = self.config.read().await.disabled_models.clone();
-        let models = self.models.read().await;
-        if !models.iter().any(|model| {
-            model.upstream_id == id && Self::codex_catalog_model_enabled(model, &disabled)
-        }) {
-            return false;
-        }
-        let listed = self.listed.lock().unwrap_or_else(|e| e.into_inner());
-        accounts.iter().any(|account| {
-            self.codex_catalog_source(&listed, account, id)
-                .flatten()
-                .is_some_and(Value::is_object)
-        })
-    }
-
-    pub(crate) async fn codex_catalog(
-        &self,
-        client: &crate::clients::Client,
-    ) -> Option<Vec<Value>> {
-        let accounts = self.codex_catalog_accounts(client).await;
-        let disabled = self.config.read().await.disabled_models.clone();
-        let models = self.models.read().await;
-        let listed = self.listed.lock().unwrap_or_else(|e| e.into_inner());
-        let mut catalog = Vec::new();
-        for model in models
-            .iter()
-            .filter(|m| Self::codex_catalog_model_enabled(m, &disabled))
-        {
-            let id = &model.upstream_id;
-            let rows: Vec<_> = accounts
-                .iter()
-                .filter_map(|a| self.codex_catalog_source(&listed, a, id))
-                .collect();
-            let Some(mut row) = rows
-                .iter()
-                .find_map(|row| *row)
-                .and_then(Value::as_object)
-                .cloned()
-            else {
-                continue;
-            };
-            // An unlisted account may still receive the model. Keep the client's
-            // bundled catalog until every account in this rotation has answered.
-            if rows.iter().any(Option::is_none) {
-                return None;
-            }
-            // The gateway can route subscription-only models with a client key.
-            row.insert("supported_in_api".into(), json!(true));
-            row.remove("available_access_programs");
-            row.remove("availability_nux");
-            // Rotation may use any of these accounts. Keep a tier only if
-            // each account that could serve this model advertises it.
-            fn tier_id(tier: &Value) -> Option<&str> {
-                tier.as_str().or_else(|| tier["id"].as_str())
-            }
-            for field in ["service_tiers", "additional_speed_tiers"] {
-                if let Some(tiers) = row.get_mut(field).and_then(Value::as_array_mut) {
-                    tiers.retain(|tier| {
-                        let Some(id) = tier_id(tier) else {
-                            return false;
-                        };
-                        rows.iter().flatten().all(|source| {
-                            source[field].as_array().is_some_and(|other| {
-                                other.iter().any(|tier| tier_id(tier) == Some(id))
-                            })
-                        })
-                    });
-                }
-            }
-            if let Some(default) = row.get("default_service_tier")
-                && default != "default"
-                && !row
-                    .get("service_tiers")
-                    .and_then(Value::as_array)
-                    .is_some_and(|tiers| tiers.iter().any(|tier| &tier["id"] == default))
-            {
-                row.remove("default_service_tier");
-            }
-            // Older clients saved qualified ids. Codex needs the exact
-            // slug in its catalog to keep its metadata when resuming them.
-            let mut alias = row.clone();
-            alias.insert("slug".into(), json!(model.id));
-            alias.insert("visibility".into(), json!("hide"));
-            catalog.extend([Value::Object(row), Value::Object(alias)]);
-        }
-        // A temporarily missing first listing is not an authoritative empty catalog.
-        if catalog.is_empty() && accounts.iter().any(|a| !listed.contains_key(&a.id)) {
-            return None;
-        }
-        Some(catalog)
-    }
-
-    /// Google renames Antigravity models without notice, so the bundled ids
-    /// go stale; the account's own `fetchAvailableModels` list is the truth.
-    async fn antigravity_models(&self, stored: &AccountCredential) -> Option<Vec<Model>> {
-        let account = self.oauth.credential(&stored.id).await.ok()?;
-        let project = account.project_id.as_deref()?;
-        let base = account
-            .base_url
-            .as_deref()
-            .unwrap_or("https://daily-cloudcode-pa.googleapis.com");
-        let response = self
-            .client
-            .post(crate::relay::endpoint(
-                base,
-                "/v1internal:fetchAvailableModels",
-            ))
-            .bearer_auth(&account.access_token)
-            .header("User-Agent", antigravity_user_agent())
-            .json(&json!({ "project": project }))
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await
-            .ok()?;
-        if !response.status().is_success() {
-            return None;
-        }
-        let value = response.json::<Value>().await.ok()?;
-        let models = antigravity_catalog(&value);
-        (!models.is_empty()).then_some(models)
-    }
-
-    pub async fn candidates(
-        &self,
-        requested: &str,
-        provider_hint: Option<&str>,
-        session: Option<&str>,
-    ) -> Result<(String, Vec<AccountCredential>), String> {
-        self.candidates_for(requested, provider_hint, session, None)
-            .await
-    }
-
-    /// The accounts `client` may use for `requested`, best first. A client
-    /// sees only the accounts its access allows, and an account where the
-    /// other holders' shares leave it nothing drops out like a reserve.
-    pub async fn candidates_for(
-        &self,
-        requested: &str,
-        provider_hint: Option<&str>,
-        session: Option<&str>,
-        client: Option<&crate::clients::Client>,
-    ) -> Result<(String, Vec<AccountCredential>), String> {
-        self.candidates_with_owner(requested, provider_hint, session, client, None, false, true)
-            .await
-    }
-
-    /// The candidates for a request, `gemini` when it came through the Gemini
-    /// API. Only that route reaches Antigravity accounts: Google bans an
-    /// account used outside Antigravity, so another dialect goes to another
-    /// provider of the model or is refused with [`ANTIGRAVITY_GEMINI_ONLY`].
-    /// An `owner` (the account that signed a Gemini history) is the only
-    /// candidate, even while it rests.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn candidates_with_owner(
-        &self,
-        requested: &str,
-        provider_hint: Option<&str>,
-        session: Option<&str>,
-        client: Option<&crate::clients::Client>,
-        owner: Option<&str>,
-        gemini: bool,
-        advance_rotation: bool,
-    ) -> Result<(String, Vec<AccountCredential>), String> {
-        let config = self.config.read().await.clone();
-        if config.disabled_models.contains(requested) {
-            return Err("model is disabled".into());
-        }
-        // A prefix names a provider or a custom endpoint route; anything else
-        // is part of the model id (OpenRouter ids contain slashes).
-        let routes = self.accounts.routes().await;
-        let pool_of = |name: &str| -> Option<(SubscriptionProvider, Option<String>)> {
-            SubscriptionProvider::parse(name)
-                .map(|provider| (provider, None))
-                .or_else(|| {
-                    routes.contains(name).then(|| {
-                        (
-                            SubscriptionProvider::OpenaiCompatible,
-                            Some(name.to_owned()),
-                        )
-                    })
-                })
-        };
-        let (prefix, model) = requested
-            .split_once('/')
-            .and_then(|(p, m)| pool_of(p).map(|pool| (Some(pool), m)))
-            .unwrap_or((None, requested));
-        let explicit = match prefix {
-            Some(pool) => Some(pool),
-            // A saved Antigravity default names no pool outside the Gemini
-            // API: a bare id there goes to whichever other pool serves it.
-            None => {
-                match provider_hint.or(config.settings.default_provider.as_deref().filter(|name| {
-                    gemini
-                        || SubscriptionProvider::parse(name)
-                            != Some(SubscriptionProvider::Antigravity)
-                })) {
-                    Some(name) => Some(pool_of(name).ok_or("unknown provider")?),
-                    None => None,
-                }
-            }
-        };
-        let all_models = self.models.read().await;
-        let pools: Vec<(SubscriptionProvider, Option<String>)> = if let Some(pool) = explicit {
-            vec![pool]
-        } else {
-            let mut pools = vec![];
-            for m in all_models
-                .iter()
-                .filter(|m| m.upstream_id == model && m.enabled)
-            {
-                let pool = (m.provider, m.route.clone());
-                if !pools.contains(&pool) {
-                    pools.push(pool);
-                }
-            }
-            // Native names select the matching native provider ahead of aggregators.
-            pools.sort_by_key(|(p, _)| match (model, *p) {
-                (m, SubscriptionProvider::Codex) if m.starts_with("gpt-") => 0,
-                (m, SubscriptionProvider::Claude) if m.starts_with("claude-") => 0,
-                (m, SubscriptionProvider::Xai) if m.starts_with("grok-") => 0,
-                _ => 1,
-            });
-            pools
-        };
-        drop(all_models);
-        let pools = if gemini {
-            pools
-        } else {
-            let served = !pools.is_empty();
-            let pools: Vec<_> = pools
-                .into_iter()
-                .filter(|(provider, _)| *provider != SubscriptionProvider::Antigravity)
-                .collect();
-            if served && pools.is_empty() {
-                return Err(ANTIGRAVITY_GEMINI_ONLY.into());
-            }
-            pools
-        };
-        let mut ordered = vec![];
-        // The earliest reset among accounts only shares held back.
-        let mut held_back: Option<(String, i64)> = None;
-        for (provider, route) in pools {
-            let pool = route.as_deref().unwrap_or(provider.as_str());
-            if owner.is_some() && provider != SubscriptionProvider::Antigravity {
-                continue;
-            }
-            if config.disabled_models.contains(&format!("{pool}/{model}")) {
-                continue;
-            }
-            let now = time::OffsetDateTime::now_utc();
-            let free_before = config.settings.free_before_reset_seconds();
-            let mut eligible = vec![];
-            let mut candidates = vec![];
-            let order = config
-                .settings
-                .account_order
-                .get(pool)
-                .or_else(|| config.settings.account_order.get(provider.as_str()));
-            // Fable calls spend the Fable week wherever they go; only the
-            // other models can spare the accounts that still have it.
-            let keep_fable = config.settings.keep_fable
-                && provider == SubscriptionProvider::Claude
-                && !model.contains("fable");
-            let mut pool_accounts = self
-                .accounts
-                .eligible_in_with_owner(provider, route.as_deref(), Some(model), owner)
-                .await;
-            let mut resting = false;
-            loop {
-                for a in pool_accounts {
-                    if owner.is_some_and(|owner| a.id != owner) {
-                        continue;
-                    }
-                    if client.is_some_and(|c| !c.may_use(&a)) {
-                        continue;
-                    }
-                    if let Some(c) = client {
-                        if !self
-                            .borrow_open(c, &a, model, now.unix_timestamp(), config.settings.release())
-                            .await
-                        {
-                            continue;
-                        }
-                    }
-                    if !self.serves(&a.id, model, a.provider) {
-                        continue;
-                    }
-                    let quota = self.quotas.get(&a.id).await;
-                    if self.reserve_excludes_with(&a, quota.as_ref(), now, free_before) {
-                        continue;
-                    }
-                    if let Some(reset) = self.clients.share_blocks_for(
-                        client,
-                        &a,
-                        quota.as_ref(),
-                        now.unix_timestamp(),
-                        config.settings.release(),
-                        model,
-                    ) {
-                        if held_back.as_ref().is_none_or(|(_, r)| reset < *r) {
-                            held_back = Some((pool.to_owned(), reset));
-                        }
-                        continue;
-                    }
-                    candidates.push(Candidate {
-                        id: a.id.clone(),
-                        remaining_percent: quota.as_ref().and_then(|q| {
-                            q.weekly_remaining_percent()
-                                .or_else(|| q.remaining_percent())
-                        }),
-                        weekly_reset: quota
-                            .as_ref()
-                            .and_then(|q| q.weekly_reset())
-                            .and_then(crate::subscriptions::parse_timestamp)
-                            .map(|t| t.unix_timestamp()),
-                        credits_only: quota.as_ref().is_some_and(|q| q.credits_only(now)),
-                        rank: order.and_then(|ids| ids.iter().position(|id| *id == a.id)),
-                        preferred: keep_fable
-                            && quota.as_ref().is_some_and(|q| {
-                                q.family_week_spent("fable", now.unix_timestamp())
-                                    || self
-                                        .clients
-                                        .share_blocks_for(
-                                            client,
-                                            &a,
-                                            Some(q),
-                                            now.unix_timestamp(),
-                                            config.settings.release(),
-                                            "fable",
-                                        )
-                                        .is_some()
-                            }),
-                    });
-                    eligible.push(a);
-                }
-                // A rate limit rests one account so the pool can rotate. With no
-                // usable account to rotate to, refusing every client for the whole
-                // rest blames a missing subscription; the upstream decides instead.
-                if !eligible.is_empty() || owner.is_some() || resting {
-                    break;
-                }
-                resting = true;
-                pool_accounts = self
-                    .accounts
-                    .resting_in(provider, route.as_deref(), Some(model))
-                    .await;
-            }
-            let strategy = config
-                .settings
-                .provider_strategies
-                .get(pool)
-                .or_else(|| config.settings.provider_strategies.get(provider.as_str()))
-                .copied()
-                .unwrap_or(config.settings.strategy);
-            let now = now.unix_timestamp();
-            if let Some(key) = session {
-                let pinned = self
-                    .affinity
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(pool, key);
-                // A pin holds unless it would spend usage credits while another
-                // account still has subscription quota, or reset-first has an
-                // eligible account with an earlier weekly reset.
-                let any_quota = candidates.iter().any(|c| !c.credits_only);
-                if let Some(index) = pinned.and_then(|id| {
-                    candidates.iter().position(|c| {
-                        c.id == id
-                            && (!c.credits_only || !any_quota)
-                            && Scheduler::pin_holds(strategy, &candidates, &id, now)
-                    })
-                }) {
-                    let mut pinned = eligible;
-                    pinned.swap(0, index);
-                    return Ok((model.into(), pinned));
-                }
-            }
-            let order = if advance_rotation {
-                self.scheduler
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .order(pool, strategy, &candidates, now)
-            } else {
-                // A reused socket only checks whether its account is still in
-                // the selected pool. Account order cannot change that pool.
-                Scheduler::default().order(pool, Strategy::FillFirst, &candidates, now)
-            };
-            for id in order {
-                if let Some(a) = eligible.iter().find(|a| a.id == id) {
-                    ordered.push(a.clone());
-                }
-            }
-            // Automatic fallback stays inside one provider's subscription pool.
-            if !ordered.is_empty() {
-                break;
-            }
-        }
-        if let (true, Some((pool, reset))) = (ordered.is_empty(), held_back) {
-            let until = time::OffsetDateTime::from_unix_timestamp(reset)
-                .ok()
-                .and_then(|t| {
-                    t.format(&time::format_description::well_known::Rfc3339)
-                        .ok()
-                })
-                .unwrap_or_default();
-            Err(format!(
-                "{} {pool} is used up until {until}; its overbooked share cap is reached or quota is reserved for other clients",
-                crate::clients::SHARE_USED_UP
-            ))
-        } else if ordered.is_empty() {
-            Err("no available subscription for this model; connect an account or wait for its quota reset".into())
-        } else {
-            Ok((model.into(), ordered))
-        }
-    }
-
-    /// The account would pay with usage credits although another eligible
-    /// account of its provider still has subscription quota for `model`.
-    pub async fn credits_avoidable(&self, account: &AccountCredential, model: &str) -> bool {
-        let now = time::OffsetDateTime::now_utc();
-        if !self
-            .quotas
-            .get(&account.id)
-            .await
-            .is_some_and(|q| q.credits_only(now))
-        {
-            return false;
-        }
-        for other in self
-            .accounts
-            .eligible_in(account.provider, account.route.as_deref(), Some(model))
-            .await
-        {
-            if other.id != account.id
-                && !self
-                    .quotas
-                    .get(&other.id)
-                    .await
-                    .is_some_and(|q| q.credits_only(now))
-                && !self.reserve_reached(&other).await
-            {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Douane leaves the account's reserve unused: an account-wide quota
-    /// window at or below it takes the account out of rotation until that
-    /// window resets. Unknown quotas never trigger it. This check only reads;
-    /// request routing uses [`Self::reserve_excludes`].
-    pub async fn reserve_reached(&self, account: &AccountCredential) -> bool {
-        let free_before = self.free_before_reset_seconds().await;
-        let snapshot = self.quotas.get(&account.id).await;
-        reserve_reached_in(
-            account.reserve(),
-            &account.reserve_windows(),
-            snapshot.as_ref(),
-            time::OffsetDateTime::now_utc(),
-            free_before,
-        )
-    }
-
-    /// Routing check for the reserve. Close to or at the reserve, a snapshot
-    /// older than a minute also starts a background quota refresh, so the
-    /// account leaves rotation in time and returns soon after its reset.
-    /// The client may not use this account: its access refuses it, or the
-    /// other holders' shares leave it nothing there.
-    pub async fn client_excludes(
-        &self,
-        client: Option<&crate::clients::Client>,
-        account: &AccountCredential,
-        model: &str,
-    ) -> bool {
-        if client.is_some_and(|c| !c.may_use(account)) {
-            return true;
-        }
-        let release = self.config.read().await.settings.release();
-        if let Some(c) = client {
-            let now = time::OffsetDateTime::now_utc().unix_timestamp();
-            if !self.borrow_open(c, account, model, now, release).await {
-                return true;
-            }
-        }
-        let snapshot = self.quotas.get(&account.id).await;
-        self.clients
-            .share_blocks_for(
-                client,
-                account,
-                snapshot.as_ref(),
-                time::OffsetDateTime::now_utc().unix_timestamp(),
-                release,
-                model,
-            )
-            .is_some()
-    }
-
-    /// Whether `client` may call `model` on `account` as far as borrowing
-    /// goes: always on an account its access allows; on a borrowed one only
-    /// for a model family whose week its home account holds back, while the
-    /// home account's own week still leaves it room.
-    async fn borrow_open(
-        &self,
-        client: &crate::clients::Client,
-        account: &AccountCredential,
-        model: &str,
-        now: i64,
-        release: crate::clients::Release,
-    ) -> bool {
-        let Some(home) = client.borrowed_home(account) else {
-            return true;
-        };
-        let Some(family) = ["fable", "opus", "sonnet"]
-            .into_iter()
-            .find(|family| model.contains(family))
-        else {
-            return false;
-        };
-        let Some(home) = self.accounts.get(home).await else {
-            return false;
-        };
-        if !client.access.allows(&home) {
-            return false;
-        }
-        let Some(quota) = self.quotas.get(&home.id).await else {
-            return false;
-        };
-        if crate::clients::account_week_spent(&quota, now)
-            || self
-                .clients
-                .share_blocks_for(Some(client), &home, Some(&quota), now, release, "")
-                .is_some()
-        {
-            return false;
-        }
-        quota.family_week_spent(family, now)
-            || self
-                .clients
-                .share_blocks_for(Some(client), &home, Some(&quota), now, release, model)
-                .is_some()
-    }
-
-    pub async fn reserve_excludes(&self, account: &AccountCredential) -> bool {
-        let free_before = self.free_before_reset_seconds().await;
-        let snapshot = self.quotas.get(&account.id).await;
-        self.reserve_excludes_with(
-            account,
-            snapshot.as_ref(),
-            time::OffsetDateTime::now_utc(),
-            free_before,
-        )
-    }
-
-    /// Seconds before an account's weekly reset when its reserve and client
-    /// shares stop applying.
-    pub async fn free_before_reset_seconds(&self) -> i64 {
-        self.config
-            .read()
-            .await
-            .settings
-            .free_before_reset_seconds()
-    }
-
-    fn reserve_excludes_with(
-        &self,
-        account: &AccountCredential,
-        snapshot: Option<&crate::subscriptions::QuotaSnapshot>,
-        now: time::OffsetDateTime,
-        free_before: i64,
-    ) -> bool {
-        let (Some(reserve), Some(snapshot)) = (account.reserve(), snapshot) else {
-            return false;
-        };
-        if snapshot.longest_window_ends_within(free_before, now.unix_timestamp()) {
-            return false;
-        }
-        let windows = account.reserve_windows();
-        let near = snapshot
-            .reserve_window_remaining(&windows, now)
-            .is_some_and(|lowest| lowest <= reserve + 10.0);
-        let stale = crate::subscriptions::parse_timestamp(&snapshot.updated_at)
-            .is_none_or(|at| now - at > time::Duration::minutes(1));
-        if near && stale {
-            self.refresh_soon(&account.id);
-        }
-        reserve_reached_in(Some(reserve), &windows, Some(snapshot), now, 0)
-    }
-
-    fn refresh_soon(&self, id: &str) {
-        let started = std::time::Instant::now();
-        let throttle = std::time::Duration::from_secs(60);
-        {
-            let mut last = self
-                .reserve_refresh
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // Expired entries go, so deleted accounts do not accumulate.
-            last.retain(|_, at| started.duration_since(*at) < throttle);
-            if last.contains_key(id) {
-                return;
-            }
-            last.insert(id.to_owned(), started);
-        }
-        let quotas = self.quotas.clone();
-        let id = id.to_owned();
-        tokio::spawn(async move {
-            let _ = quotas.refresh_background(&id).await;
-        });
-    }
-
-    /// A read asked by hand, for one account or all of them: a failure shows
-    /// at once.
-    pub async fn refresh_quotas(&self, id: Option<&str>) {
-        self.refresh_quotas_matching(|account| id.is_none_or(|id| account.id == id))
-            .await;
-    }
-
-    pub(crate) async fn refresh_quotas_matching(&self, matches: impl Fn(&AccountSummary) -> bool) {
-        use futures_util::{StreamExt, stream};
-        let ids: Vec<String> = self
-            .accounts
-            .list()
-            .await
-            .into_iter()
-            .filter(matches)
-            .map(|a| a.id)
-            .collect();
-        stream::iter(ids)
-            .for_each_concurrent(4, |id| async move {
-                let _ = self.quotas.refresh(&id).await;
-                self.observe_usage(&id).await;
-            })
-            .await;
-    }
-
-    /// Attributes the latest rise of an account's windows to its clients.
-    pub async fn observe_usage(&self, id: &str) {
-        if let Some(snapshot) = self.quotas.get(id).await {
-            self.clients
-                .observe(&snapshot, time::OffsetDateTime::now_utc().unix_timestamp());
-        }
-    }
-
-    /// The poller's pass: reads only the accounts whose snapshot is
-    /// `quota_refresh_seconds` old or whose retry delay has passed.
-    pub async fn refresh_due_quotas(&self) {
-        use futures_util::{StreamExt, stream};
-        let interval = self.config.read().await.settings.quota_refresh_seconds;
-        let interval = time::Duration::seconds(interval as i64);
-        let ids = self
-            .quotas
-            .due(interval, time::OffsetDateTime::now_utc())
-            .await;
-        stream::iter(ids)
-            .for_each_concurrent(4, |id| async move {
-                if self.quotas.refresh_background(&id).await.is_some() {
-                    self.observe_usage(&id).await;
-                }
-            })
-            .await;
-        let accounts = self.accounts.list().await;
-        let existing = accounts.iter().map(|a| a.id.clone()).collect();
-        let clients = self.clients.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            clients.forget_accounts(&existing);
-            clients.save_usage();
-            if let Err(error) = clients.drop_unreachable_shares(&accounts) {
-                tracing::warn!(%error, "unreachable client shares were not dropped");
-            }
-        })
-        .await;
-    }
-}
-
-/// A valid reserve and a snapshot whose account-wide window sits at or below
-/// it, unless the weekly reset is within `free_before` seconds. Shared by
-/// routing and the management listing.
-pub fn reserve_reached_in(
-    reserve: Option<f64>,
-    windows: &[String],
-    snapshot: Option<&crate::subscriptions::QuotaSnapshot>,
-    now: time::OffsetDateTime,
-    free_before: i64,
-) -> bool {
-    reserve
-        .filter(|percent| crate::subscriptions::valid_reserve(*percent))
-        .zip(snapshot)
-        .filter(|(_, snapshot)| {
-            !snapshot.longest_window_ends_within(free_before, now.unix_timestamp())
-        })
-        .is_some_and(|(reserve, snapshot)| snapshot.reserve_reached(reserve, windows, now))
-}
-
-/// Agent models from a `fetchAvailableModels` answer, in Antigravity's own
-/// order. Tab-completion and internal models are skipped, and an alias that
-/// repeats a display name already listed is dropped.
-fn antigravity_catalog(value: &Value) -> Vec<Model> {
-    let Some(available) = value["models"].as_object() else {
-        return vec![];
-    };
-    let hidden: BTreeSet<&str> = value["tabModelIds"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    let mut order: Vec<&str> = value["agentModelSorts"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|sort| sort["groups"].as_array())
-        .flatten()
-        .filter_map(|group| group["modelIds"].as_array())
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    let mut rest: Vec<&str> = available.keys().map(String::as_str).collect();
-    rest.sort_by_key(|id| (catalog_rank(SubscriptionProvider::Antigravity, id), *id));
-    order.extend(rest);
-    let mut seen_ids = BTreeSet::new();
-    let mut seen_names = BTreeSet::new();
-    let mut models = vec![];
-    for id in order {
-        let Some(entry) = available.get(id) else {
-            continue;
-        };
-        let Some(name) = entry["displayName"].as_str() else {
-            continue;
-        };
-        if hidden.contains(id)
-            || entry["isInternal"].as_bool() == Some(true)
-            || !seen_ids.insert(id)
-            || !seen_names.insert(name)
-        {
-            continue;
-        }
-        let bundled = catalog()
-            .iter()
-            .find(|m| m.provider == SubscriptionProvider::Antigravity && m.id == id);
-        let thinking = bundled.and_then(|m| m.thinking.clone()).or_else(|| {
-            (entry["supportsThinking"].as_bool() == Some(true)).then(|| {
-                json!({
-                    "min": entry["minThinkingBudget"].as_u64().unwrap_or(1),
-                    "dynamic_allowed": entry["thinkingBudget"].as_i64() == Some(-1),
-                })
-            })
-        });
-        models.push(Model {
-            id: id.into(),
-            provider: SubscriptionProvider::Antigravity,
-            name: name.into(),
-            context_length: entry["maxTokens"]
-                .as_u64()
-                .or_else(|| bundled.and_then(|m| m.context_length)),
-            max_output_tokens: entry["maxOutputTokens"]
-                .as_u64()
-                .or_else(|| bundled.and_then(|m| m.max_output_tokens)),
-            enabled: true,
-            upstream_id: String::new(),
-            thinking,
-            ..Model::default()
-        });
-    }
-    models
-}
-
-/// Paths of Copilot's API that douane can forward to.
-const COPILOT_PATHS: [&str; 3] = ["/v1/messages", "/responses", "/chat/completions"];
-
-/// The chat models a Copilot account's plan enables, from its `/models`
-/// answer. A model whose policy is not `enabled` is refused upstream, and
-/// one without `supported_endpoints` speaks Chat Completions only.
-pub(crate) fn copilot_catalog(value: &Value) -> Vec<Model> {
-    let Some(rows) = value["data"].as_array() else {
-        return vec![];
-    };
-    let mut models: Vec<Model> = vec![];
-    for row in rows {
-        let Some(id) = row["id"].as_str().filter(|id| !id.is_empty()) else {
-            continue;
-        };
-        if row.pointer("/policy/state").and_then(Value::as_str) != Some("enabled")
-            || row.pointer("/capabilities/type").and_then(Value::as_str) != Some("chat")
-            || models.iter().any(|m| m.id == id)
-        {
-            continue;
-        }
-        let endpoints: Vec<String> = match row["supported_endpoints"].as_array() {
-            Some(paths) => paths
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|path| COPILOT_PATHS.contains(path))
-                .map(str::to_owned)
-                .collect(),
-            None => vec!["/chat/completions".into()],
-        };
-        if endpoints.is_empty() {
-            continue;
-        }
-        let limits = row.pointer("/capabilities/limits");
-        let levels: Vec<Value> = row
-            .pointer("/capabilities/supports/reasoning_effort")
-            .and_then(Value::as_array)
-            .map(|levels| levels.iter().filter(|l| l.is_string()).cloned().collect())
-            .unwrap_or_default();
-        models.push(Model {
-            id: id.into(),
-            provider: SubscriptionProvider::Copilot,
-            name: row["name"].as_str().unwrap_or(id).into(),
-            context_length: limits.and_then(|l| {
-                l["max_context_window_tokens"]
-                    .as_u64()
-                    .or_else(|| l["max_prompt_tokens"].as_u64())
-            }),
-            max_output_tokens: limits.and_then(|l| l["max_output_tokens"].as_u64()),
-            enabled: true,
-            thinking: (!levels.is_empty()).then(|| json!({ "levels": levels })),
-            endpoints,
-            ..Model::default()
-        });
-    }
-    models
 }
 
 #[cfg(test)]
@@ -1798,6 +315,9 @@ mod tests {
         for (id, expected) in [(&ids[0], 0.0), (&ids[1], 100.0)] {
             let entry = entries.iter().find(|e| e["id"] == id.as_str()).unwrap();
             assert_eq!(entry["windows"][0]["remaining_percent"], expected, "{view}");
+            assert!(entry["error"].is_null() && entry["read_error"].is_null());
+            assert!(entry["status_reason"].is_null());
+            assert!(entry["retry_at"].is_null());
         }
         // With access restricted to the spent account, the HTTP router returns 429.
         state
@@ -2121,8 +641,24 @@ mod tests {
         state.quotas.insert_for_test(quota(&home, 40.0, 0.0)).await;
         assert!(routes("claude-fable-5-2").await.contains(&lent));
         assert_eq!(routes("claude-opus-5-5").await, [home.clone()]);
-        assert!(!state.client_excludes(Some(&pote), &state.accounts.get(&lent).await.unwrap(), "claude-fable-5-2").await);
-        assert!(state.client_excludes(Some(&pote), &state.accounts.get(&lent).await.unwrap(), "claude-opus-5-5").await);
+        assert!(
+            !state
+                .client_excludes(
+                    Some(&pote),
+                    &state.accounts.get(&lent).await.unwrap(),
+                    "claude-fable-5-2"
+                )
+                .await
+        );
+        assert!(
+            state
+                .client_excludes(
+                    Some(&pote),
+                    &state.accounts.get(&lent).await.unwrap(),
+                    "claude-opus-5-5"
+                )
+                .await
+        );
         // Without room in the home week, nothing is borrowed.
         state.quotas.insert_for_test(quota(&home, 0.0, 0.0)).await;
         assert!(!routes("claude-fable-5-2").await.contains(&lent));
@@ -2214,12 +750,115 @@ mod tests {
             accounts[0].id.clone()
         }
         assert_eq!(first(&state).await, ids[1]);
-        assert!(state.credits_avoidable(&paid, "gpt-5.5").await);
+        assert!(
+            !state
+                .can_reuse_socket(&paid.id, paid.provider, "gpt-5.5", Some("session"), None)
+                .await
+        );
+
+        let (restricted, _) = state
+            .clients
+            .create(crate::clients::ClientPatch {
+                name: Some("only paid".into()),
+                access: Some(crate::clients::Access {
+                    all: false,
+                    accounts: [ids[0].clone()].into(),
+                    pools: Default::default(),
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            state
+                .can_reuse_socket(
+                    &paid.id,
+                    paid.provider,
+                    "gpt-5.5",
+                    Some("session"),
+                    Some(&restricted)
+                )
+                .await
+        );
+        let (holder, _) = state
+            .clients
+            .create(crate::clients::ClientPatch {
+                name: Some("subscription holder".into()),
+                account_shares: Some([(ids[1].clone(), 100.0)].into()),
+                ..Default::default()
+            })
+            .unwrap();
+        state
+            .quotas
+            .insert_for_test(weekly(&ids[1], "2099-01-08T00:00:00Z"))
+            .await;
+        let (guest, _) = state
+            .clients
+            .create(crate::clients::ClientPatch {
+                name: Some("guest".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            state
+                .can_reuse_socket(
+                    &paid.id,
+                    paid.provider,
+                    "gpt-5.5",
+                    Some("session"),
+                    Some(&guest)
+                )
+                .await
+        );
+        assert!(
+            !state
+                .can_reuse_socket(
+                    &paid.id,
+                    paid.provider,
+                    "gpt-5.5",
+                    Some("session"),
+                    Some(&holder)
+                )
+                .await
+        );
 
         // Once no subscription quota remains, the pinned account pays.
         state.accounts.set_enabled(&ids[1], false).await.unwrap();
         assert_eq!(first(&state).await, ids[0]);
-        assert!(!state.credits_avoidable(&paid, "gpt-5.5").await);
+        assert!(
+            state
+                .can_reuse_socket(&paid.id, paid.provider, "gpt-5.5", Some("session"), None)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_five_hour_snapshot_routes_with_and_without_a_pin() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let account = state
+            .accounts
+            .import(json!({"type":"codex","access_token":"fixture"}), None)
+            .await
+            .unwrap();
+        let mut snapshot = weekly(&account.id, "2000-01-01T00:00:00Z");
+        snapshot.windows[0].id = "five-hour".into();
+        snapshot.windows[0].remaining_percent = Some(0.0);
+        state.quotas.insert_for_test(snapshot).await;
+        state
+            .affinity
+            .lock()
+            .unwrap()
+            .bind("codex", "cached", &account.id);
+        for session in [None, Some("cached")] {
+            let (_, candidates) = state
+                .candidates("gpt-5.5", Some("codex"), session)
+                .await
+                .unwrap();
+            assert_eq!(candidates[0].id, account.id);
+        }
     }
 
     #[tokio::test]
@@ -2318,6 +957,17 @@ mod tests {
         assert_eq!(order(&state).await.unwrap(), vec![spare.clone()]);
         let reserved = state.accounts.get(&kept).await.unwrap();
         assert!(state.reserve_reached(&reserved).await);
+        let overview = crate::quota_view::overview(
+            vec![reserved.summary()],
+            vec![state.quotas.get(&kept).await.unwrap()],
+            &state.config.read().await.settings,
+            crate::subscriptions::now(),
+        );
+        let entry = &overview["providers"][0]["entries"][0];
+        assert_eq!(entry["windows"][0]["remaining_percent"], 5.0);
+        for field in ["error", "read_error", "status_reason", "retry_at"] {
+            assert_eq!(entry.get(field), Some(&serde_json::Value::Null), "{field}");
+        }
 
         // The reserve is a hard floor: no other account means no request.
         state.accounts.set_enabled(&spare, false).await.unwrap();
@@ -2412,8 +1062,14 @@ mod tests {
         assert!(state.reserve_reached(&credential).await);
         assert!(state.reserve_refresh.lock().unwrap().is_empty());
         // Removing the account keeps the spawned refresh off the network.
+        let snapshot = state.quotas.get(&account.id).await.unwrap();
         state.accounts.delete(&account.id).await.unwrap();
-        assert!(state.reserve_excludes(&credential).await);
+        assert!(state.reserve_excludes_with(
+            &credential,
+            Some(&snapshot),
+            time::OffsetDateTime::now_utc(),
+            state.free_before_reset_seconds().await,
+        ));
         assert!(
             state
                 .reserve_refresh

@@ -91,14 +91,8 @@ impl Scheduler {
         // subscription quota, in a stable order that drains one balance first.
         let mut paid: Vec<&Candidate> = candidates.iter().filter(|a| a.credits_only).collect();
         paid.sort_by(|a, b| a.id.cmp(&b.id));
-        let mut available: Vec<&Candidate> = candidates
-            .iter()
-            .filter(|a| !a.credits_only)
-            .filter(|a| {
-                a.remaining_percent.is_none_or(|n| n > 0.0)
-                    || a.weekly_reset.is_some_and(|t| t <= now)
-            })
-            .collect();
+        let mut available: Vec<&Candidate> =
+            candidates.iter().filter(|a| !a.credits_only).collect();
         available.sort_by(|a, b| a.id.cmp(&b.id));
         let paid = paid.into_iter().map(|a| a.id.clone());
         if available.is_empty() {
@@ -209,10 +203,6 @@ mod tests {
             ranked("a", None),
             ranked("b", Some(1)),
             ranked("c", Some(0)),
-            Candidate {
-                rank: Some(0),
-                ..account("empty", Some(0.0), Some(900))
-            },
         ];
         assert_eq!(
             Scheduler::default().order("claude", Strategy::Manual, &a, 0),
@@ -271,11 +261,10 @@ mod tests {
         );
     }
     #[test]
-    fn reset_first_uses_weekly_expiry_and_skips_empty_accounts() {
+    fn reset_first_orders_eligible_accounts_by_weekly_expiry() {
         let a = vec![
             account("later", Some(90.0), Some(900)),
             account("soon", Some(30.0), Some(300)),
-            account("empty", Some(0.0), Some(100)),
         ];
         assert_eq!(
             Scheduler::default().order("claude", Strategy::ResetFirst, &a, 0),
@@ -288,7 +277,6 @@ mod tests {
             account("later", Some(90.0), Some(900)),
             account("soon", Some(30.0), Some(300)),
             account("tied", Some(50.0), Some(300)),
-            account("empty", Some(0.0), Some(100)),
         ];
         let holds = |strategy, pinned| Scheduler::pin_holds(strategy, &a, pinned, 0);
         assert!(holds(Strategy::ResetFirst, "soon"));
@@ -341,17 +329,15 @@ mod tests {
         assert_eq!(later, 10, "the final percent must keep its 90% priority");
     }
     #[test]
-    fn smart_moves_to_the_next_reset_only_after_exhaustion() {
+    fn smart_favors_the_next_eligible_reset() {
         let mut s = Scheduler::default();
         let a = vec![
-            account("first", Some(0.0), Some(3600)),
             account("second", Some(2.0), Some(86400)),
             account("later", Some(100.0), Some(6 * 86400)),
         ];
         let mut second = 0;
         for _ in 0..100 {
             let order = s.order("claude", Strategy::Smart, &a, 0);
-            assert!(!order.iter().any(|id| id == "first"));
             second += usize::from(order[0] == "second");
         }
         assert_eq!(second, 90);
@@ -419,7 +405,6 @@ mod tests {
                 paid("credits-b", Some(3600)),
                 account("quota", Some(5.0), Some(6 * 86400)),
                 paid("credits-a", Some(3600)),
-                account("empty", Some(0.0), Some(3600)),
             ];
             for _ in 0..10 {
                 assert_eq!(
@@ -428,10 +413,7 @@ mod tests {
                     "{strategy:?}"
                 );
             }
-            let only_paid = vec![
-                paid("credits", Some(3600)),
-                account("empty", Some(0.0), Some(3600)),
-            ];
+            let only_paid = vec![paid("credits", Some(3600))];
             assert_eq!(s.order("codex", strategy, &only_paid, 0), vec!["credits"]);
         }
     }

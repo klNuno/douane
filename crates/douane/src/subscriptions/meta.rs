@@ -1,6 +1,6 @@
 //! Native Muse Code subscription credentials. The device credential never
 //! doubles as an inference key, and provider bodies never become errors.
-use super::oauth::send_json;
+use super::oauth::send_json_received;
 use super::store::text;
 use super::{AccountCredential, SubscriptionError, SubscriptionTier};
 use serde_json::{Value, json};
@@ -40,8 +40,8 @@ pub(crate) async fn mint(
     client: &reqwest::Client,
     endpoint: &str,
     dca: &str,
-) -> Result<Value, SubscriptionError> {
-    let value = send_json(
+) -> Result<(Value, time::OffsetDateTime), SubscriptionError> {
+    let (value, received) = send_json_received(
         client
             .post(endpoint)
             .bearer_auth(dca)
@@ -68,7 +68,7 @@ pub(crate) async fn mint(
     if !base.starts_with("https://api.meta.ai/") && !local {
         return Err(SubscriptionError::InvalidResponse);
     }
-    Ok(value)
+    Ok((value, received))
 }
 
 pub(crate) fn apply_minted(
@@ -91,8 +91,6 @@ pub(crate) fn apply_minted(
             source: "provider_profile".into(),
         });
     account.expires_at = None;
-    account.last_error = None;
-    account.cooldown_until = None;
     Ok(())
 }
 

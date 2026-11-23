@@ -491,15 +491,16 @@ impl OAuthManager {
         if (!force && !account.needs_refresh()) || (force && account.access_token != refused) {
             return Ok(account);
         }
+        let started = account.clone();
         if account.provider == SubscriptionProvider::Meta {
             let dca = account
                 .dca_token
                 .as_deref()
                 .ok_or(SubscriptionError::NoRefreshToken)?;
-            let observed = time::OffsetDateTime::now_utc();
-            let value = super::meta::mint(&self.meta_client, &self.meta_mint_url, dca).await?;
+            let (value, observed) =
+                super::meta::mint(&self.meta_client, &self.meta_mint_url, dca).await?;
             super::meta::apply_minted(&mut account, &value)?;
-            self.store.update_credential(account).await?;
+            self.store.update_credential(&started, account).await?;
             self.remember_meta_usage(id, &value, observed).await;
             return self.store.get(id).await.ok_or(SubscriptionError::NotFound);
         }
@@ -531,13 +532,16 @@ impl OAuthManager {
         let response = match result {
             Ok(response) => response,
             Err(error) => {
-                if matches!(error, SubscriptionError::SessionRevoked) {
+                let reason = if matches!(error, SubscriptionError::SessionRevoked) {
                     self.revoked
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(id.into(), refresh_token.into());
-                }
-                let _ = self.store.mark_error(id, Some(error.to_string())).await;
+                    "authentication needs reconnecting"
+                } else {
+                    "provider request failed"
+                };
+                self.store.mark_error_for(&started, reason).await;
                 return Err(error);
             }
         };
@@ -550,10 +554,8 @@ impl OAuthManager {
             account.id_token = Some(token);
         }
         account.expires_at = expiry_from_response(&response);
-        account.last_error = None;
-        account.cooldown_until = None;
         apply_identity(&mut account);
-        self.store.update_credential(account).await?;
+        self.store.update_credential(&started, account).await?;
         self.store.get(id).await.ok_or(SubscriptionError::NotFound)
     }
 
@@ -612,8 +614,8 @@ impl OAuthManager {
 
     async fn meta_account(&self, token: Value) -> Result<AccountSummary, SubscriptionError> {
         let dca = text(&token, &["access_token"]).ok_or(SubscriptionError::InvalidResponse)?;
-        let observed = time::OffsetDateTime::now_utc();
-        let minted = super::meta::mint(&self.meta_client, &self.meta_mint_url, &dca).await?;
+        let (minted, observed) =
+            super::meta::mint(&self.meta_client, &self.meta_mint_url, &dca).await?;
         let mut value = minted.clone();
         value["type"] = json!("meta");
         value["dca_token"] = json!(dca);
@@ -914,12 +916,19 @@ impl OAuthManager {
 pub(crate) async fn send_json(
     request: reqwest::RequestBuilder,
 ) -> Result<Value, SubscriptionError> {
+    send_json_received(request).await.map(|(value, _)| value)
+}
+
+pub(super) async fn send_json_received(
+    request: reqwest::RequestBuilder,
+) -> Result<(Value, time::OffsetDateTime), SubscriptionError> {
     let mut response = request
         .timeout(Duration::from_secs(30))
         .header("Accept", "application/json")
         .send()
         .await
         .map_err(|_| SubscriptionError::Transport)?;
+    let received = time::OffsetDateTime::now_utc();
     if !response.status().is_success() {
         let status = response.status();
         let source = response.url().clone();
@@ -943,6 +952,7 @@ pub(crate) async fn send_json(
     response
         .json::<Value>()
         .await
+        .map(|value| (value, received))
         .map_err(|_| SubscriptionError::InvalidResponse)
 }
 
@@ -1990,6 +2000,12 @@ mod tests {
             ));
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let revoked = store.get(&summary.id).await.unwrap().summary();
+        assert_eq!(revoked.status, "error");
+        assert_eq!(
+            revoked.last_error.as_deref(),
+            Some("authentication needs reconnecting")
+        );
         store
             .modify(&summary.id, |account| {
                 account.refresh_token = Some("reconnected-refresh".into())
