@@ -460,7 +460,12 @@ impl Eligibility<'_> {
             return Err(Unavailable);
         }
         let quota = self.state.quotas.for_account(account).await;
+        // Observed Codex windows use the exhaustion checked in `offers`.
+        // A successful response can report zero before credits are known.
+        let use_snapshot_exhaustion = account.provider != SubscriptionProvider::Codex
+            || account.quota.last_observation_at.is_none();
         if !owner
+            && use_snapshot_exhaustion
             && quota
                 .as_ref()
                 .is_some_and(|q| q.window_exhausted(self.now) && !q.usable_credits())

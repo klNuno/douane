@@ -67,6 +67,7 @@ struct Mock {
     refusal_exhausted: AtomicBool,
     omit_refusal_usage: AtomicBool,
     exhausted_handshake: AtomicBool,
+    exhausted_success: AtomicBool,
     limit_headers: AtomicBool,
     /// Milliseconds between the HTTP body's chunks; a few by default.
     chunk_pause_ms: AtomicU64,
@@ -433,6 +434,7 @@ async fn mock_http(
     let hold = mock.hold_http.load(Ordering::Relaxed);
     let omit_content_type = mock.omit_content_type.load(Ordering::Relaxed);
     let probe_limits = mock.limit_headers.load(Ordering::Relaxed);
+    let exhausted = mock.exhausted_success.load(Ordering::Relaxed);
     // The first chunk comes at once: the pause is the silence inside the body.
     let pause = Duration::from_millis(mock.chunk_pause_ms.load(Ordering::Relaxed).max(3));
     let total = chunks.len();
@@ -464,7 +466,16 @@ async fn mock_http(
             .headers_mut()
             .insert("set-cookie", "upstream-session=fixture".parse().unwrap());
     }
+    if exhausted {
+        add_exhausted_codex_headers(&mut response);
+    }
     response
+}
+
+fn add_exhausted_codex_headers(response: &mut Response) {
+    let headers = response.headers_mut();
+    headers.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+    headers.insert("x-codex-primary-reset-at", "4102444800".parse().unwrap());
 }
 
 #[tokio::test]
@@ -626,7 +637,12 @@ async fn mock_upgrade(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let id = mock.connections.fetch_add(1, Ordering::Relaxed);
-    upgrade.on_upgrade(move |socket| mock_socket(socket, mock, headers, id))
+    let exhausted = mock.exhausted_success.load(Ordering::Relaxed);
+    let mut response = upgrade.on_upgrade(move |socket| mock_socket(socket, mock, headers, id));
+    if exhausted {
+        add_exhausted_codex_headers(&mut response);
+    }
+    response
 }
 
 async fn mock_socket(mut socket: WebSocket, mock: Arc<Mock>, headers: HeaderMap, id: usize) {
@@ -2496,6 +2512,36 @@ async fn a_refusal_names_a_used_up_window_apart_from_a_rate_limit() {
         assert!(entry["retry_at"].is_string());
         assert_eq!(entry.get("error"), Some(&Value::Null));
         assert_eq!(entry.get("read_error"), Some(&Value::Null));
+    }
+}
+
+#[tokio::test]
+async fn codex_success_at_zero_before_a_poll_keeps_routing() {
+    for websocket in [false, true] {
+        let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+        let id = &fixture.accounts[0].0;
+        fixture
+            .mock
+            .exhausted_success
+            .store(true, Ordering::Relaxed);
+        for (index, session) in ["first", "second"].into_iter().enumerate() {
+            let mut request = json!({"model":"codex/gpt-test","input":"hello"});
+            if websocket {
+                let mut socket = fixture.socket(session).await;
+                request["type"] = json!("response.create");
+                send(&mut socket, request).await;
+                let answer = terminal(&mut socket).await;
+                assert_eq!(answer["type"], "response.completed", "{session}: {answer}");
+            } else {
+                let response = fixture.post("/v1/responses", session, request).await;
+                assert_eq!(response.status(), StatusCode::OK, "{session}");
+            }
+            assert_eq!(fixture.received().len(), index + 1);
+            assert_eq!(summary(&fixture, id).await.status, "ready");
+            let snapshot = fixture.state.quotas.get(id).await.unwrap();
+            assert_eq!(snapshot.windows[0].remaining_percent, Some(0.0));
+            assert!(snapshot.credits.is_empty());
+        }
     }
 }
 

@@ -142,6 +142,11 @@ impl AccountStore {
             missing.remove(old);
             missing.remove(target);
         }
+        // A failed remap must not fall back to an unrelated local account
+        // with the same id as the exported record.
+        missing.extend(remapped.into_iter().filter_map(|(old, target)| {
+            (old != target && applied.get(&old) != Some(&target)).then_some(old)
+        }));
         Ok((results, applied, missing))
     }
 

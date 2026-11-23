@@ -442,6 +442,68 @@ async fn conflicting_remapped_client_shares_leave_accounts_and_settings_untouche
     );
 }
 #[tokio::test]
+async fn a_failed_account_remap_cannot_restore_a_client_against_a_colliding_id() {
+    let (api, _) = upstream().await;
+    let instance = Instance::new().await;
+    let existing = instance
+        .state
+        .accounts
+        .import(endpoint("local", &api.url, "fixture"), None)
+        .await
+        .unwrap();
+    let target = instance
+        .state
+        .accounts
+        .import(
+            json!({"type":"codex","access_token":"fixture","account_id":"test-identity",
+                   "base_url":api.url,"models":["gpt-test"]}),
+            Some("Local Codex".into()),
+        )
+        .await
+        .unwrap();
+    let target_path = instance
+        .directory
+        .path()
+        .join("accounts")
+        .join(format!("{}.json", target.id));
+    let stored = tokio::fs::read(&target_path).await.unwrap();
+    let mut record: Value = serde_json::from_slice(&stored).unwrap();
+    record["id"] = json!(existing.id);
+    record["name"] = json!("Imported Codex");
+    // The identity resolves to the local Codex record, whose replacement fails.
+    tokio::fs::remove_file(&target_path).await.unwrap();
+    tokio::fs::create_dir(&target_path).await.unwrap();
+
+    let (status, answer) = instance
+        .post(
+            "/admin/api/restore",
+            json!({
+                "format":"douane-export", "version":1,
+                "accounts":[record],
+                "clients":[{"id":"fixture", "name":"Fixture", "key_hash":"0".repeat(64),
+                            "key_hint":"fixture", "created_at":"2026-01-01T00:00:00Z",
+                            "access":{"all":false,"pools":[],"accounts":[existing.id]}}]
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "{answer}");
+    assert_eq!(
+        answer["error"]["message"],
+        "a restored client references an account that could not be saved"
+    );
+    assert!(instance.state.clients.list().is_empty());
+    assert!(
+        instance
+            .state
+            .accounts
+            .list()
+            .await
+            .iter()
+            .any(|a| a.id == target.id && a.name == "Local Codex")
+    );
+}
+
+#[tokio::test]
 async fn a_restored_sign_in_replaces_the_same_identity() {
     let directory = tempfile::tempdir().unwrap();
     let store = AccountStore::open(directory.path().join("accounts")).unwrap();
