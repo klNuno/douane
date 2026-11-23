@@ -1,4 +1,7 @@
 //! Persistent native Responses sockets. Backpressure propagates to the upstream socket.
+use crate::subscriptions::cooldown::{
+    QuotaScope, Refusal, Transport, classify_event, classify_http,
+};
 
 use crate::{
     relay::{self, CallGuard},
@@ -66,79 +69,6 @@ async fn previous_not_found(socket: &mut WebSocket, request: &Value) {
     }
     downstream_send(socket, Message::Text(error.to_string().into())).await;
     close_for_recovery(socket).await;
-}
-
-#[derive(Clone, Copy)]
-struct NativeFailure {
-    status: u16,
-    seconds: u64,
-    reason: &'static str,
-}
-
-fn failure_status(status: u16) -> Option<NativeFailure> {
-    match status {
-        429 => Some(NativeFailure {
-            status,
-            seconds: 60,
-            reason: "websocket upstream rate limited",
-        }),
-        401 | 403 => Some(NativeFailure {
-            status,
-            seconds: 300,
-            reason: "websocket upstream authentication failed",
-        }),
-        _ => None,
-    }
-}
-
-fn native_failure(value: &Value) -> Option<NativeFailure> {
-    if !matches!(value["type"].as_str(), Some("error" | "response.failed")) {
-        return None;
-    }
-    let error = value
-        .get("error")
-        .or_else(|| value.pointer("/response/error"))
-        .unwrap_or(value);
-    let status = value["status"]
-        .as_u64()
-        .or_else(|| error["status"].as_u64())
-        .and_then(|n| u16::try_from(n).ok());
-    let mut failure = [error["code"].as_str(), error["type"].as_str()]
-        .into_iter()
-        .flatten()
-        .find_map(|code| match code {
-            "rate_limit_exceeded" | "slow_down" => failure_status(429),
-            "usage_limit_reached"
-            | "insufficient_quota"
-            | "credit_balance_exhausted"
-            | "organization_spend_limit_exceeded"
-            | "project_spend_limit_exceeded"
-            | "quota_exceeded" => failure_status(429).map(|failure| NativeFailure {
-                reason: "websocket upstream quota exceeded",
-                ..failure
-            }),
-            "invalid_api_key"
-            | "authentication_error"
-            | "invalid_authentication"
-            | "invalid_token"
-            | "token_expired"
-            | "unauthorized" => failure_status(401),
-            _ => None,
-        })
-        .or_else(|| status.and_then(failure_status))?;
-    let seconds = error["resets_in_seconds"]
-        .as_u64()
-        .or_else(|| error["retry_after"].as_u64())
-        .or_else(|| {
-            error["resets_at"].as_i64().map(|at| {
-                at.saturating_sub(time::OffsetDateTime::now_utc().unix_timestamp())
-                    .max(1) as u64
-            })
-        });
-    if let Some(seconds) = seconds {
-        failure.seconds = seconds.clamp(1, 86_400);
-    }
-    Some(failure)
 }
 
 fn account_eligible(account: &AccountCredential, model: &str) -> bool {
@@ -252,6 +182,21 @@ async fn connect_pool(
                 tokio_tungstenite::connect_async_with_config(request, Some(config), true),
             )
             .await;
+            let received = time::OffsetDateTime::now_utc();
+            let response_headers = match &result {
+                Ok(Ok((_, response))) => Some(response.headers()),
+                Ok(Err(WsError::Http(response))) => Some(response.headers()),
+                _ => None,
+            };
+            let accepted = matches!(&result, Ok(Ok(_)));
+            if let Some(headers) = response_headers
+                && state
+                    .quotas
+                    .observe_response_headers_at(&account, headers, received, accepted)
+                    .await
+            {
+                state.observe_usage(&account.id).await;
+            }
             match result {
                 Ok(Ok((socket, _))) => return Some((account, socket)),
                 Ok(Err(WsError::Http(response)))
@@ -266,9 +211,11 @@ async fn connect_pool(
                         account = fresh;
                         continue;
                     }
-                    failed(state, &account, &response).await;
+                    failed(state, &account, model, &response, received).await;
                 }
-                Ok(Err(WsError::Http(response))) => failed(state, &account, &response).await,
+                Ok(Err(WsError::Http(response))) => {
+                    failed(state, &account, model, &response, received).await
+                }
                 _ => {
                     let _ = state
                         .accounts
@@ -286,29 +233,35 @@ async fn connect_pool(
 async fn failed(
     state: &AppState,
     account: &AccountCredential,
+    model: &str,
     response: &tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
+    received: time::OffsetDateTime,
 ) {
-    let mut failure = failure_status(response.status().as_u16()).unwrap_or(NativeFailure {
-        status: 502,
-        seconds: 15,
-        reason: "websocket upstream connection failed",
-    });
-    // Rest until the provider's own reset, as the HTTP relay does.
-    if let Some(seconds) =
-        crate::relay::cooldown_seconds(response.headers(), crate::relay::unix_now())
-    {
-        failure.seconds = seconds;
-    }
-    let _ = state
-        .accounts
-        .cooldown_with_retry_after(
-            &account.id,
-            failure.seconds,
-            failure.reason,
-            crate::relay::retry_after_seconds(response.headers(), crate::relay::unix_now())
-                .is_some(),
+    let body = response
+        .body()
+        .as_ref()
+        .and_then(|body| serde_json::from_slice(body).ok());
+    let mut refusal = classify_http(
+        account.provider,
+        model,
+        response.status().as_u16(),
+        response.headers(),
+        body.as_ref(),
+        None,
+        received,
+        Transport::WebSocket,
+    )
+    .unwrap_or_else(|| {
+        Refusal::timed(
+            received,
+            15,
+            "websocket upstream connection failed",
+            QuotaScope::Global,
+            false,
         )
-        .await;
+    });
+    refusal.budget_revision = Some(account.budget_revision);
+    let _ = state.accounts.record_refusal(&account.id, refusal).await;
 }
 
 async fn connect_replacement(
@@ -564,22 +517,7 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                                 break;
                             }
                             if pending == 0 { attempted.clear(); }
-                            let current = state.accounts.get(&account.id).await;
-                            // A resting account stays only while its pool still has nothing else.
-                            let kept = match &current {
-                                Some(a) if account_eligible(a, &requested) => true,
-                                Some(a) if account_offered(a, &requested) => state
-                                    .candidates_for(&requested, Some(provider.as_str()), session.as_deref(), client.as_ref())
-                                    .await
-                                    .is_ok_and(|(_, c)| c.first().is_some_and(|first| first.id == a.id)),
-                                _ => false,
-                            };
-                            let usable = match current.filter(|_| kept) {
-                                Some(current) => !state.reserve_excludes(&current).await
-                                    && !state.client_excludes(client.as_ref(), &current, &requested).await
-                                    && !state.credits_avoidable(&current, &requested).await,
-                                None => false,
-                            };
+                            let usable = state.can_reuse_socket(&account.id, provider, &requested, session.as_deref(), client.as_ref()).await;
                             if !usable {
                                 if has_previous(&body) {
                                     previous_not_found(&mut downstream, &body).await;
@@ -637,10 +575,11 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
             }
             message = upstream.next() => {
                 last_upstream = tokio::time::Instant::now();
+                let received = time::OffsetDateTime::now_utc();
                 match message {
                     Some(Ok(UpMessage::Text(text))) => {
                         if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                            let failure = native_failure(&value);
+                            let failure = classify_event(account.provider, &value, &model, received, Transport::WebSocket);
                             let pending = calls.values().map(VecDeque::len).sum::<usize>();
                             let can_retry = failure.is_some() && pending == 1
                                 && retry_request.is_some();
@@ -655,7 +594,10 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                             if let Some(queue) = calls.get_mut(observed_lane) {
                                 if let Some(Some(call)) = queue.front_mut() {
                                     call.observe(&value);
-                                    if let Some(failure) = failure { call.call.status = failure.status; }
+                                    if let Some(failure) = &failure {
+                                        call.call.status = failure.status;
+                                        call.fail(&failure.diagnostic);
+                                    }
                                 }
                                 if terminal {
                                     queue.pop_front();
@@ -673,7 +615,9 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                                     && state.oauth.renew_refused(&account.id, &account.access_token).await.is_ok();
                                 renewed_turn |= renewed;
                                 if !renewed {
-                                    let _ = state.accounts.cooldown(&account.id, failure.seconds, failure.reason).await;
+                                    let mut refusal = failure.refusal;
+                                    refusal.budget_revision = Some(account.budget_revision);
+                                    let _ = state.accounts.record_refusal(&account.id, refusal).await;
                                 }
                                 if can_retry {
                                     let request = retry_request.take().unwrap();

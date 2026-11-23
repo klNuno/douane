@@ -83,6 +83,22 @@
     "provider": "claude",
     "context_length": 1000000,
     "max_output_tokens": 128000,
+    "capabilities": {
+      "speed": {
+        "options": [
+          {
+            "id": "standard",
+            "label": "Standard"
+          },
+          {
+            "id": "fast",
+            "label": "Fast"
+          }
+        ],
+        "default": "standard"
+      },
+      "adaptive_thinking": true
+    },
     "thinking": {
       "zero_allowed": true,
       "dynamic_allowed": true,
@@ -101,6 +117,22 @@
     "provider": "claude",
     "context_length": 1000000,
     "max_output_tokens": 128000,
+    "capabilities": {
+      "speed": {
+        "options": [
+          {
+            "id": "standard",
+            "label": "Standard"
+          },
+          {
+            "id": "fast",
+            "label": "Fast"
+          }
+        ],
+        "default": "standard"
+      },
+      "adaptive_thinking": true
+    },
     "thinking": {
       "zero_allowed": true,
       "dynamic_allowed": true,
@@ -173,7 +205,24 @@
     "provider": "claude",
     "context_length": 1000000,
     "max_output_tokens": 128000,
+    "capabilities": {
+      "speed": {
+        "options": [
+          {
+            "id": "standard",
+            "label": "Standard"
+          },
+          {
+            "id": "fast",
+            "label": "Fast"
+          }
+        ],
+        "default": "standard"
+      },
+      "adaptive_thinking": true
+    },
     "thinking": {
+      "default": "high",
       "zero_allowed": false,
       "dynamic_allowed": true,
       "levels": [
@@ -191,6 +240,22 @@
     "provider": "claude",
     "context_length": 1000000,
     "max_output_tokens": 128000,
+    "capabilities": {
+      "speed": {
+        "options": [
+          {
+            "id": "standard",
+            "label": "Standard"
+          },
+          {
+            "id": "fast",
+            "label": "Fast"
+          }
+        ],
+        "default": "standard"
+      },
+      "adaptive_thinking": true
+    },
     "thinking": {
       "zero_allowed": false,
       "dynamic_allowed": true,

@@ -397,6 +397,68 @@ async fn exhausted_api_budget_tries_the_other_key_and_keeps_the_replacement() {
     }
 }
 
+#[tokio::test]
+async fn a_402_in_flight_cannot_rest_a_reconfigured_budget() {
+    use douane::subscriptions::EndpointPatch;
+    use tokio::sync::Notify;
+
+    for change_url in [false, true] {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (ready, _) = api(&["shared-model"]).await;
+        let refused = serve(Router::new()
+            .route("/v1/models", get(|| async { Json(json!({"data":[{"id":"shared-model"}]})) }))
+            .route("/v1/chat/completions", post({
+                let gate = (entered.clone(), release.clone());
+                move |Json(body): Json<Value>| {
+                    let (entered, release) = gate.clone();
+                    async move {
+                        if body["metadata"]["call_type"] == "main_call" {
+                            return Json(json!({"id":"chat","choices":[{"message":{"role":"assistant","content":"ok"}}]})).into_response();
+                        }
+                        entered.notify_one();
+                        release.notified().await;
+                        (StatusCode::PAYMENT_REQUIRED, Json(json!({"error":{"code":"budget_exhausted"}}))).into_response()
+                    }
+                }
+            }))).await;
+        let gateway = Gateway::new(&[endpoint("budget", &refused.url, "fixture")]).await;
+        let account = gateway.state.accounts.list().await.remove(0);
+        let body = chat("budget/shared-model");
+        let pending = gateway
+            .client
+            .post(format!("{}/v1/chat/completions", gateway.server.url))
+            .json(&body);
+        let pending = tokio::spawn(async move { pending.send().await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let patch = if change_url {
+            EndpointPatch {
+                base_url: Some(format!("{}/v1", ready.url)),
+                ..Default::default()
+            }
+        } else {
+            EndpointPatch {
+                metadata: Some([("call_type".into(), "main_call".into())].into()),
+                ..Default::default()
+            }
+        };
+        gateway
+            .state
+            .accounts
+            .update_endpoint(&account.id, patch)
+            .await
+            .unwrap();
+        release.notify_one();
+        assert_eq!(pending.await.unwrap().status(), 402);
+        let current = gateway.state.accounts.list().await.remove(0);
+        assert_eq!(current.status, "ready");
+        assert!(current.last_error.is_none());
+        assert_eq!(gateway.post("/v1/chat/completions", body).await.0, 200);
+    }
+}
+
 /// Mistral bills a key's request to the Vibe Code allowance only when the body
 /// carries `metadata.call_type`: the key holding that metadata must still get
 /// it after the other key's API budget runs out, and only that key.

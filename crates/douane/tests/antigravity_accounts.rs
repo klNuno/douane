@@ -233,6 +233,36 @@ impl Pool {
         let accounts = self.state.accounts.list().await;
         accounts.into_iter().find(|a| a.id == id).unwrap().status
     }
+
+    fn restricted_key(&self) -> String {
+        self.state
+            .clients
+            .create(douane::clients::ClientPatch {
+                name: Some("Restricted".into()),
+                access: Some(douane::clients::Access {
+                    all: false,
+                    accounts: [self.first.0.clone()].into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap()
+            .1
+    }
+
+    async fn restricted_catalog(&self, key: &str) -> Value {
+        reqwest::Client::new()
+            .get(format!("{}/v1beta/models", self.url))
+            .bearer_auth(key)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
 }
 
 #[tokio::test]
@@ -272,6 +302,55 @@ async fn argon_is_discovered_and_relayed_with_the_current_client_identity() {
     }
     assert!(pool.first.1.asked().is_empty());
     assert_eq!(pool.second.1.asked(), argon);
+}
+
+#[tokio::test]
+async fn gemini_discovery_and_family_resolution_use_only_the_clients_accounts() {
+    let family = "gemini-4-neon";
+    let high = "gemini-4-neon-high";
+    let pool = Pool::new(Plan::new(&[family], &[family]), Plan::new(&[high], &[high])).await;
+    let key = pool.restricted_key();
+    let client = reqwest::Client::new();
+    let catalog = pool.restricted_catalog(&key).await;
+    let models = catalog["models"].as_array().unwrap();
+    assert_eq!(models.len(), 1, "{catalog}");
+    assert_eq!(models[0]["name"], format!("models/{family}"));
+    assert_eq!(models[0]["displayName"], family);
+    let response = client
+        .post(format!(
+            "{}/v1beta/models/{family}-preview:generateContent",
+            pool.url
+        ))
+        .bearer_auth(&key)
+        .json(&json!({
+            "contents":[{"role":"user","parts":[{"text":"Reply OK"}]}],
+            "generationConfig":{"thinkingConfig":{"thinkingLevel":"HIGH"}}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response.text().await.unwrap()
+    );
+    assert_eq!(pool.first.1.asked(), [family]);
+    assert!(pool.second.1.asked().is_empty());
+}
+
+#[tokio::test]
+async fn a_fallback_catalog_stays_account_scoped_on_later_refreshes() {
+    let high = "gemini-4-neon-high";
+    let pool = Pool::new(Plan::new(&[], &[]), Plan::new(&[high], &[high])).await;
+    let key = pool.restricted_key();
+    let initial = pool.restricted_catalog(&key).await;
+    let models = initial["models"].as_array().unwrap();
+    assert_eq!(models.len(), 17, "{initial}");
+    assert_eq!(models[0]["name"], "models/gemini-3.8-flash-high");
+    assert_eq!(models[0]["displayName"], "Gemini 3.8 Flash");
+    pool.state.refresh_models_in(Some("antigravity")).await;
+    assert_eq!(pool.restricted_catalog(&key).await, initial);
 }
 
 #[tokio::test]

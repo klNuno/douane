@@ -11,11 +11,14 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+
+type ReadGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
 struct Fixture {
     state: Arc<AppState>,
     replies: Arc<Mutex<HashMap<String, Value>>>,
+    read_gate: Arc<Mutex<Option<ReadGate>>>,
     accounts: Vec<String>,
     tasks: Vec<JoinHandle<()>>,
     _dir: tempfile::TempDir,
@@ -38,11 +41,15 @@ impl Fixture {
                 .map(|(i, reply)| (i.to_string(), reply))
                 .collect(),
         ));
+        let read_gate: Arc<Mutex<Option<ReadGate>>> = Arc::default();
         let router = Router::new()
             .route(
                 "/models",
                 get(
-                    |State(replies): State<Arc<Mutex<HashMap<String, Value>>>>,
+                    |State((replies, gate)): State<(
+                        Arc<Mutex<HashMap<String, Value>>>,
+                        Arc<Mutex<Option<ReadGate>>>,
+                    )>,
                      Query(query): Query<HashMap<String, String>>,
                      headers: HeaderMap| async move {
                         assert_eq!(query["client_version"], "0.170.0");
@@ -50,11 +57,16 @@ impl Fixture {
                         assert_eq!(headers["user-agent"], "codex_cli_rs/0.170.0");
                         let id = headers["chatgpt-account-id"].to_str().unwrap();
                         assert_eq!(headers["authorization"], format!("Bearer fixture-{id}"));
+                        let gate = gate.lock().unwrap().take();
+                        if let Some((started, release)) = gate {
+                            started.send(()).unwrap();
+                            release.await.unwrap();
+                        }
                         Json(replies.lock().unwrap()[id].clone())
                     },
                 ),
             )
-            .with_state(replies.clone());
+            .with_state((replies.clone(), read_gate.clone()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
@@ -82,6 +94,7 @@ impl Fixture {
         Self {
             state,
             replies,
+            read_gate,
             accounts,
             tasks: vec![task],
             _dir: dir,
@@ -108,10 +121,14 @@ fn listing(id: &str, context: u64) -> Value {
 #[tokio::test]
 async fn native_catalog_only_offers_tiers_supported_by_the_clients_subscriptions() {
     let priority = json!({"id":"priority", "name":"Fast", "description":"Fixture"});
-    let ultrafast = json!({"id":"ultrafast", "name":"Ultrafast", "description":"Fixture"});
-    let model = |slug: &str, tiers: Value| json!({"slug":slug, "supported_in_api":false, "service_tiers":tiers});
+    let model = |slug: &str, tiers: Value| {
+        json!({
+            "slug":slug, "supported_in_api":false, "service_tiers":tiers,
+            "additional_speed_tiers":["fast","ultrafast"], "default_service_tier":"ultrafast"
+        })
+    };
     let f = Fixture::new(vec![
-        json!({"models":[model("gpt-6.2-sol", json!([priority, ultrafast]))]}),
+        json!({"models":[model("gpt-6.2-sol", json!([priority, "ultrafast"]))]}),
         json!({"error":"unavailable"}),
     ])
     .await;
@@ -145,6 +162,7 @@ async fn native_catalog_only_offers_tiers_supported_by_the_clients_subscriptions
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/v1/codex/models", listener.local_addr().unwrap());
+    let generic_url = url.replace("/v1/codex/models", "/v1/models");
     let mut f = f;
     let router = douane::router(f.state.clone());
     f.tasks.push(tokio::spawn(async move {
@@ -182,8 +200,9 @@ async fn native_catalog_only_offers_tiers_supported_by_the_clients_subscriptions
     assert_eq!(one["models"][0]["supported_in_api"], true);
     assert_eq!(
         one["models"][0]["service_tiers"],
-        json!([priority, ultrafast])
+        json!([priority, "ultrafast"])
     );
+    assert_eq!(one["models"][0]["default_service_tier"], "ultrafast");
     assert_eq!(one["models"][1]["slug"], "codex/gpt-6.2-sol");
     assert_eq!(one["models"][1]["visibility"], "hide");
     assert_eq!(
@@ -201,9 +220,36 @@ async fn native_catalog_only_offers_tiers_supported_by_the_clients_subscriptions
             503
         );
     }
+    let generic = |key: &str| {
+        let request = http.get(&generic_url).bearer_auth(key);
+        async move {
+            let catalog: Value = request
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            catalog["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == "codex/gpt-6.2-sol")
+                .cloned()
+                .unwrap()
+        }
+    };
+    assert!(generic(&both).await.get("service_tiers").is_none());
+    assert!(generic(&both).await["capabilities"].get("speed").is_none());
+    assert_eq!(
+        generic(&first).await["service_tiers"],
+        json!([priority, "ultrafast"])
+    );
     f.replies.lock().unwrap().insert(
         "1".into(),
-        json!({"models":[model("gpt-6.2-sol", json!([priority])),
+        json!({"models":[{"slug":"gpt-6.2-sol", "service_tiers":["priority"], "additional_speed_tiers":[{"id":"fast","name":"Fast"}]},
             model("gpt-6.2-astra", json!([priority]))]}),
     );
     f.state.refresh_models_in(Some("codex")).await;
@@ -215,7 +261,25 @@ async fn native_catalog_only_offers_tiers_supported_by_the_clients_subscriptions
         .iter()
         .find(|row| row["slug"] == "gpt-6.2-sol")
         .unwrap();
-    assert_eq!(sol["service_tiers"], json!([priority]));
+    if f.accounts[0] < f.accounts[1] {
+        assert_eq!(sol["service_tiers"], json!([priority]));
+        assert_eq!(sol["additional_speed_tiers"], json!(["fast"]));
+    } else {
+        assert_eq!(sol["service_tiers"], json!(["priority"]));
+        assert_eq!(
+            sol["additional_speed_tiers"],
+            json!([{"id":"fast","name":"Fast"}])
+        );
+    }
+    assert!(sol.get("default_service_tier").is_none());
+    let generic_sol = generic(&both).await;
+    assert_eq!(generic_sol["service_tiers"], sol["service_tiers"]);
+    let options = generic_sol["capabilities"]["speed"]["options"]
+        .as_array()
+        .unwrap();
+    assert!(options.iter().any(|option| option["id"] == "priority"));
+    assert!(options.iter().any(|option| option["id"] == "fast"));
+    assert!(!options.iter().any(|option| option["id"] == "ultrafast"));
     let mut account =
         serde_json::to_value(f.state.accounts.get(&f.accounts[1]).await.unwrap()).unwrap();
     account["models"] = json!(["gpt-6.2-astra"]);
@@ -230,7 +294,21 @@ async fn native_catalog_only_offers_tiers_supported_by_the_clients_subscriptions
         .iter()
         .find(|row| row["slug"] == "gpt-6.2-sol")
         .unwrap();
-    assert_eq!(sol["service_tiers"], json!([priority, ultrafast]));
+    assert_eq!(sol["service_tiers"], json!([priority, "ultrafast"]));
+    f.replies.lock().unwrap().insert(
+        "0".into(),
+        json!({"models":[{"slug":"gpt-6.2-sol","service_tiers":["default",priority],
+            "default_service_tier":{"id":"priority"}}]}),
+    );
+    f.state.refresh_models_in(Some("codex")).await;
+    assert_eq!(
+        get(first.clone()).await["models"][0]["default_service_tier"],
+        json!({"id":"priority"})
+    );
+    assert_eq!(
+        generic(&first).await["capabilities"]["speed"]["default"],
+        "priority"
+    );
     f.state
         .config
         .write()
@@ -244,6 +322,41 @@ async fn native_catalog_only_offers_tiers_supported_by_the_clients_subscriptions
         .insert("0".into(), json!({"models":[]}));
     f.state.refresh_models_in(Some("codex")).await;
     assert_eq!(get(first).await["models"], json!([]));
+}
+
+#[tokio::test]
+async fn a_targeted_refresh_preserves_other_pools_and_a_disable_during_discovery() {
+    let id = "codex/gpt-future";
+    let f = Fixture::new(vec![listing("gpt-future", 700000)]).await;
+    f.state.accounts.import(json!({
+        "type":"claude","access_token":"fixture","account_id":"claude-fixture","models":["claude-fable-5-2"]
+    }), None).await.unwrap();
+    f.state.refresh_models().await;
+    let (started, observed) = oneshot::channel();
+    let (release, waiting) = oneshot::channel();
+    *f.read_gate.lock().unwrap() = Some((started, waiting));
+    let state = f.state.clone();
+    let task = tokio::spawn(async move {
+        state.refresh_models_in(Some("codex")).await;
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), observed)
+        .await
+        .unwrap()
+        .unwrap();
+    f.state
+        .config
+        .write()
+        .await
+        .disabled_models
+        .insert(id.into());
+    release.send(()).unwrap();
+    task.await.unwrap();
+    let rows = f.state.models.read().await;
+    assert!(rows.iter().any(|m| m.id == id && !m.enabled));
+    assert!(
+        rows.iter()
+            .any(|m| m.id == "claude/claude-fable-5-2" && m.enabled)
+    );
 }
 
 #[tokio::test]

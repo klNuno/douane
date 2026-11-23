@@ -344,6 +344,166 @@ async fn malformed_bundles_are_refused_and_change_nothing() {
 }
 
 #[tokio::test]
+async fn client_dry_run_rejection_leaves_settings_in_memory_and_on_disk() {
+    let instance = Instance::new().await;
+    let path = instance.state.config_path.as_ref().unwrap();
+    let original = tokio::fs::read(path).await.unwrap();
+    let (status, answer) = instance
+        .post(
+            "/admin/api/restore",
+            json!({
+                "settings": true,
+                "bundle": {
+                    "format": "douane-export", "version": 1, "accounts": [],
+                    "settings": {"quota_refresh_seconds": 600},
+                    "disabled_models": ["claude/claude-fable-5-2"],
+                    "clients": [{"id":"fixture", "name":"Fixture", "key_hash":"invalid",
+                                 "key_hint":"fixture", "created_at":"2026-01-01T00:00:00Z"}]
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "{answer}");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("key hash")
+    );
+    assert_eq!(tokio::fs::read(path).await.unwrap(), original);
+    let config = instance.state.config.read().await;
+    assert_eq!(config.settings.quota_refresh_seconds, 300);
+    assert!(config.disabled_models.is_empty());
+}
+
+#[tokio::test]
+async fn conflicting_remapped_client_shares_leave_accounts_and_settings_untouched() {
+    let instance = Instance::new().await;
+    let account = instance.state.accounts.import(
+        json!({"type":"claude","access_token":"fixture","account_id":"one-identity","name":"Local"}),
+        None,
+    ).await.unwrap();
+    let record = serde_json::to_value(&instance.state.accounts.export().await[0]).unwrap();
+    let first_id = "a".repeat(48);
+    let second_id = "b".repeat(48);
+    let mut first = record.clone();
+    first["id"] = json!(first_id);
+    first["name"] = json!("First");
+    let mut second = record;
+    second["id"] = json!(second_id);
+    second["name"] = json!("Second");
+    let config_path = instance.state.config_path.as_ref().unwrap();
+    let original_settings = tokio::fs::read(config_path).await.unwrap();
+    let account_path = instance
+        .directory
+        .path()
+        .join("accounts")
+        .join(format!("{}.json", account.id));
+    let original_account = tokio::fs::read(&account_path).await.unwrap();
+    let (status, answer) = instance
+        .post(
+            "/admin/api/restore",
+            json!({
+                "settings":true,
+                "bundle":{
+                    "format":"douane-export", "version":1,
+                    "accounts":[first,second],
+                    "settings":{"quota_refresh_seconds":600},
+                    "clients":[{"id":"fixture", "name":"Fixture", "key_hash":"0".repeat(64),
+                                "key_hint":"fixture", "created_at":"2026-01-01T00:00:00Z",
+                                "account_shares":{(first_id):10.0,(second_id):95.0}}]
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "{answer}");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("conflicting account shares")
+    );
+    assert_eq!(instance.state.accounts.list().await[0].name, "Local");
+    assert!(tokio::fs::read(account_path).await.unwrap() == original_account);
+    assert!(instance.state.clients.list().is_empty());
+    assert_eq!(
+        tokio::fs::read(config_path).await.unwrap(),
+        original_settings
+    );
+    assert_eq!(
+        instance
+            .state
+            .config
+            .read()
+            .await
+            .settings
+            .quota_refresh_seconds,
+        300
+    );
+}
+#[tokio::test]
+async fn a_failed_account_remap_cannot_restore_a_client_against_a_colliding_id() {
+    let (api, _) = upstream().await;
+    let instance = Instance::new().await;
+    let existing = instance
+        .state
+        .accounts
+        .import(endpoint("local", &api.url, "fixture"), None)
+        .await
+        .unwrap();
+    let target = instance
+        .state
+        .accounts
+        .import(
+            json!({"type":"codex","access_token":"fixture","account_id":"test-identity",
+                   "base_url":api.url,"models":["gpt-test"]}),
+            Some("Local Codex".into()),
+        )
+        .await
+        .unwrap();
+    let target_path = instance
+        .directory
+        .path()
+        .join("accounts")
+        .join(format!("{}.json", target.id));
+    let stored = tokio::fs::read(&target_path).await.unwrap();
+    let mut record: Value = serde_json::from_slice(&stored).unwrap();
+    record["id"] = json!(existing.id);
+    record["name"] = json!("Imported Codex");
+    // The identity resolves to the local Codex record, whose replacement fails.
+    tokio::fs::remove_file(&target_path).await.unwrap();
+    tokio::fs::create_dir(&target_path).await.unwrap();
+
+    let (status, answer) = instance
+        .post(
+            "/admin/api/restore",
+            json!({
+                "format":"douane-export", "version":1,
+                "accounts":[record],
+                "clients":[{"id":"fixture", "name":"Fixture", "key_hash":"0".repeat(64),
+                            "key_hint":"fixture", "created_at":"2026-01-01T00:00:00Z",
+                            "access":{"all":false,"pools":[],"accounts":[existing.id]}}]
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "{answer}");
+    assert_eq!(
+        answer["error"]["message"],
+        "a restored client references an account that could not be saved"
+    );
+    assert!(instance.state.clients.list().is_empty());
+    assert!(
+        instance
+            .state
+            .accounts
+            .list()
+            .await
+            .iter()
+            .any(|a| a.id == target.id && a.name == "Local Codex")
+    );
+}
+
+#[tokio::test]
 async fn a_restored_sign_in_replaces_the_same_identity() {
     let directory = tempfile::tempdir().unwrap();
     let store = AccountStore::open(directory.path().join("accounts")).unwrap();
@@ -377,4 +537,183 @@ async fn a_restored_sign_in_replaces_the_same_identity() {
     // The change survives a reopen of the folder.
     let reopened = AccountStore::open(directory.path().join("accounts")).unwrap();
     assert_eq!(reopened.list().await[0].name, "Remote");
+}
+
+#[tokio::test]
+async fn failed_account_persist_rejects_clients_referencing_missing_account() {
+    let instance = Instance::new().await;
+    let source = tempfile::tempdir().unwrap();
+    let remote = AccountStore::open(source.path().join("accounts")).unwrap();
+    remote
+        .import(
+            json!({"type":"claude","access_token":"tok","account_id":"missing-id","name":"Blocked"}),
+            None,
+        )
+        .await
+        .unwrap();
+    let record = serde_json::to_value(&remote.export().await[0]).unwrap();
+    let blocked_id = record["id"].as_str().unwrap().to_owned();
+    // Place a directory at the target file path so persist() fails atomically.
+    std::fs::create_dir(
+        instance
+            .directory
+            .path()
+            .join("accounts")
+            .join(format!("{blocked_id}.json")),
+    )
+    .unwrap();
+    let (status, answer) = instance
+        .post(
+            "/admin/api/restore",
+            json!({
+                "bundle": {
+                    "format": "douane-export",
+                    "version": 1,
+                    "accounts": [record],
+                    "clients": [{
+                        "id": "fixture",
+                        "name": "Fixture",
+                        "key_hash": "0".repeat(64),
+                        "key_hint": "fixture",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "access": {"accounts": [blocked_id]}
+                    }]
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "{answer}");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("could not be saved")
+    );
+    assert!(instance.state.accounts.list().await.is_empty());
+    assert!(instance.state.clients.list().is_empty());
+}
+
+#[tokio::test]
+async fn prepare_failed_account_referenced_by_client_saves_nothing() {
+    let instance = Instance::new().await;
+    let source = tempfile::tempdir().unwrap();
+    let remote = AccountStore::open(source.path().join("accounts")).unwrap();
+    remote
+        .import(
+            json!({"type":"claude","access_token":"tok-good","account_id":"good-id","name":"Good"}),
+            None,
+        )
+        .await
+        .unwrap();
+    let good_record = serde_json::to_value(&remote.export().await[0]).unwrap();
+    let bad_record = json!({
+        "id": "bad-account-id",
+        "type": "claude",
+        "name": "Bad"
+    });
+    let (status, answer) = instance
+        .post(
+            "/admin/api/restore",
+            json!({
+                "bundle": {
+                    "format": "douane-export",
+                    "version": 1,
+                    "accounts": [good_record, bad_record],
+                    "clients": [{
+                        "id": "fixture",
+                        "name": "Fixture",
+                        "key_hash": "0".repeat(64),
+                        "key_hint": "fixture",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "access": {"accounts": ["bad-account-id"]}
+                    }]
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "{answer}");
+    assert_eq!(
+        answer["error"]["message"],
+        "a restored client references an account that could not be saved"
+    );
+    assert!(instance.state.accounts.list().await.is_empty());
+    assert!(instance.state.clients.list().is_empty());
+}
+
+#[tokio::test]
+async fn partial_persist_failure_referenced_by_client_reports_saved_accounts_and_errors() {
+    let instance = Instance::new().await;
+    let source = tempfile::tempdir().unwrap();
+    let remote = AccountStore::open(source.path().join("accounts")).unwrap();
+    remote
+        .import(
+            json!({"type":"claude","access_token":"tok-good","account_id":"good-id","name":"Good"}),
+            None,
+        )
+        .await
+        .unwrap();
+    remote
+        .import(
+            json!({"type":"claude","access_token":"tok-blocked","account_id":"blocked-id","name":"Blocked"}),
+            None,
+        )
+        .await
+        .unwrap();
+    let exported: Vec<Value> = remote
+        .export()
+        .await
+        .into_iter()
+        .map(|account| serde_json::to_value(account).unwrap())
+        .collect();
+    let good_record = exported
+        .iter()
+        .find(|record| record["name"] == "Good")
+        .unwrap()
+        .clone();
+    let blocked_record = exported
+        .iter()
+        .find(|record| record["name"] == "Blocked")
+        .unwrap()
+        .clone();
+    let blocked_id = blocked_record["id"].as_str().unwrap().to_owned();
+    std::fs::create_dir(
+        instance
+            .directory
+            .path()
+            .join("accounts")
+            .join(format!("{blocked_id}.json")),
+    )
+    .unwrap();
+    let (status, answer) = instance
+        .post(
+            "/admin/api/restore",
+            json!({
+                "bundle": {
+                    "format": "douane-export",
+                    "version": 1,
+                    "accounts": [good_record, blocked_record],
+                    "clients": [{
+                        "id": "fixture",
+                        "name": "Fixture",
+                        "key_hash": "0".repeat(64),
+                        "key_hint": "fixture",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "access": {"accounts": [blocked_id]}
+                    }]
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "{answer}");
+    assert_eq!(
+        answer["error"]["message"],
+        "a restored client references an account that could not be saved"
+    );
+    assert_eq!(answer["restored"], 1);
+    assert_eq!(answer["accounts"].as_array().map(Vec::len), Some(1));
+    assert_eq!(answer["errors"].as_array().map(Vec::len), Some(1));
+    assert_eq!(answer["clients"], 0);
+    assert_eq!(answer["settings"], false);
+    assert_eq!(instance.state.accounts.list().await.len(), 1);
+    assert!(instance.state.clients.list().is_empty());
 }

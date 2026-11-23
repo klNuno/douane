@@ -62,8 +62,12 @@ struct Mock {
     omit_content_type: AtomicBool,
     items_before_empty_completion: AtomicBool,
     refusal: Mutex<Option<(u16, Value)>>,
+    http_failure: Mutex<Option<Value>>,
     /// The refusal reports its Codex window at 100%, a used-up subscription.
     refusal_exhausted: AtomicBool,
+    omit_refusal_usage: AtomicBool,
+    exhausted_handshake: AtomicBool,
+    exhausted_success: AtomicBool,
     limit_headers: AtomicBool,
     /// Milliseconds between the HTTP body's chunks; a few by default.
     chunk_pause_ms: AtomicU64,
@@ -112,6 +116,7 @@ impl Fixture {
                 .route("/responses", post(mock_http).get(mock_upgrade))
                 .route("/v1/responses", post(mock_http).get(mock_upgrade))
                 .route("/v1/chat/completions", post(mock_http))
+                .route("/v1/messages", post(mock_http))
                 .route(
                     "/models",
                     get(|| async { axum::Json(json!({"models":[{"slug":"gpt-test"}]})) }),
@@ -180,6 +185,19 @@ impl Fixture {
             accounts,
             _directory: directory,
         }
+    }
+
+    async fn quotas(&self) -> Value {
+        self.client
+            .get(format!("{}/v1/quotas", self.gateway.url))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
     }
 
     async fn socket(&self, session: &str) -> ClientSocket {
@@ -279,7 +297,11 @@ impl Fixture {
 }
 
 fn account(provider: &str, name: &str, base: &str) -> Value {
-    json!({"type":provider,"access_token":format!("fixture-{name}"),"account_id":format!("identity-{name}"),"base_url":base,"models":["gpt-test"]})
+    let mut account = json!({"type":provider,"access_token":format!("fixture-{name}"),"account_id":format!("identity-{name}"),"base_url":base,"models":["gpt-test"]});
+    if provider == "claude" {
+        account["models"] = json!(["gpt-test", "claude-fable-5-2"]);
+    }
+    account
 }
 
 fn completed(stream_id: Option<&Value>) -> Value {
@@ -332,14 +354,43 @@ async fn mock_http(
         } else {
             "42"
         };
-        return (
+        let mut response = (
             StatusCode::from_u16(status).unwrap(),
             [
-                ("x-codex-primary-used-percent", used),
+                ("anthropic-ratelimit-requests-remaining", "3"),
                 ("request-id", "fixture-request"),
                 ("set-cookie", "upstream-session=fixture"),
             ],
             axum::Json(body),
+        )
+            .into_response();
+        if !mock.omit_refusal_usage.load(Ordering::Relaxed) {
+            response
+                .headers_mut()
+                .insert("x-codex-primary-used-percent", used.parse().unwrap());
+        }
+        if used == "100" {
+            response
+                .headers_mut()
+                .insert("x-codex-primary-reset-at", "4102444800".parse().unwrap());
+        }
+        return response;
+    }
+    if uri.path() == "/v1/messages" {
+        return (
+            [("anthropic-ratelimit-requests-remaining", "4")],
+            axum::Json(json!({"type":"message","role":"assistant","content":[{"type":"text","text":"OK"}]})),
+        ).into_response();
+    }
+    if let Some(failure) = mock.http_failure.lock().unwrap().as_ref() {
+        let end = if *mock.trailing_frame.lock().unwrap() {
+            ""
+        } else {
+            "\n\n"
+        };
+        return (
+            [("content-type", "text/event-stream")],
+            format!("event: error\ndata: {failure}{end}"),
         )
             .into_response();
     }
@@ -383,6 +434,7 @@ async fn mock_http(
     let hold = mock.hold_http.load(Ordering::Relaxed);
     let omit_content_type = mock.omit_content_type.load(Ordering::Relaxed);
     let probe_limits = mock.limit_headers.load(Ordering::Relaxed);
+    let exhausted = mock.exhausted_success.load(Ordering::Relaxed);
     // The first chunk comes at once: the pause is the silence inside the body.
     let pause = Duration::from_millis(mock.chunk_pause_ms.load(Ordering::Relaxed).max(3));
     let total = chunks.len();
@@ -414,7 +466,139 @@ async fn mock_http(
             .headers_mut()
             .insert("set-cookie", "upstream-session=fixture".parse().unwrap());
     }
+    if exhausted {
+        add_exhausted_codex_headers(&mut response);
+    }
     response
+}
+
+fn add_exhausted_codex_headers(response: &mut Response) {
+    let headers = response.headers_mut();
+    headers.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+    headers.insert("x-codex-primary-reset-at", "4102444800".parse().unwrap());
+}
+
+#[tokio::test]
+async fn claude_catalog_and_native_fast_mode_preserve_the_wire() {
+    let fixture = Fixture::new(
+        &[("claude", "anthropic"), ("codex", "openai")],
+        Strategy::FillFirst,
+    )
+    .await;
+    fixture.state.config.write().await.settings.default_provider = Some("codex".into());
+    let send = |model: &str, beta: &[&str], fast: bool, provider: Option<&str>| {
+        let mut body =
+            json!({"model":model,"messages":[{"role":"user","content":"hello"}],"max_tokens":16});
+        if fast {
+            body["speed"] = json!("fast");
+        }
+        let mut request = fixture
+            .client
+            .post(format!("{}/v1/messages", fixture.gateway.url))
+            .header("x-douane-model-catalog", "claude")
+            .json(&body);
+        for value in beta {
+            request = request.header("anthropic-beta", *value);
+        }
+        if let Some(provider) = provider {
+            request = request.header("x-douane-provider", provider);
+        }
+        request.send()
+    };
+    fixture.mock.limit_headers.store(true, Ordering::Relaxed);
+    let cases: [(&str, &[&str], bool, Option<&str>); 3] = [
+        (
+            "claude/claude-fable-5-2",
+            &["fast-mode-2026-02-01", "fixture-feature"],
+            true,
+            Some("codex"),
+        ),
+        (
+            "claude-fable-5-2",
+            &["oauth-2025-04-20,fast-mode-2026-02-01", "fixture-feature"],
+            true,
+            None,
+        ),
+        ("claude-fable-5-2", &[], false, None),
+    ];
+    for (model, beta, fast, provider) in cases {
+        let response = send(model, beta, fast, provider).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = fixture.mock.received.lock().unwrap();
+        let request = seen.last().unwrap();
+        assert_eq!(
+            response.headers()["anthropic-ratelimit-requests-remaining"],
+            "4"
+        );
+        assert_eq!(request.headers["authorization"], "Bearer fixture-anthropic");
+        assert_eq!(request.body["model"], "claude-fable-5-2");
+        assert_eq!(request.body["speed"].as_str(), fast.then_some("fast"));
+        let merged = request.headers["anthropic-beta"].to_str().unwrap();
+        assert!(
+            merged
+                .split(',')
+                .any(|beta| beta.trim() == "oauth-2025-04-20")
+        );
+        assert_eq!(merged.contains("fast-mode-2026-02-01"), fast);
+        assert_eq!(merged.contains("fixture-feature"), fast);
+    }
+    let refusal =
+        json!({"error":{"type":"invalid_request_error","message":"fixture fast-mode refusal"}});
+    *fixture.mock.refusal.lock().unwrap() = Some((400, refusal.clone()));
+    let response = send("claude-fable-5-2", &["fast-mode-2026-02-01"], true, None)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-requests-remaining"],
+        "3"
+    );
+    assert_eq!(response.headers()["request-id"], "fixture-request");
+    assert_eq!(response.json::<Value>().await.unwrap(), refusal);
+    let response = send("claude-fable-5-2", &[], false, Some("unknown"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["message"],
+        "unknown provider"
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_claude_model_list_preserves_known_capabilities() {
+    let fixture = Fixture::new(&[("claude", "anthropic")], Strategy::FillFirst).await;
+    let catalog: Value = fixture
+        .client
+        .get(format!("{}/v1/models", fixture.gateway.url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data = catalog["data"].as_array().unwrap();
+    let fable = data
+        .iter()
+        .find(|row| row["id"] == "claude/claude-fable-5-2")
+        .unwrap();
+    assert_eq!(
+        fable["capabilities"],
+        json!({
+            "speed":{"options":[{"id":"standard","label":"Standard"},{"id":"fast","label":"Fast"}],"default":"standard"},
+            "effort":{"levels":["low","medium","high","xhigh","max"],"default":"high"},
+            "adaptive_thinking":true
+        })
+    );
+    assert_eq!(fable["service_tiers"], json!([{"id":"fast","name":"Fast"}]));
+    let unknown = data
+        .iter()
+        .find(|row| row["id"] == "claude/gpt-test")
+        .unwrap();
+    assert!(unknown.get("capabilities").is_none());
+    assert!(unknown.get("service_tiers").is_none());
 }
 
 struct HoldProbe {
@@ -435,6 +619,16 @@ async fn mock_upgrade(
     upgrade: WebSocketUpgrade,
 ) -> Response {
     mock.handshakes.lock().unwrap().push(headers.clone());
+    if mock.exhausted_handshake.load(Ordering::Relaxed) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                ("x-codex-primary-used-percent", "100"),
+                ("x-codex-primary-reset-at", "4102444800"),
+            ],
+        )
+            .into_response();
+    }
     let refused = mock.refused_handshake.lock().unwrap().clone();
     if refused.is_some_and(|token| {
         token == "*"
@@ -443,7 +637,12 @@ async fn mock_upgrade(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let id = mock.connections.fetch_add(1, Ordering::Relaxed);
-    upgrade.on_upgrade(move |socket| mock_socket(socket, mock, headers, id))
+    let exhausted = mock.exhausted_success.load(Ordering::Relaxed);
+    let mut response = upgrade.on_upgrade(move |socket| mock_socket(socket, mock, headers, id));
+    if exhausted {
+        add_exhausted_codex_headers(&mut response);
+    }
+    response
 }
 
 async fn mock_socket(mut socket: WebSocket, mock: Arc<Mock>, headers: HeaderMap, id: usize) {
@@ -2289,7 +2488,7 @@ async fn a_refusal_names_a_used_up_window_apart_from_a_rate_limit() {
             .store(exhausted, Ordering::Relaxed);
         *fixture.mock.refusal.lock().unwrap() = Some((
             429,
-            json!({"error":{"type":"usage_limit_reached","message":"fixture limit"}}),
+            json!({"error":{"type":"rate_limit_exceeded","message":"fixture limit"}}),
         ));
         let request = json!({"model":"gpt-test","input":"hello","stream":false});
         let refused = fixture.post("/v1/responses", "limited", request).await;
@@ -2302,8 +2501,179 @@ async fn a_refusal_names_a_used_up_window_apart_from_a_rate_limit() {
             .into_iter()
             .next()
             .unwrap();
-        assert_eq!(account.status, "cooldown");
+        assert_eq!(
+            account.status,
+            if exhausted { "exhausted" } else { "cooldown" }
+        );
         assert_eq!(account.last_error.as_deref(), Some(reason));
+        let quotas = fixture.quotas().await;
+        let entry = &quotas["providers"][0]["entries"][0];
+        assert_eq!(entry["status_reason"], reason);
+        assert!(entry["retry_at"].is_string());
+        assert_eq!(entry.get("error"), Some(&Value::Null));
+        assert_eq!(entry.get("read_error"), Some(&Value::Null));
+    }
+}
+
+#[tokio::test]
+async fn codex_success_at_zero_before_a_poll_keeps_routing() {
+    for websocket in [false, true] {
+        let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+        let id = &fixture.accounts[0].0;
+        fixture
+            .mock
+            .exhausted_success
+            .store(true, Ordering::Relaxed);
+        for (index, session) in ["first", "second"].into_iter().enumerate() {
+            let mut request = json!({"model":"codex/gpt-test","input":"hello"});
+            if websocket {
+                let mut socket = fixture.socket(session).await;
+                request["type"] = json!("response.create");
+                send(&mut socket, request).await;
+                let answer = terminal(&mut socket).await;
+                assert_eq!(answer["type"], "response.completed", "{session}: {answer}");
+            } else {
+                let response = fixture.post("/v1/responses", session, request).await;
+                assert_eq!(response.status(), StatusCode::OK, "{session}");
+            }
+            assert_eq!(fixture.received().len(), index + 1);
+            assert_eq!(summary(&fixture, id).await.status, "ready");
+            let snapshot = fixture.state.quotas.get(id).await.unwrap();
+            assert_eq!(snapshot.windows[0].remaining_percent, Some(0.0));
+            assert!(snapshot.credits.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn codex_http_and_websocket_refusals_record_header_exhaustion() {
+    for websocket in [false, true] {
+        let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+        let id = &fixture.accounts[0].0;
+        let request = json!({"model":"codex/gpt-test","input":"hello"});
+        if websocket {
+            fixture
+                .mock
+                .exhausted_handshake
+                .store(true, Ordering::Relaxed);
+            let mut socket = fixture.socket("used-up").await;
+            let mut body = request.clone();
+            body["type"] = json!("response.create");
+            send(&mut socket, body).await;
+            assert_eq!(terminal(&mut socket).await["type"], "error");
+            assert_eq!(fixture.mock.handshakes.lock().unwrap().len(), 1);
+            fixture
+                .mock
+                .exhausted_handshake
+                .store(false, Ordering::Relaxed);
+        } else {
+            fixture
+                .mock
+                .refusal_exhausted
+                .store(true, Ordering::Relaxed);
+            *fixture.mock.refusal.lock().unwrap() =
+                Some((429, json!({"error":{"message":"fixture limit"}})));
+            let response = fixture
+                .post("/v1/responses", "used-up", request.clone())
+                .await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            *fixture.mock.refusal.lock().unwrap() = None;
+        }
+        let account = summary(&fixture, id).await;
+        assert!(
+            account
+                .last_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("quota exceeded"))
+        );
+        let snapshot = fixture
+            .state
+            .quotas
+            .get(id)
+            .await
+            .expect("refusal headers publish quota evidence");
+        assert_eq!(snapshot.windows[0].id, "five-hour");
+        assert_eq!(snapshot.windows[0].remaining_percent, Some(0.0));
+        assert_eq!(
+            snapshot.windows[0].reset_at.as_deref(),
+            Some("2100-01-01T00:00:00Z")
+        );
+    }
+}
+
+#[tokio::test]
+async fn headerless_codex_usage_limit_blocks_last_account_retry() {
+    let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+    fixture
+        .mock
+        .omit_refusal_usage
+        .store(true, Ordering::Relaxed);
+    *fixture.mock.refusal.lock().unwrap() =
+        Some((429, json!({"error":{"type":"usage_limit_reached"}})));
+    let request = json!({"model":"codex/gpt-test","input":"hello"});
+    let response = fixture
+        .post("/v1/responses", "used-up", request.clone())
+        .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    *fixture.mock.refusal.lock().unwrap() = None;
+    let response = fixture.post("/v1/responses", "retry", request).await;
+    assert!(!response.status().is_success());
+    assert_eq!(fixture.received().len(), 1);
+    let account = summary(&fixture, &fixture.accounts[0].0).await;
+    assert_eq!(
+        account.last_error.as_deref(),
+        Some("upstream quota exceeded")
+    );
+}
+
+#[tokio::test]
+async fn sse_refusals_are_recorded_with_or_without_a_final_separator() {
+    for stream in [false, true] {
+        for at_eof in [false, true] {
+            let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+            *fixture.mock.trailing_frame.lock().unwrap() = at_eof;
+            *fixture.mock.http_failure.lock().unwrap() = Some(json!({
+                "type":"error", "status":429,
+                "error":{"code":"usage_limit_reached","message":"private fixture body","retry_after":3600}
+            }));
+            let response = fixture
+                .post(
+                    "/v1/responses",
+                    "sse-refusal",
+                    json!({"model":"gpt-test","input":"hello","stream":stream}),
+                )
+                .await;
+            if stream {
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response.text().await.unwrap();
+                assert!(body.contains("usage_limit_reached"));
+                assert!(!body.contains("response.completed"));
+            } else {
+                assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            }
+            let account = summary(&fixture, &fixture.accounts[0].0).await;
+            assert_eq!(account.status, "cooldown");
+            assert_eq!(
+                account.last_error.as_deref(),
+                Some("upstream quota exceeded")
+            );
+            let quotas = fixture.quotas().await;
+            let entry = &quotas["providers"][0]["entries"][0];
+            assert_eq!(entry["status_reason"], "upstream quota exceeded");
+            assert!(entry["retry_at"].is_string());
+            assert_eq!(entry.get("error"), Some(&Value::Null));
+            assert_eq!(entry.get("read_error"), Some(&Value::Null));
+            fixture.state.ledger.flush().await;
+            let ledger = fixture.state.ledger.calls(1).await;
+            assert_eq!(ledger[0].status, 429);
+            assert!(
+                !ledger[0]
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("private fixture body")
+            );
+        }
     }
 }
 
