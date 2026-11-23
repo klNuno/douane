@@ -2726,3 +2726,125 @@ async fn codex_usage_credits_keep_an_exhausted_account_selectable() {
         assert_eq!(status == "exhausted", !selectable, "{credits}");
     }
 }
+
+#[test]
+fn claude_fallback_limit_kinds_do_not_collide_with_standard_windows() {
+    let items: Vec<Value> = (0..8)
+        .map(|i| json!({"utilization": (i + 1) * 10, "resets_at": "2030-01-01T05:00:00Z"}))
+        .collect();
+    let windows = parse_claude(&json!({"limits": items}), observed());
+    assert!(
+        windows
+            .iter()
+            .all(|w| w.id != "five-hour" && w.id != "seven-day"),
+        "fallback limit-5/limit-7 must not masquerade as five-hour/seven-day: {windows:?}"
+    );
+    let upper = parse_claude(
+        &json!({
+            "limits": [
+                {"kind": "Session", "utilization": 25, "resets_at": "2030-01-01T05:00:00Z"},
+                {"kind": "Weekly", "utilization": 40, "resets_at": "2030-01-08T00:00:00Z"}
+            ]
+        }),
+        observed(),
+    );
+    assert!(upper.iter().any(|w| w.id == "five-hour"));
+    assert!(upper.iter().any(|w| w.id == "seven-day"));
+}
+
+#[tokio::test]
+async fn meta_weekly_and_seven_day_window_stay_distinct() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+    let account = store
+        .import(
+            json!({"type":"meta","access_token":"fixture","account_id":"m","name":"m"}),
+            None,
+        )
+        .await
+        .unwrap();
+    let service = QuotaService::new(reqwest::Client::new(), store.clone());
+    service
+        .observe_meta_event(
+            &account.id,
+            &json!({
+                "subscription": {
+                    "weekly": {"used_percent": 100.0, "resets_at": 1893456000},
+                    "window": {"used_percent": 50.0, "window_duration_mins": 10080, "resets_at": 1893456000}
+                }
+            }),
+        )
+        .await;
+    let snapshot = service.get(&account.id).await.unwrap();
+    assert_eq!(snapshot.windows.len(), 2, "{:?}", snapshot.windows);
+    let weekly = snapshot.windows.iter().find(|w| w.id == "weekly").unwrap();
+    let session = snapshot
+        .windows
+        .iter()
+        .find(|w| w.id == "window-604800s")
+        .unwrap();
+    assert_eq!(weekly.remaining_percent, Some(0.0));
+    assert_eq!(session.remaining_percent, Some(50.0));
+}
+
+#[tokio::test]
+async fn fresh_zero_with_inherited_reset_is_recorded_for_confirmed_reset() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+    let account = store
+        .import(
+            json!({"type":"claude","access_token":"fixture","account_id":"c","name":"c"}),
+            None,
+        )
+        .await
+        .unwrap();
+    let service = QuotaService::new(reqwest::Client::new(), store.clone());
+    let reset = timestamp(time::OffsetDateTime::now_utc() + time::Duration::hours(4));
+    let first = QuotaSnapshot {
+        account_id: account.id.clone(),
+        provider: SubscriptionProvider::Claude,
+        windows: vec![QuotaWindow {
+            id: "five-hour".into(),
+            label: "5 hours".into(),
+            remaining_percent: Some(20.0),
+            reset_at: Some(reset.clone()),
+            used: Some(80.0),
+            limit: Some(100.0),
+        }],
+        updated_at: timestamp(time::OffsetDateTime::now_utc() - time::Duration::minutes(2)),
+        error: None,
+        subscription: None,
+        credits: Vec::new(),
+        verification_required: false,
+        verification_available: false,
+    };
+    let started = store.get(&account.id).await.unwrap();
+    service
+        .apply_observation(&account.id, &first, None, &started)
+        .await
+        .unwrap();
+    let zero_without_reset = QuotaSnapshot {
+        windows: vec![QuotaWindow {
+            id: "five-hour".into(),
+            label: "5 hours".into(),
+            remaining_percent: Some(0.0),
+            reset_at: None,
+            used: Some(100.0),
+            limit: Some(100.0),
+        }],
+        updated_at: now(),
+        ..first
+    };
+    let started = store.get(&account.id).await.unwrap();
+    service
+        .apply_observation(&account.id, &zero_without_reset, None, &started)
+        .await
+        .unwrap();
+    let stored = store.get(&account.id).await.unwrap();
+    let zero = stored
+        .quota
+        .zeros
+        .get("five-hour")
+        .expect("zero with inherited reset_at must be tracked");
+    assert_eq!(zero.window.reset_at.as_deref(), Some(reset.as_str()));
+}

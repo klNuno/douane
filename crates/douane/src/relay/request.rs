@@ -446,8 +446,13 @@ fn merge_anthropic_betas(headers: &mut HeaderMap) {
         .flat_map(|value| value.split(',').map(str::trim))
         .filter(|beta| !beta.is_empty())
         .collect();
-    if !betas.contains(&"oauth-2025-04-20") {
-        betas.splice(..0, ["oauth-2025-04-20", "claude-code-20250219"]);
+    for required in ["oauth-2025-04-20", "claude-code-20250219"]
+        .into_iter()
+        .rev()
+    {
+        if !betas.contains(&required) {
+            betas.insert(0, required);
+        }
     }
     if let Ok(value) = betas.join(",").parse() {
         headers.insert("anthropic-beta", value);
@@ -848,5 +853,35 @@ impl RelayRequest {
             request_headers,
             bytes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_anthropic_betas_keeps_both_baselines_without_duplicates() {
+        let mut oauth_only = HeaderMap::new();
+        oauth_only.insert(
+            "anthropic-beta",
+            header::HeaderValue::from_static("oauth-2025-04-20,fast-mode-2026-02-01"),
+        );
+        merge_anthropic_betas(&mut oauth_only);
+        assert_eq!(
+            oauth_only.get("anthropic-beta").unwrap(),
+            "claude-code-20250219,oauth-2025-04-20,fast-mode-2026-02-01"
+        );
+
+        let mut claude_only = HeaderMap::new();
+        claude_only.insert(
+            "anthropic-beta",
+            header::HeaderValue::from_static("claude-code-20250219,fast-mode-2026-02-01"),
+        );
+        merge_anthropic_betas(&mut claude_only);
+        assert_eq!(
+            claude_only.get("anthropic-beta").unwrap(),
+            "oauth-2025-04-20,claude-code-20250219,fast-mode-2026-02-01"
+        );
     }
 }

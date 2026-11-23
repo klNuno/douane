@@ -516,11 +516,17 @@ pub(super) fn parse_claude(value: &Value, observed: time::OffsetDateTime) -> Vec
             let model = model
                 .as_deref()
                 .map(|id| crate::subscriptions::cooldown::claude_family(id).unwrap_or(id));
-            let kind = text(window, &["kind", "group"]).unwrap_or_else(|| format!("limit-{index}"));
+            let explicit_kind = text(window, &["kind", "group"]);
+            let kind = explicit_kind
+                .clone()
+                .unwrap_or_else(|| format!("limit-{index}"));
+            let lower = kind.to_ascii_lowercase();
             // Claude names its five-hour window "session" in this list.
-            let id = if kind.contains("5") || kind.contains("five") || kind.contains("session") {
+            let id = if explicit_kind.is_some()
+                && (lower.contains('5') || lower.contains("five") || lower.contains("session"))
+            {
                 "five-hour".into()
-            } else if kind.contains("7") || kind.contains("week") {
+            } else if explicit_kind.is_some() && (lower.contains('7') || lower.contains("week")) {
                 model
                     .map(|m| format!("seven-day-{m}"))
                     .unwrap_or_else(|| "seven-day".into())
@@ -558,7 +564,6 @@ pub(super) fn parse_claude(value: &Value, observed: time::OffsetDateTime) -> Vec
     windows
 }
 
-/// Snapshots a previous run saved; none when the file is missing or unreadable.
 /// The five-hour and weekly windows of Claude's unified rate-limit headers:
 /// utilization is a fraction, resets are Unix seconds.
 pub(super) fn claude_header_windows(headers: &reqwest::header::HeaderMap) -> Vec<QuotaWindow> {

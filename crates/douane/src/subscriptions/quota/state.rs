@@ -85,12 +85,22 @@ impl QuotaService {
                 source["window_duration_mins"]
                     .as_u64()
                     .filter(|n| *n > 0 && *n < 525600)
-                    .map(|n| match n {
-                        300 => "five-hour".into(),
-                        1440 => "daily".into(),
-                        10080 => "weekly".into(),
-                        38880..=46080 => "monthly".into(),
-                        n => format!("window-{}s", n * 60),
+                    .map(|n| {
+                        let candidate = match n {
+                            300 => "five-hour".into(),
+                            1440 => "daily".into(),
+                            10080 => "weekly".into(),
+                            38880..=46080 => "monthly".into(),
+                            n => format!("window-{}s", n * 60),
+                        };
+                        if windows
+                            .iter()
+                            .any(|existing: &QuotaWindow| existing.id == candidate)
+                        {
+                            format!("window-{}s", n * 60)
+                        } else {
+                            candidate
+                        }
                     })
                     .unwrap_or_else(|| default_id.into())
             } else {
@@ -438,7 +448,7 @@ fn merge_windows(
                 .insert(position.min(snapshot.windows.len()), window.clone()),
         }
         if evidence.remaining_percent.is_some() {
-            accepted.push(evidence);
+            accepted.push(window);
         }
     }
     (accepted, durable_change)
