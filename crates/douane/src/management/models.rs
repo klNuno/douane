@@ -369,8 +369,8 @@ fn effort_capability(thinking: Option<&Value>) -> Option<Value> {
     Some(effort)
 }
 
-/// A model's effort levels as the Grok CLI lists them: highest first, `high`
-/// flagged as the default when the model offers it. Null without levels.
+/// A model's effort levels as the Grok CLI lists them: highest first, the
+/// thinking default (or `high`) flagged. Null without levels.
 fn reasoning_efforts(thinking: Option<&Value>) -> Option<Value> {
     let thinking = thinking?;
     let levels: Vec<&str> = thinking
@@ -462,8 +462,8 @@ mod tests {
                 {"value":"none","label":"None"}
             ])
         );
-        // A model without a level scale offers no effort, and none is flagged
-        // when `high` is not on the scale.
+        // A model without a level scale offers no effort; without a thinking
+        // default, `high` is flagged when on the scale and none otherwise.
         for thinking in [None, Some(json!({"min":1024,"max":128000}))] {
             assert_eq!(
                 public_model(&model(thinking), false, None)["reasoning_efforts"],
@@ -478,6 +478,15 @@ mod tests {
         assert_eq!(
             unflagged["reasoning_efforts"],
             json!([{"value":"low","label":"Low"},{"value":"minimal","label":"Minimal"}])
+        );
+        let explicit_default = public_model(
+            &model(Some(json!({"levels":["low","high"],"default":"low"}))),
+            false,
+            None,
+        );
+        assert_eq!(
+            explicit_default["reasoning_efforts"],
+            json!([{"value":"high","label":"High"},{"value":"low","label":"Low","default":true}])
         );
     }
 

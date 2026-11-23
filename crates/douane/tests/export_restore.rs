@@ -592,3 +592,128 @@ async fn failed_account_persist_rejects_clients_referencing_missing_account() {
     assert!(instance.state.accounts.list().await.is_empty());
     assert!(instance.state.clients.list().is_empty());
 }
+
+#[tokio::test]
+async fn prepare_failed_account_referenced_by_client_saves_nothing() {
+    let instance = Instance::new().await;
+    let source = tempfile::tempdir().unwrap();
+    let remote = AccountStore::open(source.path().join("accounts")).unwrap();
+    remote
+        .import(
+            json!({"type":"claude","access_token":"tok-good","account_id":"good-id","name":"Good"}),
+            None,
+        )
+        .await
+        .unwrap();
+    let good_record = serde_json::to_value(&remote.export().await[0]).unwrap();
+    let bad_record = json!({
+        "id": "bad-account-id",
+        "type": "claude",
+        "name": "Bad"
+    });
+    let (status, answer) = instance
+        .post(
+            "/admin/api/restore",
+            json!({
+                "bundle": {
+                    "format": "douane-export",
+                    "version": 1,
+                    "accounts": [good_record, bad_record],
+                    "clients": [{
+                        "id": "fixture",
+                        "name": "Fixture",
+                        "key_hash": "0".repeat(64),
+                        "key_hint": "fixture",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "access": {"accounts": ["bad-account-id"]}
+                    }]
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "{answer}");
+    assert_eq!(
+        answer["error"]["message"],
+        "a restored client references an account that could not be saved"
+    );
+    assert!(instance.state.accounts.list().await.is_empty());
+    assert!(instance.state.clients.list().is_empty());
+}
+
+#[tokio::test]
+async fn partial_persist_failure_referenced_by_client_reports_saved_accounts_and_errors() {
+    let instance = Instance::new().await;
+    let source = tempfile::tempdir().unwrap();
+    let remote = AccountStore::open(source.path().join("accounts")).unwrap();
+    remote
+        .import(
+            json!({"type":"claude","access_token":"tok-good","account_id":"good-id","name":"Good"}),
+            None,
+        )
+        .await
+        .unwrap();
+    remote
+        .import(
+            json!({"type":"claude","access_token":"tok-blocked","account_id":"blocked-id","name":"Blocked"}),
+            None,
+        )
+        .await
+        .unwrap();
+    let exported: Vec<Value> = remote
+        .export()
+        .await
+        .into_iter()
+        .map(|account| serde_json::to_value(account).unwrap())
+        .collect();
+    let good_record = exported
+        .iter()
+        .find(|record| record["name"] == "Good")
+        .unwrap()
+        .clone();
+    let blocked_record = exported
+        .iter()
+        .find(|record| record["name"] == "Blocked")
+        .unwrap()
+        .clone();
+    let blocked_id = blocked_record["id"].as_str().unwrap().to_owned();
+    std::fs::create_dir(
+        instance
+            .directory
+            .path()
+            .join("accounts")
+            .join(format!("{blocked_id}.json")),
+    )
+    .unwrap();
+    let (status, answer) = instance
+        .post(
+            "/admin/api/restore",
+            json!({
+                "bundle": {
+                    "format": "douane-export",
+                    "version": 1,
+                    "accounts": [good_record, blocked_record],
+                    "clients": [{
+                        "id": "fixture",
+                        "name": "Fixture",
+                        "key_hash": "0".repeat(64),
+                        "key_hint": "fixture",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "access": {"accounts": [blocked_id]}
+                    }]
+                }
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "{answer}");
+    assert_eq!(
+        answer["error"]["message"],
+        "a restored client references an account that could not be saved"
+    );
+    assert_eq!(answer["restored"], 1);
+    assert_eq!(answer["accounts"].as_array().map(Vec::len), Some(1));
+    assert_eq!(answer["errors"].as_array().map(Vec::len), Some(1));
+    assert_eq!(answer["clients"], 0);
+    assert_eq!(answer["settings"], false);
+    assert_eq!(instance.state.accounts.list().await.len(), 1);
+    assert!(instance.state.clients.list().is_empty());
+}

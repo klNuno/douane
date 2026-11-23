@@ -55,8 +55,13 @@ pub async fn restore(State(state): State<Arc<AppState>>, Json(body): Json<Value>
     };
     let (results, renamed, missing) = match state
         .accounts
-        .restore_batch(plan.accounts, |remapped| {
+        .restore_batch(plan.accounts, |remapped, prepare_missing| {
             if let Some(clients) = &plan.clients {
+                if client_references_missing(clients, prepare_missing) {
+                    return Err(
+                        "a restored client references an account that could not be saved".into(),
+                    );
+                }
                 state.clients.restore(clients.clone(), remapped, true)?;
             }
             Ok(())
@@ -91,6 +96,21 @@ pub async fn restore(State(state): State<Arc<AppState>>, Json(body): Json<Value>
         .transpose()
     {
         Ok(count) => count.unwrap_or(0),
+        Err(message) if !accounts.is_empty() => {
+            super::accounts::refresh_imported_accounts(&state, &accounts).await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {"message": message},
+                    "restored": accounts.len(),
+                    "accounts": accounts,
+                    "errors": errors,
+                    "settings": false,
+                    "clients": 0,
+                })),
+            )
+                .into_response();
+        }
         Err(message) => return error(StatusCode::BAD_REQUEST, &message),
     };
     let accepted = !accounts.is_empty() || errors.is_empty();

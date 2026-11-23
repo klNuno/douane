@@ -151,10 +151,7 @@ impl QuotaService {
         Some(self.refresh_with(id, Trigger::Background).await)
     }
 
-    /// Claude answers every inference call with its five-hour and weekly
-    /// usage. Those headers keep both windows current between usage reads,
-    /// and the poller waits a full interval after them, so an account in use
-    /// rarely needs the usage endpoint Anthropic can refuse with 429.
+    /// Accounts the poller should read now: a failing one once its retry
     /// delay has passed, a healthy one once its snapshot is `interval` old.
     /// Retry state of deleted accounts goes.
     pub async fn due(&self, interval: time::Duration, now: time::OffsetDateTime) -> Vec<String> {

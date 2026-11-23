@@ -75,7 +75,10 @@ impl AccountStore {
     pub(crate) async fn restore_batch(
         &self,
         records: &[Value],
-        validate: impl FnOnce(&BTreeMap<String, String>) -> Result<(), String>,
+        validate: impl FnOnce(
+            &BTreeMap<String, String>,
+            &std::collections::BTreeSet<String>,
+        ) -> Result<(), String>,
     ) -> Result<
         (
             Vec<Result<AccountSummary, SubscriptionError>>,
@@ -87,6 +90,7 @@ impl AccountStore {
         let mut accounts = self.accounts.write().await;
         let mut proposed = accounts.clone();
         let mut remapped = BTreeMap::new();
+        let mut prepare_missing = std::collections::BTreeSet::new();
         let pending: Vec<_> = records
             .iter()
             .map(|record| {
@@ -99,12 +103,21 @@ impl AccountStore {
                         proposed.insert(account.id.clone(), account.clone());
                         Ok(account)
                     }
-                    Err(error) => Err(error),
+                    Err(error) => {
+                        if let Some(old) = old.as_ref().filter(|id| !accounts.contains_key(*id)) {
+                            prepare_missing.insert(old.clone());
+                        }
+                        Err(error)
+                    }
                 };
                 (old, account)
             })
             .collect();
-        validate(&remapped)?;
+        for (old, target) in &remapped {
+            prepare_missing.remove(old);
+            prepare_missing.remove(target);
+        }
+        validate(&remapped, &prepare_missing)?;
         let mut applied = BTreeMap::new();
         let mut missing = std::collections::BTreeSet::new();
         let results = pending
