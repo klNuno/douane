@@ -285,7 +285,6 @@ async fn account_update_is_atomic_persisted_and_survives_credential_refresh() {
             &imported.id,
             Some("New label".into()),
             Some(false),
-            None,
             Some(Some(5.0)),
             Some(vec!["weekly".into(), "five-hour".into(), "weekly".into()]),
         )
@@ -317,24 +316,17 @@ async fn account_update_is_atomic_persisted_and_survives_credential_refresh() {
     );
     assert!(matches!(
         reopened
-            .update(
-                &imported.id,
-                None,
-                None,
-                None,
-                None,
-                Some(vec!["hourly".into()])
-            )
+            .update(&imported.id, None, None, None, Some(vec!["hourly".into()]))
             .await,
         Err(SubscriptionError::InvalidReserveWindows)
     ));
     let longest = reopened
-        .update(&imported.id, None, None, None, None, Some(vec![]))
+        .update(&imported.id, None, None, None, Some(vec![]))
         .await
         .unwrap();
     assert!(longest.reserve_windows.is_empty());
     let cleared = reopened
-        .update(&imported.id, None, None, None, Some(None), None)
+        .update(&imported.id, None, None, Some(None), None)
         .await
         .unwrap();
     assert_eq!(cleared.reserve_percent, None);
@@ -342,7 +334,7 @@ async fn account_update_is_atomic_persisted_and_survives_credential_refresh() {
     for invalid in [-1.0, 0.0, 100.0, f64::NAN, f64::INFINITY] {
         assert!(matches!(
             reopened
-                .update(&imported.id, None, None, None, Some(Some(invalid)), None)
+                .update(&imported.id, None, None, Some(Some(invalid)), None)
                 .await,
             Err(SubscriptionError::InvalidReserve)
         ));
@@ -384,35 +376,31 @@ async fn reimport_without_a_label_preserves_the_renamed_account() {
 }
 
 #[tokio::test]
-async fn a_hidden_account_stays_hidden_and_routable_through_reload_and_reimport() {
+async fn legacy_hidden_accounts_remain_routable_without_persisting_visibility() {
     let directory = tempfile::tempdir().unwrap();
     let store = AccountStore::open(directory.path()).unwrap();
-    let fixture = json!({"type":"codex","access_token":"fixture","account_id":"fixture-account"});
-    let account = store.import(fixture, None).await.unwrap();
-    assert!(!account.hidden);
-    let hidden = store
-        .update(&account.id, None, None, Some(true), None, None)
-        .await
-        .unwrap();
-    assert!(hidden.hidden && hidden.enabled);
+    let mut fixture =
+        json!({"type":"codex","access_token":"fixture","account_id":"fixture-account"});
+    let account = store.import(fixture.clone(), None).await.unwrap();
+    let path = directory.path().join(format!("{}.json", account.id));
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["hidden"] = json!(true);
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let reopened = AccountStore::open(directory.path()).unwrap();
     assert_eq!(
-        store
+        reopened
             .eligible(SubscriptionProvider::Codex, None)
             .await
             .len(),
         1
     );
-    let reopened = AccountStore::open(directory.path()).unwrap();
-    assert!(reopened.list().await[0].hidden);
-    let rotated = json!({"type":"codex","access_token":"rotated","account_id":"fixture-account"});
-    assert!(reopened.import(rotated, None).await.unwrap().hidden);
-    let shown = reopened
-        .update(&account.id, None, None, Some(false), None, None)
-        .await
-        .unwrap();
-    assert!(!shown.hidden);
-    let raw = fs::read_to_string(directory.path().join(format!("{}.json", account.id))).unwrap();
-    assert!(!raw.contains("hidden"));
+    let summaries = serde_json::to_value(reopened.list().await).unwrap();
+    assert!(summaries[0].get("hidden").is_none());
+    fixture["access_token"] = json!("rotated");
+    let updated = reopened.import(fixture, None).await.unwrap();
+    assert_eq!(updated.id, account.id);
+    let record: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert!(record.get("hidden").is_none());
 }
 
 #[tokio::test]

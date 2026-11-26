@@ -23,9 +23,9 @@ const accounts = [
 	account('acc-claude-work', 'claude', 'Work', { email: 'alex.work@example.com', subscription: tier('ultra', 'Claude Ultra', 20) }),
 	account('acc-claude-studio', 'claude', 'Studio', { email: 'studio@example.com', subscription: tier('ultra', 'Claude Ultra', 20) }),
 	account('acc-claude-side', 'claude', 'Side', { email: 'side@example.com', subscription: tier('pro', 'Claude Pro') }),
-	// Off the Quotas page: one the provider revoked, one the user hid.
+	// Off the Quotas page because the provider revoked the session.
 	account('acc-claude-old', 'claude', 'Old', { email: 'old@example.com', subscription: tier('pro', 'Claude Pro'), enabled: false, status: 'disabled', last_error: "the provider revoked this account's session; reconnect the account" }),
-	account('acc-claude-spare', 'claude', 'Spare', { email: 'spare@example.com', subscription: tier('ultra', 'Claude Ultra', 20), hidden: true }),
+	account('acc-claude-spare', 'claude', 'Spare', { email: 'spare@example.com', subscription: tier('ultra', 'Claude Ultra', 20) }),
 	account('acc-codex', 'codex', 'ChatGPT', { email: 'alex@example.com', subscription: tier('pro', 'Codex Pro', null, 20) }),
 	account('acc-codex-plus', 'codex', 'Plus', { email: 'plus@example.com', subscription: tier('plus', 'Codex Plus', null, 1) }),
 	account('acc-grok', 'xai', 'SuperGrok', { subscription: tier('supergrok', 'SuperGrok') }),
@@ -236,7 +236,7 @@ function api(method, path, body, query = new URLSearchParams()) {
 	const owned = path.match(/^\/accounts\/([^/]+)$/);
 	const patched = owned && accounts.find((a) => a.id === decodeURIComponent(owned[1]));
 	if (method === 'PATCH' && patched) {
-		for (const key of ['name', 'enabled', 'hidden']) if (body?.[key] !== undefined) patched[key] = body[key];
+		for (const key of ['name', 'enabled']) if (body?.[key] !== undefined) patched[key] = body[key];
 		patched.status = patched.enabled ? 'ready' : 'disabled';
 		return { account: patched };
 	}

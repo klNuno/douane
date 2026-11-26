@@ -19,7 +19,6 @@ impl AccountStore {
             account.id = previous.id.clone();
             account.created_at = previous.created_at.clone();
             account.enabled = previous.enabled;
-            account.hidden = previous.hidden;
             account.reserve_percent = previous.reserve_percent;
             account.reserve_windows = previous.reserve_windows.clone();
             account.quota = previous.quota.clone();
@@ -588,7 +587,6 @@ pub(super) fn parse_import(
         dialect,
         image_limit,
         metadata: BTreeMap::new(),
-        hidden: false,
     };
     apply_identity(&mut account);
     account.name = name

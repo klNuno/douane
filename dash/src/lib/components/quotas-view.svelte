@@ -12,7 +12,7 @@
 	import { addDays, day, midnight } from '$lib/pool-format';
 	import { historyRequests } from '$lib/pool';
 	import { t } from '$lib/i18n.svelte';
-	let { accounts, quotas, providers = [], busy, refresh, resetUpdated, settings, manageAccounts }: { accounts: Account[]; quotas: Quota[]; providers?: Provider[]; busy: string; refresh: (id?: string) => void; resetUpdated: () => Promise<void>; settings: Settings | null; manageAccounts: () => void } = $props();
+	let { accounts, hiddenAccountIds, quotas, providers = [], busy, refresh, resetUpdated, settings, manageAccounts }: { accounts: Account[]; hiddenAccountIds: ReadonlySet<string>; quotas: Quota[]; providers?: Provider[]; busy: string; refresh: (id?: string) => void; resetUpdated: () => Promise<void>; settings: Settings | null; manageAccounts: () => void } = $props();
 	const TOOLBAR_GAP = 20;
 	let provider = $state('all');
 	let search = $state('');
@@ -21,7 +21,7 @@
 	// A compatible endpoint can have a billing API even though its group has no shared quota API.
 	let unreported = $derived(new Set(providers.filter(p => !p.quota).map(p => p.id)));
 	// Disabled accounts and those hidden in Accounts stay off this page, pool included.
-	let shown = $derived(accounts.filter(a => a.enabled && !a.hidden));
+	let shown = $derived(accounts.filter(a => a.enabled && !hiddenAccountIds.has(a.id)));
 	let supported = $derived(shown.filter(a => a.quota_supported ?? !unreported.has(a.provider)));
 	let providerIds = $derived([...new Set(supported.map(a => a.provider))].sort((a, b) => (order.indexOf(a) < 0 ? 99 : order.indexOf(a)) - (order.indexOf(b) < 0 ? 99 : order.indexOf(b)) || providerName(a).localeCompare(providerName(b))));
 	let filtered = $derived(supported.filter(a => (provider === 'all' || !providerIds.includes(provider) || a.provider === provider) && `${a.name} ${a.email ?? ''}`.toLowerCase().includes(search.toLowerCase())).sort((a,b) => sort === 'remaining' ? (remaining(a.id) ?? 101) - (remaining(b.id) ?? 101) : a.name.localeCompare(b.name)));
