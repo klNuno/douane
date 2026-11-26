@@ -19,7 +19,8 @@ function page(options = {}) {
   const { enabled = true, hidden = false, known = true, current = 50, credits = [] } = options;
   const pace = 'pace' in options ? options.pace : true;
   return render(View, { props: {
-    accounts: [{ id: 'a', provider: 'claude', name: 'A', status: 'ready', enabled, hidden }, { id: 'b', provider: 'codex', name: 'B', status: 'ready', enabled: true }],
+    accounts: [{ id: 'a', provider: 'claude', name: 'A', status: 'ready', enabled }, { id: 'b', provider: 'codex', name: 'B', status: 'ready', enabled: true }],
+    hiddenAccountIds: new Set(hidden ? ['a'] : []),
     quotas: ['a', 'b'].map(account_id => ({ account_id, updated_at: '2026-10-30T12:00:00Z', credits, windows: [{ id: 'weekly', label: 'Weekly', remaining_percent: current, reset_at: known ? '2026-10-31T12:00:00Z' : null }] })),
     busy: '', settings: { show_provider_pace: pace }, resetUpdated() {}, manageAccounts() {}, refresh() {}
   } }).body;
@@ -104,7 +105,7 @@ test('unknown estimates are visibly partial; disabled and hidden accounts leave 
     assert.doesNotMatch(body, />A</);
     assert.match(body, />B</);
   }
-  const all = render(View, { props: { accounts: [{ id: 'a', provider: 'claude', name: 'A', status: 'disabled', enabled: false }, { id: 'b', provider: 'codex', name: 'B', status: 'ready', enabled: true, hidden: true }], quotas: [], busy: '', settings: {}, resetUpdated() {}, manageAccounts() {}, refresh() {} } }).body;
+  const all = render(View, { props: { accounts: [{ id: 'a', provider: 'claude', name: 'A', status: 'disabled', enabled: false }, { id: 'b', provider: 'codex', name: 'B', status: 'ready', enabled: true }], hiddenAccountIds: new Set(['b']), quotas: [], busy: '', settings: {}, resetUpdated() {}, manageAccounts() {}, refresh() {} } }).body;
   assert.match(all, /No account to show/);
   assert.ok(tags(page({ current: null }), 'meter').every(tag => !tag.includes('aria-valuenow')));
 });

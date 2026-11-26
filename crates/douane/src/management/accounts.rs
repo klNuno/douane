@@ -140,8 +140,6 @@ pub(super) async fn refresh_imported_accounts(state: &Arc<AppState>, accounts: &
 pub struct AccountPatch {
     name: Option<String>,
     enabled: Option<bool>,
-    /// Hides the account from the Quotas page and the pool; routing ignores it.
-    hidden: Option<bool>,
     /// Absent keeps the reserve; `null` or `0` removes it.
     #[serde(default, deserialize_with = "present")]
     reserve_percent: Option<Option<f64>>,
@@ -181,7 +179,6 @@ fn present<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<Option<f
 struct AccountMutation {
     name: Option<String>,
     enabled: Option<bool>,
-    hidden: Option<bool>,
     reserve: Option<Option<f64>>,
     reserve_windows: Option<Vec<String>>,
 }
@@ -212,21 +209,17 @@ impl AccountPatch {
         }
         let account = (name.is_some()
             || self.enabled.is_some()
-            || self.hidden.is_some()
             || reserve.is_some()
             || self.reserve_windows.is_some())
         .then_some(AccountMutation {
             name,
             enabled: self.enabled,
-            hidden: self.hidden,
             reserve,
             reserve_windows: self.reserve_windows.take(),
         });
         let endpoint = self.endpoint();
         if account.is_none() && endpoint.is_none() {
-            return Err(
-                "provide a name, enabled or hidden state, reserve or endpoint field".into(),
-            );
+            return Err("provide a name, enabled state, reserve or endpoint field".into());
         }
         Ok((account, endpoint))
     }
@@ -288,7 +281,6 @@ async fn apply_account_patch(
                     id,
                     account.name,
                     account.enabled,
-                    account.hidden,
                     account.reserve,
                     account.reserve_windows,
                 )
@@ -537,7 +529,7 @@ mod tests {
                 .unwrap();
             state
                 .accounts
-                .update(&account.id, None, None, None, Some(Some(5.0)), None)
+                .update(&account.id, None, None, Some(Some(5.0)), None)
                 .await
                 .unwrap();
             if let Some((windows, error)) = quota {
@@ -576,34 +568,16 @@ mod tests {
         assert_eq!(body["account"]["name"], "Renamed");
         assert_eq!(body["account"]["reserve_measured"], true);
         assert_eq!(body["account"]["reserve_reached"], true);
-        assert_eq!(body["account"]["hidden"], false);
-        // Hiding keeps the account enabled and survives a reload from disk.
-        let response = update_account(
-            State(state.clone()),
-            Path(ids[0].clone()),
-            Json(AccountPatch {
-                hidden: Some(true),
-                ..AccountPatch::default()
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(body["account"]["hidden"], true);
-        assert_eq!(body["account"]["enabled"], true);
-        assert!(state.accounts.get(&ids[0]).await.unwrap().hidden);
-        let Json(listing) = accounts(State(state.clone())).await;
-        let hidden: Vec<_> = listing["accounts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|row| row["hidden"] == true)
-            .map(|row| row["id"].as_str().unwrap().to_owned())
-            .collect();
-        assert_eq!(hidden, [ids[0].clone()]);
+        assert!(body["account"].get("hidden").is_none());
     }
+
+    #[test]
+    fn account_patch_rejects_browser_visibility() {
+        assert!(
+            serde_json::from_value::<AccountPatch>(serde_json::json!({"hidden": true})).is_err()
+        );
+    }
+
     #[tokio::test]
     async fn verification_redirect_exposes_challenge_only_as_no_store_location() {
         let challenge = "https://accounts.google.com/signin/continue?challenge=private-fixture";

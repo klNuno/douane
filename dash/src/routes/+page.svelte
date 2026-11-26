@@ -30,11 +30,13 @@
 		{ label:'nav.service',items:[{ id:'activity',label:'nav.activity',icon:Activity },{ id:'settings',label:'nav.settings',icon:Settings2 },{ id:'quickstart',label:'nav.quickstart',icon:Rocket }] }
 	];
 	const mobileItems = groups.flatMap(group => group.items).filter(item => ['quotas','accounts','activity','settings'].includes(item.id));
+	const hiddenAccountPrefix = 'douane.hiddenAccount.';
 	let screen = $state('quotas');
 	let mobileOpen = $state(false);
 	let connectOpen = $state(false);
 	let riskOpen = $state(false);
 	let accounts = $state.raw<Account[]>([]);
+	let hiddenAccountIds = $state.raw<ReadonlySet<string>>(new Set());
 	let quotas = $state.raw<Quota[]>([]);
 	let providers = $state.raw<Provider[]>([]);
 	let models = $state.raw<Model[]>([]);
@@ -70,6 +72,31 @@
 	}
 	function navigate(next: string) { screen = next; mobileOpen = false; failure = ''; notice = ''; location.hash = next; window.scrollTo(0,0); }
 	function hashChange() { const hash = location.hash.slice(1); if (groups.flatMap(g => g.items).some(item => item.id === hash)) screen = hash; }
+	function readHiddenAccounts() {
+		const ids = new Set<string>();
+		try {
+			for (let index = 0; index < localStorage.length; index++) {
+				const key = localStorage.key(index);
+				if (key?.startsWith(hiddenAccountPrefix)) ids.add(key.slice(hiddenAccountPrefix.length));
+			}
+		} catch { /* The preference still works in memory if storage is unavailable. */ }
+		return ids;
+	}
+	function syncHiddenAccounts(event: StorageEvent) {
+		if (event.key === null || event.key.startsWith(hiddenAccountPrefix)) hiddenAccountIds = readHiddenAccounts();
+	}
+	function toggleAccountVisibility(id: string) {
+		const next = new Set(hiddenAccountIds);
+		const wasHidden = next.delete(id);
+		if (!wasHidden) next.add(id);
+		hiddenAccountIds = next;
+		try {
+			const key = hiddenAccountPrefix + id;
+			if (wasHidden) localStorage.removeItem(key); else localStorage.setItem(key, '1');
+		}
+		catch { /* Keep this tab's choice when storage is unavailable. */ }
+		notice = t(wasHidden ? 'notice.accountShown' : 'notice.accountHidden');
+	}
 	async function mutate(name: string, action: () => Promise<unknown>, message = '') {
 		if (busy) return false; busy = name; failure = ''; notice = '';
 		try { await action(); if (loadingRequest) await loadingRequest; await load(true); notice = message; return true; }
@@ -118,11 +145,11 @@
 		if (done) notice = t(restored === 1 ? 'notice.restored.one' : 'notice.restored.other', { count: restored });
 		return done;
 	}
-	onMount(() => { riskOpen = !riskAccepted(); hashChange(); void load(); const timer = setInterval(() => { if (!document.hidden && !busy) void load(true); },15_000); return () => clearInterval(timer); });
+	onMount(() => { hiddenAccountIds = readHiddenAccounts(); riskOpen = !riskAccepted(); hashChange(); void load(); const timer = setInterval(() => { if (!document.hidden && !busy) void load(true); },15_000); return () => clearInterval(timer); });
 </script>
 
 <svelte:head><title>{pageTitle} · douane</title><meta name="description" content={t('page.description')}/></svelte:head>
-<svelte:window onhashchange={hashChange} onkeydown={(event) => { if (event.key === 'Escape') mobileOpen = false; }}/>
+<svelte:window onhashchange={hashChange} onstorage={syncHiddenAccounts} onkeydown={(event) => { if (event.key === 'Escape') mobileOpen = false; }}/>
 <svelte:document onvisibilitychange={() => { if (!document.hidden) void load(true); }}/>
 
 <div class="app-shell">
@@ -137,8 +164,8 @@
 			{#if failure}<div class="notice error" role="alert"><span>{failure}</span><button class="button small" onclick={() => load()} disabled={loading}>{t('common.retry')}</button></div>{/if}
 			{#if notice}<div class="notice success" role="status">{notice}<button class="icon-button" onclick={() => notice = ''} aria-label={t('page.dismissNotice')}><X size={14}/></button></div>{/if}
 			{#if loading && !summary}<div class="loading-state" role="status"><RefreshCw size={18} class="spinning"/><span>{t('page.loading')}</span></div>{/if}
-			{#if screen === 'quotas'}<QuotasView {accounts} {quotas} {providers} {busy} {settings} {refresh} resetUpdated={() => load(true)} manageAccounts={() => navigate('accounts')}/>
-			{:else if screen === 'accounts'}<AccountsView {accounts} {quotas} {settings} {providers} {refresh} {setQuotaDisplay} {setQuotaWindows} {busy} {rename} {setReserve} {updateEndpoint} connect={() => connectOpen = true} {importFiles} toggle={(account) => mutate('account',() => management.setAccountEnabled(account.id,!account.enabled),t(account.enabled ? 'notice.accountDisabled' : 'notice.accountEnabled'))} hide={(account) => mutate('account',() => management.setAccountHidden(account.id,!account.hidden),t(account.hidden ? 'notice.accountShown' : 'notice.accountHidden'))} remove={(account) => mutate('account',() => management.deleteAccount(account.id),t('notice.accountDeleted'))}/>
+			{#if screen === 'quotas'}<QuotasView {accounts} {hiddenAccountIds} {quotas} {providers} {busy} {settings} {refresh} resetUpdated={() => load(true)} manageAccounts={() => navigate('accounts')}/>
+			{:else if screen === 'accounts'}<AccountsView {accounts} {hiddenAccountIds} {quotas} {settings} {providers} {refresh} {setQuotaDisplay} {setQuotaWindows} {busy} {rename} {setReserve} {updateEndpoint} connect={() => connectOpen = true} {importFiles} toggle={(account) => mutate('account',() => management.setAccountEnabled(account.id,!account.enabled),t(account.enabled ? 'notice.accountDisabled' : 'notice.accountEnabled'))} {toggleAccountVisibility} remove={(account) => mutate('account',() => management.deleteAccount(account.id),t('notice.accountDeleted'))}/>
 			{:else if screen === 'clients'}<ClientsView report={clients} {accounts} {busy} updated={async (message) => { await load(true); notice = message; }}/>
 			{:else if screen === 'settings'}{#if settings}{#key JSON.stringify(settings)}<SettingsView {settings} {providers} {accounts} {quotas} {busy} restore={restoreBackup} save={(next) => mutate('settings',() => management.settingsSave(next),t('notice.settingsSaved'))}/>{/key}{:else}<div class="page-heading"><div><h1>{t('nav.settings')}</h1><p class="page-description">{t('page.settingsUnavailable')}</p></div></div><LanguageSetting/>{/if}
 			{:else if screen === 'models'}<ModelsView {models} listings={modelListings} {accounts} {busy} {navigate} toggleModel={(model) => mutate('model',() => management.setModelEnabled(model.id,model.enabled === false),t('notice.modelUpdated'))} setModels={(ids, enabled) => mutate('models',() => management.setModelsEnabled(ids,enabled),t('notice.modelsUpdated', { count: ids.length }))} refreshModels={(pool) => mutate(`models:${pool ?? '*'}`,() => management.refreshModels(pool))}/>

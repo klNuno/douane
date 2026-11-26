@@ -321,8 +321,6 @@ pub struct AccountSummary {
 
     pub reserve_percent: Option<f64>,
     pub reserve_windows: Vec<String>,
-    /// Kept out of the Quotas page and the provider pool, still routed.
-    pub hidden: bool,
     /// A custom endpoint's model prefix, address, wire format and model
     /// filter. Absent for subscriptions; never a credential.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -426,9 +424,6 @@ pub struct AccountCredential {
     /// Entries a custom endpoint adds to each request's `metadata`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) metadata: BTreeMap<String, String>,
-    /// The user hid it from the Quotas page; routing ignores this.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) hidden: bool,
 }
 
 /// A reserve is a share strictly between 0 and 100.
@@ -781,7 +776,6 @@ impl AccountCredential {
             retry_at,
             reserve_percent: self.reserve(),
             reserve_windows: self.reserve_windows(),
-            hidden: self.hidden,
             route: self.route.clone(),
             base_url: (self.provider == SubscriptionProvider::OpenaiCompatible)
                 .then(|| self.base_url.clone())

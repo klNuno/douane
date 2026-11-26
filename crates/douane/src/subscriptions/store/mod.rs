@@ -73,7 +73,6 @@ impl AccountStore {
         id: &str,
         name: Option<String>,
         enabled: Option<bool>,
-        hidden: Option<bool>,
         reserve: Option<Option<f64>>,
         windows: Option<Vec<String>>,
     ) -> Result<AccountSummary, SubscriptionError> {
@@ -95,9 +94,6 @@ impl AccountStore {
             }
             if let Some(enabled) = enabled {
                 account.enabled = enabled;
-            }
-            if let Some(hidden) = hidden {
-                account.hidden = hidden;
             }
             if let Some(reserve) = reserve {
                 account.reserve_percent = reserve;

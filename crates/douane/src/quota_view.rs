@@ -417,7 +417,6 @@ mod tests {
             retry_at: None,
             reserve_percent: None,
             reserve_windows: vec![],
-            hidden: false,
             route: None,
             base_url: None,
             dialect: None,
