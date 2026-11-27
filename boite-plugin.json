@@ -2,30 +2,30 @@
   "schema": 1,
   "id": "douane",
   "name": "Douane",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Local gateway for AI coding subscriptions: pools Claude, Codex, Grok, Copilot and API key accounts behind one OpenAI and Anthropic compatible endpoint, with quota tracking and a dashboard.",
   "homepage": "https://github.com/klNuno/douane",
   "executable": "douane",
   "artifacts": {
     "win32-x64": {
-      "url": "https://github.com/klNuno/douane/releases/download/v0.3.2/douane-windows-x64.exe",
-      "sha256": "fc3c4fefc919604dc46f7ede92cdd71480d2967cf161307bf98a4f66916c91a3"
+      "url": "https://github.com/klNuno/douane/releases/download/v0.3.3/douane-windows-x64.exe",
+      "sha256": "701611da78b4c4a3b826ba871718e689746455f7e585718ac9ccc3e2961b2b1e"
     },
     "darwin-arm64": {
-      "url": "https://github.com/klNuno/douane/releases/download/v0.3.2/douane-macos-arm64",
-      "sha256": "b95dba94aed2c73c85df031812984bf4be8f104b49f25938b5b018491bfedbc9"
+      "url": "https://github.com/klNuno/douane/releases/download/v0.3.3/douane-macos-arm64",
+      "sha256": "6d193b65300f69bd84ee586d3ffa5775f5a6a3edef939cd1ca5cfa613bdea7f5"
     },
     "darwin-x64": {
-      "url": "https://github.com/klNuno/douane/releases/download/v0.3.2/douane-macos-x64",
-      "sha256": "1751d84f4c9791a47844016c8105f3784fd53182d6b0cadedcc06a93cf37c13f"
+      "url": "https://github.com/klNuno/douane/releases/download/v0.3.3/douane-macos-x64",
+      "sha256": "511d704e382a5c7171d001de40b4cd2088ddccc30a767ca0a367dba4a271a41c"
     },
     "linux-x64": {
-      "url": "https://github.com/klNuno/douane/releases/download/v0.3.2/douane-linux-x64",
-      "sha256": "39c5d6ac7dbf90e5ef64d3251abd971d44ac182ac9504c1b0ae31765740fafd7"
+      "url": "https://github.com/klNuno/douane/releases/download/v0.3.3/douane-linux-x64",
+      "sha256": "f066ffbeef640acc2db8d1dfd7aa54c0333a4ddd932d7363cf823fed7666f17e"
     },
     "linux-arm64": {
-      "url": "https://github.com/klNuno/douane/releases/download/v0.3.2/douane-linux-arm64",
-      "sha256": "8a19199bf63f743cc5d273ef5f28ac9a297a510d7c3c276919e67d4d2a720342"
+      "url": "https://github.com/klNuno/douane/releases/download/v0.3.3/douane-linux-arm64",
+      "sha256": "84a13c9de82edc65b06995b195efbd708c911ebcaac0594816cd5ece535867e3"
     }
   },
   "provides": {
